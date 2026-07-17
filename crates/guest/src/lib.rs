@@ -30,6 +30,22 @@ pub const FLE_FUNCT3: u8 = 0b000;
 pub const FLT_FUNCT3: u8 = 0b001;
 pub const FEQ_FUNCT3: u8 = 0b010;
 
+/// funct7 for fclass.s (funct3=001) and fmv.x.w (funct3=000, not needed for Zfinx).
+/// Single FP source operand; rd is an integer register.
+pub const FCLASS_S_FUNCT7: u8 = 0b1110000;
+/// funct3 for fclass.s.
+pub const FCLASS_FUNCT3: u8 = 0b001;
+
+/// funct7 for fcvt.w.s / fcvt.wu.s (float -> int); the rs2 field selects
+/// the integer type (0 = int32, 1 = uint32). rd is an integer register.
+pub const FCVT_W_S_FUNCT7: u8 = 0b1100000;
+/// funct7 for fcvt.s.w / fcvt.s.wu (int -> float); the rs2 field selects
+/// the integer type (0 = int32, 1 = uint32). rs1 is an integer register.
+pub const FCVT_S_W_FUNCT7: u8 = 0b1101000;
+/// rs2-field values selecting the conversion integer type.
+pub const FCVT_RS2_W: u8 = 0b00000;
+pub const FCVT_RS2_WU: u8 = 0b00001;
+
 /// RISC-V rounding mode (rm field, funct3 bits).
 pub const RM_RNE: u8 = 0b000; // Round to Nearest, ties to Even
 pub const RM_RTZ: u8 = 0b001; // Round toward Zero

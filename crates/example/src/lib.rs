@@ -135,6 +135,40 @@ fn fle_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     )
 }
 
+/// Unary FP instruction with a single source register (fclass / fcvt).
+fn fp_unary(opcode: FpOpcode, rd: u32, rs1: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(opcode.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::ZERO,
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn fclass_s(rd: u32, rs1: u32) -> Instruction<F> {
+    fp_unary(FpOpcode::FCLASS_S, rd, rs1)
+}
+
+fn fcvt_w_s(rd: u32, rs1: u32) -> Instruction<F> {
+    fp_unary(FpOpcode::FCVT_W_S, rd, rs1)
+}
+
+fn fcvt_wu_s(rd: u32, rs1: u32) -> Instruction<F> {
+    fp_unary(FpOpcode::FCVT_WU_S, rd, rs1)
+}
+
+fn fcvt_s_w(rd: u32, rs1: u32) -> Instruction<F> {
+    fp_unary(FpOpcode::FCVT_S_W, rd, rs1)
+}
+
+fn fcvt_s_wu(rd: u32, rs1: u32) -> Instruction<F> {
+    fp_unary(FpOpcode::FCVT_S_WU, rd, rs1)
+}
+
 fn run_program(instructions: Vec<Instruction<F>>, init_memory: SparseMemoryImage) -> VmState<F> {
     let program = Program::new_without_debug_infos(&instructions, 0);
     let exe = VmExe::new(program).with_init_memory(init_memory);
@@ -561,6 +595,174 @@ fn test_fcmp_chained() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FCLASS.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fclass_categories() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.5); // +normal
+    write_fp_reg(&mut mem, 2, -1.5); // -normal
+    write_fp_reg(&mut mem, 3, f32::INFINITY);
+    write_fp_reg(&mut mem, 4, f32::NEG_INFINITY);
+    write_fp_reg_bits(&mut mem, 5, 0x0000_0000); // +0
+    write_fp_reg_bits(&mut mem, 6, 0x8000_0000); // -0
+    write_fp_reg_bits(&mut mem, 7, 0x0000_0001); // +subnormal
+    write_fp_reg_bits(&mut mem, 8, 0x8000_0001); // -subnormal
+    write_fp_reg_bits(&mut mem, 9, 0x7FC0_0000); // qNaN
+    write_fp_reg_bits(&mut mem, 10, 0x7FA0_0001); // sNaN
+
+    let state = run_program(
+        vec![
+            fclass_s(11, 1),
+            fclass_s(12, 2),
+            fclass_s(13, 3),
+            fclass_s(14, 4),
+            fclass_s(15, 5),
+            fclass_s(16, 6),
+            fclass_s(17, 7),
+            fclass_s(18, 8),
+            fclass_s(19, 9),
+            fclass_s(20, 10),
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 11), 1 << 6);
+    assert_eq!(read_fp_reg_bits(&state, 12), 1 << 1);
+    assert_eq!(read_fp_reg_bits(&state, 13), 1 << 7);
+    assert_eq!(read_fp_reg_bits(&state, 14), 1 << 0);
+    assert_eq!(read_fp_reg_bits(&state, 15), 1 << 4);
+    assert_eq!(read_fp_reg_bits(&state, 16), 1 << 3);
+    assert_eq!(read_fp_reg_bits(&state, 17), 1 << 5);
+    assert_eq!(read_fp_reg_bits(&state, 18), 1 << 2);
+    assert_eq!(read_fp_reg_bits(&state, 19), 1 << 9);
+    assert_eq!(read_fp_reg_bits(&state, 20), 1 << 8);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FCVT.W.S / FCVT.WU.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fcvt_w_s_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.7);
+    write_fp_reg(&mut mem, 2, -3.7);
+    write_fp_reg(&mut mem, 3, 2.5); // ties to even -> 2
+
+    let state = run_program(
+        vec![fcvt_w_s(0, 1), fcvt_w_s(4, 2), fcvt_w_s(5, 3), terminate()],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 4);
+    assert_eq!(read_fp_reg_bits(&state, 4), (-4i32) as u32);
+    assert_eq!(read_fp_reg_bits(&state, 5), 2);
+}
+
+#[test]
+fn test_fcvt_w_s_special() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, CANONICAL_NAN);
+    write_fp_reg(&mut mem, 2, f32::NEG_INFINITY);
+    write_fp_reg(&mut mem, 3, 3e9); // out of i32 range
+
+    let state = run_program(
+        vec![
+            fcvt_w_s(0, 1), // NaN -> INT32_MAX
+            fcvt_w_s(4, 2), // -inf -> INT32_MIN
+            fcvt_w_s(5, 3), // saturate -> INT32_MAX
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), i32::MAX as u32);
+    assert_eq!(read_fp_reg_bits(&state, 4), i32::MIN as u32);
+    assert_eq!(read_fp_reg_bits(&state, 5), i32::MAX as u32);
+}
+
+#[test]
+fn test_fcvt_wu_s() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.7);
+    write_fp_reg(&mut mem, 2, -3.7);
+    write_fp_reg_bits(&mut mem, 3, CANONICAL_NAN);
+    write_fp_reg(&mut mem, 4, 3e9); // in u32 range
+
+    let state = run_program(
+        vec![
+            fcvt_wu_s(0, 1),
+            fcvt_wu_s(5, 2),
+            fcvt_wu_s(6, 3),
+            fcvt_wu_s(7, 4),
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 4);
+    assert_eq!(read_fp_reg_bits(&state, 5), 0); // negative -> 0
+    assert_eq!(read_fp_reg_bits(&state, 6), u32::MAX); // NaN -> UINT32_MAX
+    assert_eq!(read_fp_reg_bits(&state, 7), 3000000000);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FCVT.S.W / FCVT.S.WU execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fcvt_s_w() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 42);
+    write_fp_reg_bits(&mut mem, 2, (-42i32) as u32);
+    write_fp_reg_bits(&mut mem, 3, 0x0100_0001); // 2^24+1 -> 2^24 (ties to even)
+
+    let state = run_program(
+        vec![fcvt_s_w(0, 1), fcvt_s_w(4, 2), fcvt_s_w(5, 3), terminate()],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 0), 42.0);
+    assert_eq!(read_fp_reg(&state, 4), -42.0);
+    assert_eq!(read_fp_reg(&state, 5), 16777216.0);
+}
+
+#[test]
+fn test_fcvt_s_wu() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 42);
+    write_fp_reg_bits(&mut mem, 2, u32::MAX); // rounds to 2^32
+
+    let state = run_program(vec![fcvt_s_wu(0, 1), fcvt_s_wu(4, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 42.0);
+    assert_eq!(read_fp_reg(&state, 4), 4294967296.0);
+}
+
+#[test]
+fn test_fcvt_roundtrip() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 17.0);
+
+    let state = run_program(
+        vec![
+            fcvt_w_s(2, 1), // f2 = 17 (as int)
+            fcvt_s_w(3, 2), // f3 = 17.0 (as float)
+            feq_s(4, 1, 3), // 17.0 == 17.0 -> 1
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 2), 17);
+    assert_eq!(read_fp_reg(&state, 3), 17.0);
+    assert_eq!(read_fp_reg_bits(&state, 4), 1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Guest program test: builds a real rv32im ELF with inline-asm F instructions,
 // transpiles with Zfinx, and executes through the VM.
 // ════════════════════════════════════════════════════════════════════════════
@@ -749,5 +951,62 @@ mod guest_program_tests {
     #[test]
     fn test_prove_fcmp() {
         prove_guest_example("fcmp_prove");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fcvt() {
+        prove_guest_example("fcvt_prove");
+    }
+}
+
+/// Chip-level proving tests: hand-built programs run through air_test.
+#[cfg(feature = "proving")]
+#[cfg(test)]
+mod chip_proving_tests {
+    use openvm_circuit::utils::air_test;
+    use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+    use super::*;
+
+    fn prove_program(instructions: Vec<Instruction<F>>, init_memory: SparseMemoryImage) {
+        let program = Program::new_without_debug_infos(&instructions, 0);
+        let exe = VmExe::new(program).with_init_memory(init_memory);
+        air_test(Rv32FCpuBuilder, Rv32FConfig::default(), exe);
+    }
+
+    #[test]
+    fn test_prove_fcvt_s_w_single() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, 1, (-42i32) as u32);
+        prove_program(vec![fcvt_s_w(0, 1), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fcvt_s_wu_single() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, 1, 42);
+        prove_program(vec![fcvt_s_wu(0, 1), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fclass_single() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 1.5);
+        prove_program(vec![fclass_s(0, 1), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fcvt_w_s_single() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 3.7);
+        prove_program(vec![fcvt_w_s(0, 1), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fcvt_wu_s_single() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 3.7);
+        prove_program(vec![fcvt_wu_s(0, 1), terminate()], mem);
     }
 }

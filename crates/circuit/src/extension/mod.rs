@@ -12,12 +12,15 @@ use openvm_circuit_primitives::range_tuple::{
     RangeTupleCheckerAir, RangeTupleCheckerBus, RangeTupleCheckerChip, SharedRangeTupleCheckerChip,
 };
 use openvm_cpu_backend::{CpuBackend, CpuDevice};
-use openvm_instructions::LocalOpcode;
+use openvm_instructions::{riscv::RV32_REGISTER_AS, LocalOpcode};
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
-use crate::{adapters::*, fadd::*, fcmp::*, fminmax::*, fmul::*, fsgnj::*, fsub::*};
+use crate::{
+    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fminmax::*, fmul::*,
+    fsgnj::*, fsub::*,
+};
 
 /// RISC-V F (single-precision floating-point) extension config.
 ///
@@ -65,6 +68,9 @@ pub enum Rv32FExecutor {
     Fsgnj(Rv32FsgnjExecutor),
     Fminmax(Rv32FminmaxExecutor),
     Fcmp(Rv32FcmpExecutor),
+    Fclass(Rv32FclassExecutor),
+    FcvtF2I(Rv32FcvtF2IExecutor),
+    FcvtI2F(Rv32FcvtI2FExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -117,6 +123,45 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
                 FpOpcode::FLE_S.global_opcode(),
                 FpOpcode::FLT_S.global_opcode(),
                 FpOpcode::FEQ_S.global_opcode(),
+            ],
+        )?;
+
+        let adapter_exec = Rv32FpUnaryAdapterExecutor::new(self.fp_register_as, RV32_REGISTER_AS);
+        let fclass = Rv32FclassExecutor::new(
+            adapter_exec,
+            FpOpcode::CLASS_OFFSET,
+            self.fp_register_as,
+            RV32_REGISTER_AS,
+        );
+        inventory.add_executor(fclass, [FpOpcode::FCLASS_S.global_opcode()])?;
+
+        let adapter_exec = Rv32FpUnaryAdapterExecutor::new(self.fp_register_as, RV32_REGISTER_AS);
+        let fcvt_f2i = Rv32FcvtF2IExecutor::new(
+            adapter_exec,
+            FpOpcode::CLASS_OFFSET,
+            self.fp_register_as,
+            RV32_REGISTER_AS,
+        );
+        inventory.add_executor(
+            fcvt_f2i,
+            [
+                FpOpcode::FCVT_W_S.global_opcode(),
+                FpOpcode::FCVT_WU_S.global_opcode(),
+            ],
+        )?;
+
+        let adapter_exec = Rv32FpUnaryAdapterExecutor::new(RV32_REGISTER_AS, self.fp_register_as);
+        let fcvt_i2f = Rv32FcvtI2FExecutor::new(
+            adapter_exec,
+            FpOpcode::CLASS_OFFSET,
+            RV32_REGISTER_AS,
+            self.fp_register_as,
+        );
+        inventory.add_executor(
+            fcvt_i2f,
+            [
+                FpOpcode::FCVT_S_W.global_opcode(),
+                FpOpcode::FCVT_S_WU.global_opcode(),
             ],
         )?;
         Ok(())
@@ -186,6 +231,39 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             FcmpCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fcmp);
+
+        let fclass = Rv32FclassAir::new(
+            Rv32FpUnaryAdapterAir::new(
+                exec_bridge,
+                memory_bridge,
+                self.fp_register_as,
+                RV32_REGISTER_AS,
+            ),
+            FclassCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fclass);
+
+        let fcvt_f2i = Rv32FcvtF2IAir::new(
+            Rv32FpUnaryAdapterAir::new(
+                exec_bridge,
+                memory_bridge,
+                self.fp_register_as,
+                RV32_REGISTER_AS,
+            ),
+            FcvtF2ICoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fcvt_f2i);
+
+        let fcvt_i2f = Rv32FcvtI2FAir::new(
+            Rv32FpUnaryAdapterAir::new(
+                exec_bridge,
+                memory_bridge,
+                RV32_REGISTER_AS,
+                self.fp_register_as,
+            ),
+            FcvtI2FCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fcvt_i2f);
 
         Ok(())
     }
@@ -289,6 +367,39 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fcmp);
+
+        inventory.next_air::<Rv32FclassAir>()?;
+        let fclass = Rv32FclassChip::new(
+            FclassFiller::new(
+                Rv32FpUnaryAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fclass);
+
+        inventory.next_air::<Rv32FcvtF2IAir>()?;
+        let fcvt_f2i = Rv32FcvtF2IChip::new(
+            FcvtF2IFiller::new(
+                Rv32FpUnaryAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fcvt_f2i);
+
+        inventory.next_air::<Rv32FcvtI2FAir>()?;
+        let fcvt_i2f = Rv32FcvtI2FChip::new(
+            FcvtI2FFiller::new(
+                Rv32FpUnaryAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fcvt_i2f);
 
         Ok(())
     }
