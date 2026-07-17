@@ -3,6 +3,7 @@ use openvm_circuit::arch::{VmAirWrapper, VmChipWrapper};
 use crate::adapters::{Rv32FpAdapterAir, Rv32FpAdapterExecutor, Rv32FpAdapterFiller};
 
 mod core;
+mod execution;
 pub use core::*;
 
 pub type Rv32FmulAir = VmAirWrapper<Rv32FpAdapterAir, FmulCoreAir>;

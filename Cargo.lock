@@ -1258,6 +1258,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openvm-rv32f-example"
+version = "0.1.0"
+dependencies = [
+ "openvm-circuit",
+ "openvm-instructions",
+ "openvm-rv32f-circuit",
+ "openvm-rv32f-guest",
+ "openvm-rv32f-transpiler",
+ "openvm-stark-sdk",
+]
+
+[[package]]
 name = "openvm-rv32f-guest"
 version = "0.1.0"
 dependencies = [
@@ -1358,6 +1370,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tikv-jemallocator",
  "tracing",
 ]
 
@@ -2201,6 +2214,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

@@ -1,0 +1,18 @@
+[package]
+name = "openvm-rv32f-example"
+description = "Example and integration tests for the OpenVM RISC-V F extension"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0" }
+openvm-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", features = [
+    "test-utils",
+] }
+openvm-instructions = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-rv32f-circuit = { path = "../circuit" }
+openvm-rv32f-transpiler = { path = "../transpiler" }
+openvm-rv32f-guest = { path = "../guest" }
