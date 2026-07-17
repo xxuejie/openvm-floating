@@ -763,6 +763,308 @@ fn test_fcvt_roundtrip() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Execution-level fuzz: random operands through the VM interpreter, verified
+// against the native semantics helpers from the circuit crate.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod fuzz_tests {
+    use openvm_rv32f_circuit::{
+        fclass::fclass_s as fclass_native,
+        fcmp::{fcmp_result, FcmpOp},
+        fcvt_f2i::fcvt_f2i_result,
+        fcvt_i2f::fcvt_i2f_result,
+        fminmax::fminmax_result,
+    };
+
+    use super::*;
+
+    struct XorShift64 {
+        state: u64,
+    }
+    impl XorShift64 {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: seed.wrapping_add(1),
+            }
+        }
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x as u32
+        }
+    }
+
+    const SPECIALS: [u32; 12] = [
+        0x0000_0000, // +0.0 / 0
+        0x8000_0000, // -0.0 / i32::MIN
+        0x7FC0_0000, // qNaN
+        0x7FA0_0001, // sNaN
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x0000_0001, // min subnormal / 1
+        0x8000_0001, // -min subnormal
+        0x007F_FFFF, // max subnormal
+        0x0080_0000, // min normal
+        0x7F7F_FFFF, // max finite
+        0xFF7F_FFFF, // -max finite
+    ];
+
+    fn rand_bits(rng: &mut XorShift64) -> u32 {
+        if rng.next_u32().is_multiple_of(3) {
+            SPECIALS[(rng.next_u32() as usize) % SPECIALS.len()]
+        } else {
+            rng.next_u32()
+        }
+    }
+
+    /// Builds one program of binary FP ops (inputs in regs 1..30, rd aliases
+    /// rs1 so results stay readable; max 15 cases).
+    fn build_binary_chunk(
+        chunk: &[(u32, u32)],
+        make: &mut impl FnMut(u32, u32, u32, usize) -> Instruction<F>,
+    ) -> (Vec<Instruction<F>>, SparseMemoryImage) {
+        let mut mem = SparseMemoryImage::new();
+        let mut instrs = Vec::new();
+        for (i, &(a, b)) in chunk.iter().enumerate() {
+            let rs1 = 2 * i as u32 + 1;
+            let rs2 = rs1 + 1;
+            write_fp_reg_bits(&mut mem, rs1, a);
+            write_fp_reg_bits(&mut mem, rs2, b);
+            instrs.push(make(rs1, rs1, rs2, i));
+        }
+        instrs.push(terminate());
+        (instrs, mem)
+    }
+
+    /// Builds one program of unary FP ops (rd aliases rs1; max 30 cases).
+    fn build_unary_chunk(
+        chunk: &[u32],
+        make: &mut impl FnMut(u32, u32, usize) -> Instruction<F>,
+    ) -> (Vec<Instruction<F>>, SparseMemoryImage) {
+        let mut mem = SparseMemoryImage::new();
+        let mut instrs = Vec::new();
+        for (i, &a) in chunk.iter().enumerate() {
+            let rs1 = i as u32 + 1;
+            write_fp_reg_bits(&mut mem, rs1, a);
+            instrs.push(make(rs1, rs1, i));
+        }
+        instrs.push(terminate());
+        (instrs, mem)
+    }
+
+    /// Runs binary FP ops through the VM in chunks of 15.
+    fn fuzz_binary(
+        cases: &[(u32, u32)],
+        mut make: impl FnMut(u32, u32, u32, usize) -> Instruction<F>,
+        mut expect: impl FnMut(u32, u32, usize) -> u32,
+    ) {
+        for (chunk_idx, chunk) in cases.chunks(15).enumerate() {
+            let (instrs, mem) = build_binary_chunk(chunk, &mut make);
+            let state = run_program(instrs, mem);
+            for (i, &(a, b)) in chunk.iter().enumerate() {
+                let rs1 = 2 * i as u32 + 1;
+                let got = read_fp_reg_bits(&state, rs1);
+                let want = expect(a, b, i);
+                assert_eq!(
+                    got, want,
+                    "chunk {chunk_idx} case {i}: a={a:#010x} b={b:#010x}"
+                );
+            }
+        }
+    }
+
+    /// Runs unary FP ops through the VM in chunks of 30 (rd aliases rs1).
+    fn fuzz_unary(
+        cases: &[u32],
+        mut make: impl FnMut(u32, u32, usize) -> Instruction<F>,
+        mut expect: impl FnMut(u32, usize) -> u32,
+    ) {
+        for (chunk_idx, chunk) in cases.chunks(30).enumerate() {
+            let (instrs, mem) = build_unary_chunk(chunk, &mut make);
+            let state = run_program(instrs, mem);
+            for (i, &a) in chunk.iter().enumerate() {
+                let rs1 = i as u32 + 1;
+                let got = read_fp_reg_bits(&state, rs1);
+                let want = expect(a, i);
+                assert_eq!(got, want, "chunk {chunk_idx} case {i}: a={a:#010x}");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_exec_fminmax() {
+        let mut rng = XorShift64::new(0xA11C_E001);
+        let cases: Vec<(u32, u32)> = (0..150)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        fuzz_binary(
+            &cases,
+            |rd, rs1, rs2, i| {
+                if i % 2 == 0 {
+                    fmin_s(rd, rs1, rs2)
+                } else {
+                    fmax_s(rd, rs1, rs2)
+                }
+            },
+            |a, b, i| fminmax_result(a, b, i % 2 == 0),
+        );
+    }
+
+    #[test]
+    fn fuzz_exec_fcmp() {
+        const OPS: [FcmpOp; 3] = [FcmpOp::Le, FcmpOp::Lt, FcmpOp::Eq];
+        let mut rng = XorShift64::new(0xA11C_E002);
+        let cases: Vec<(u32, u32)> = (0..150)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        fuzz_binary(
+            &cases,
+            |rd, rs1, rs2, i| match OPS[i % 3] {
+                FcmpOp::Le => fle_s(rd, rs1, rs2),
+                FcmpOp::Lt => flt_s(rd, rs1, rs2),
+                FcmpOp::Eq => feq_s(rd, rs1, rs2),
+            },
+            |a, b, i| fcmp_result(a, b, OPS[i % 3]),
+        );
+    }
+
+    #[test]
+    fn fuzz_exec_fclass() {
+        let mut rng = XorShift64::new(0xA11C_E003);
+        let cases: Vec<u32> = (0..300).map(|_| rand_bits(&mut rng)).collect();
+        fuzz_unary(
+            &cases,
+            |rd, rs1, _| fclass_s(rd, rs1),
+            |a, _| fclass_native(a),
+        );
+    }
+
+    #[test]
+    fn fuzz_exec_fcvt_f2i() {
+        let mut rng = XorShift64::new(0xA11C_E004);
+        let cases: Vec<u32> = (0..150).map(|_| rand_bits(&mut rng)).collect();
+        fuzz_unary(
+            &cases,
+            |rd, rs1, i| {
+                if i % 2 == 0 {
+                    fcvt_w_s(rd, rs1)
+                } else {
+                    fcvt_wu_s(rd, rs1)
+                }
+            },
+            |a, i| fcvt_f2i_result(a, i % 2 == 1),
+        );
+    }
+
+    #[test]
+    fn fuzz_exec_fcvt_i2f() {
+        let mut rng = XorShift64::new(0xA11C_E005);
+        let cases: Vec<u32> = (0..150).map(|_| rand_bits(&mut rng)).collect();
+        fuzz_unary(
+            &cases,
+            |rd, rs1, i| {
+                if i % 2 == 0 {
+                    fcvt_s_w(rd, rs1)
+                } else {
+                    fcvt_s_wu(rd, rs1)
+                }
+            },
+            |a, i| fcvt_i2f_result(a, i % 2 == 1),
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Proving-level fuzz: random programs through air_test (constraint check).
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[cfg(feature = "proving")]
+    fn prove_chunk(instrs: Vec<Instruction<F>>, mem: SparseMemoryImage) {
+        use openvm_circuit::utils::air_test;
+        use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+        let program = Program::new_without_debug_infos(&instrs, 0);
+        let exe = VmExe::new(program).with_init_memory(mem);
+        air_test(Rv32FCpuBuilder, Rv32FConfig::default(), exe);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fminmax() {
+        let mut rng = XorShift64::new(0xB0B0_0001);
+        let cases: Vec<(u32, u32)> = (0..15)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, i| {
+            if i % 2 == 0 {
+                fmin_s(rd, rs1, rs2)
+            } else {
+                fmax_s(rd, rs1, rs2)
+            }
+        });
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fcmp() {
+        const OPS: [FcmpOp; 3] = [FcmpOp::Le, FcmpOp::Lt, FcmpOp::Eq];
+        let mut rng = XorShift64::new(0xB0B0_0002);
+        let cases: Vec<(u32, u32)> = (0..15)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, i| match OPS[i % 3] {
+            FcmpOp::Le => fle_s(rd, rs1, rs2),
+            FcmpOp::Lt => flt_s(rd, rs1, rs2),
+            FcmpOp::Eq => feq_s(rd, rs1, rs2),
+        });
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fclass() {
+        let mut rng = XorShift64::new(0xB0B0_0003);
+        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fclass_s(rd, rs1));
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fcvt_f2i() {
+        let mut rng = XorShift64::new(0xB0B0_0004);
+        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, i| {
+            if i % 2 == 0 {
+                fcvt_w_s(rd, rs1)
+            } else {
+                fcvt_wu_s(rd, rs1)
+            }
+        });
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fcvt_i2f() {
+        let mut rng = XorShift64::new(0xB0B0_0005);
+        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, i| {
+            if i % 2 == 0 {
+                fcvt_s_w(rd, rs1)
+            } else {
+                fcvt_s_wu(rd, rs1)
+            }
+        });
+        prove_chunk(instrs, mem);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Guest program test: builds a real rv32im ELF with inline-asm F instructions,
 // transpiles with Zfinx, and executes through the VM.
 // ════════════════════════════════════════════════════════════════════════════

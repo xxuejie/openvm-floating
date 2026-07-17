@@ -58,15 +58,67 @@ impl XorShift64 {
     }
 }
 
+/// Neighbors of a nonzero finite f32 in value order (toward +inf / toward -inf).
+fn f32_neighbors(bits: u32) -> (f32, f32) {
+    debug_assert!(bits != 0);
+    let (up, down) = if bits & 0x8000_0000 == 0 {
+        (bits + 1, bits - 1)
+    } else {
+        (bits - 1, bits + 1)
+    };
+    (f32::from_bits(up), f32::from_bits(down))
+}
+
+/// Property check (independent of the implementation): the result must be a
+/// nearest f32 to the exact integer value, with ties resolved to even
+/// mantissa. All comparisons are done in f64, which is exact here.
+fn check_fcvt_i2f(x: u32, is_wu: bool, result_bits: u32) {
+    let xd = if is_wu { x as f64 } else { (x as i32) as f64 };
+    let y = f32::from_bits(result_bits);
+    assert!(!y.is_nan() && !y.is_infinite(), "fcvt({x:#010x}) -> {y}");
+    if xd == 0.0 {
+        assert_eq!(result_bits, 0, "fcvt(0) must be +0.0");
+        return;
+    }
+    assert_eq!(y.is_sign_negative(), xd < 0.0, "fcvt({x:#010x}) sign");
+    let err = (y as f64 - xd).abs();
+    let (up, down) = f32_neighbors(result_bits);
+    let up_err = (up as f64 - xd).abs();
+    let down_err = (xd - down as f64).abs();
+    assert!(
+        err <= up_err && err <= down_err,
+        "fcvt({x:#010x}) = {y}: not a nearest f32 (up {up}, down {down})"
+    );
+    if err == up_err || err == down_err {
+        assert_eq!(
+            result_bits & 1,
+            0,
+            "fcvt({x:#010x}) = {y}: midpoint tie not to even mantissa"
+        );
+    }
+}
+
 #[test]
 fn fuzz_fcvt_i2f() {
     let mut rng = XorShift64::new(0x12F0_2025_000C);
-    for _ in 0..200_000 {
-        let x = rng.next_u32();
-        // reference: round via i64/f64 intermediate (f64 is exact for i32/u32)
-        let ref_s = ((x as i32) as f64).round_ties_even() as f32;
-        let ref_su = (x as f64).round_ties_even() as f32;
-        assert_eq!(f32::from_bits(fcvt_s_w(x)), ref_s, "fcvt.s.w({x:#010x})");
-        assert_eq!(f32::from_bits(fcvt_s_wu(x)), ref_su, "fcvt.s.wu({x:#010x})");
+    let specials = [
+        0,
+        1,
+        u32::MAX,
+        i32::MIN as u32,
+        i32::MAX as u32,
+        0x0100_0001, // 2^24 + 1 (tie)
+        0x0100_0003, // 2^24 + 3 (tie)
+        (-16777217i32) as u32,
+        (-16777219i32) as u32,
+    ];
+    for i in 0..200_000 {
+        let x = if i % 4 == 0 {
+            specials[(rng.next_u32() as usize) % specials.len()]
+        } else {
+            rng.next_u32()
+        };
+        check_fcvt_i2f(x, false, fcvt_s_w(x));
+        check_fcvt_i2f(x, true, fcvt_s_wu(x));
     }
 }

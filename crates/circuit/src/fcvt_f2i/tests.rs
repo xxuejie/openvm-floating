@@ -97,34 +97,91 @@ impl XorShift64 {
     }
 }
 
+/// Property check (independent of the implementation): verifies the RISC-V
+/// fcvt.w.s contract directly — NaN -> INT32_MAX, saturation at the i32
+/// bounds, and round-to-nearest-even for in-range values, all computed in
+/// f64 (which represents both the input f32 and the result i32 exactly).
+fn check_fcvt_w_s(bits: u32, result: u32) {
+    let f = f32::from_bits(bits);
+    if f.is_nan() {
+        assert_eq!(result, i32::MAX as u32, "fcvt.w.s({bits:#010x}) is NaN");
+        return;
+    }
+    let fd = f as f64;
+    let r = result as i32;
+    // f32 has no values in (2147483520, 2^31) or (-2^31 - 128, -2^31) gaps,
+    // so the saturation boundaries are exactly +-2^31.
+    if r == i32::MAX {
+        assert!(fd >= 2147483648.0, "fcvt.w.s({f}) = MAX but in range");
+    } else if r == i32::MIN {
+        assert!(fd <= -2147483648.0, "fcvt.w.s({f}) = MIN but in range");
+    } else {
+        let diff = (fd - r as f64).abs();
+        assert!(
+            diff <= 0.5,
+            "fcvt.w.s({f}) = {r}: not nearest (diff {diff})"
+        );
+        if diff == 0.5 {
+            assert_eq!(r % 2, 0, "fcvt.w.s({f}) = {r}: tie not to even");
+        }
+    }
+}
+
+/// Same for fcvt.wu.s: NaN -> UINT32_MAX, negative rounds to 0, saturates
+/// at UINT32_MAX, RNE in range.
+fn check_fcvt_wu_s(bits: u32, result: u32) {
+    let f = f32::from_bits(bits);
+    if f.is_nan() {
+        assert_eq!(result, u32::MAX, "fcvt.wu.s({bits:#010x}) is NaN");
+        return;
+    }
+    let fd = f as f64;
+    if result == u32::MAX {
+        assert!(fd >= 4294967296.0, "fcvt.wu.s({f}) = MAX but in range");
+    } else if result == 0 {
+        // round(f) <= 0 iff f <= 0.5 (RNE ties 0.5 to even 0)
+        assert!(fd <= 0.5, "fcvt.wu.s({f}) = 0 but rounds positive");
+    } else {
+        let diff = (fd - result as f64).abs();
+        assert!(diff <= 0.5, "fcvt.wu.s({f}) = {result}: not nearest");
+        if diff == 0.5 {
+            assert_eq!(result % 2, 0, "fcvt.wu.s({f}) = {result}: tie not to even");
+        }
+    }
+}
+
 #[test]
 fn fuzz_fcvt_f2i() {
     let mut rng = XorShift64::new(0xFC77_2025_000B);
-    for _ in 0..200_000 {
-        let bits = rng.next_u32();
-        let f = f32::from_bits(bits);
-        // independent reference via explicit comparisons
-        let (ws, wus) = if f.is_nan() {
-            (i32::MAX as u32, u32::MAX)
+    // Interesting boundaries: saturation thresholds, tie points, small values.
+    let specials = [
+        0x0000_0000,
+        0x8000_0000,
+        CANON,
+        0x7FA0_0001,
+        f32::INFINITY.to_bits(),
+        f32::NEG_INFINITY.to_bits(),
+        2147483648.0f32.to_bits(),
+        (-2147483648.0f32).to_bits(),
+        2147483520.0f32.to_bits(),
+        4294967040.0f32.to_bits(),
+        4294967296.0f32.to_bits(),
+        0.5f32.to_bits(),
+        (-0.5f32).to_bits(),
+        1.5f32.to_bits(),
+        2.5f32.to_bits(),
+        3.5f32.to_bits(),
+        3e9f32.to_bits(),
+        (-3e9f32).to_bits(),
+        5e9f32.to_bits(),
+    ];
+    for i in 0..200_000 {
+        let bits = if i % 4 == 0 {
+            specials[(rng.next_u32() as usize) % specials.len()]
         } else {
-            let r = f.round_ties_even();
-            let ws = if r >= 2147483648.0 {
-                i32::MAX as u32
-            } else if r < -2147483648.0 {
-                i32::MIN as u32
-            } else {
-                (r as i64) as i32 as u32
-            };
-            let wus = if r >= 4294967296.0 {
-                u32::MAX
-            } else if r <= 0.0 {
-                0
-            } else {
-                r as u64 as u32
-            };
-            (ws, wus)
+            rng.next_u32()
         };
-        assert_eq!(fcvt_w_s(bits), ws, "fcvt.w.s({bits:#010x} = {f})");
-        assert_eq!(fcvt_wu_s(bits), wus, "fcvt.wu.s({bits:#010x} = {f})");
+        check_fcvt_w_s(bits, fcvt_w_s(bits));
+        check_fcvt_wu_s(bits, fcvt_wu_s(bits));
     }
 }

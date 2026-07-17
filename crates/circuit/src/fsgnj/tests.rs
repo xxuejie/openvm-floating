@@ -78,15 +78,23 @@ fn fuzz_fsgnj_all_ops() {
     for _ in 0..500_000 {
         let a = rng.next_u32();
         let b = rng.next_u32();
+        let (a_sign, b_sign) = (a >> 31, b >> 31);
         for op in 0..3u8 {
             let r = compute_fsgnj(a, b, op);
-            let expected = match op {
-                0 => (a & 0x7FFFFFFF) | (b & 0x80000000),
-                1 => (a & 0x7FFFFFFF) | (!b & 0x80000000),
-                2 => a ^ (b & 0x80000000),
+            // Magnitude always comes from a.
+            assert_eq!(r.result_bits & 0x7FFF_FFFF, a & 0x7FFF_FFFF);
+            // Sign is determined by b (and a, for fsgnjx).
+            let expected_sign = match op {
+                0 => b_sign,
+                1 => b_sign ^ 1,
+                2 => a_sign ^ b_sign,
                 _ => unreachable!(),
             };
-            assert_eq!(r.result_bits, expected);
+            assert_eq!(
+                r.result_bits >> 31,
+                expected_sign,
+                "op {op} a={a:#010x} b={b:#010x}"
+            );
         }
     }
 }
