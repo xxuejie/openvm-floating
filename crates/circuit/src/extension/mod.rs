@@ -17,7 +17,7 @@ use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
-use crate::{adapters::*, fadd::*, fminmax::*, fmul::*, fsgnj::*, fsub::*};
+use crate::{adapters::*, fadd::*, fcmp::*, fminmax::*, fmul::*, fsgnj::*, fsub::*};
 
 /// RISC-V F (single-precision floating-point) extension config.
 ///
@@ -64,6 +64,7 @@ pub enum Rv32FExecutor {
     Fsub(Rv32FsubExecutor),
     Fsgnj(Rv32FsgnjExecutor),
     Fminmax(Rv32FminmaxExecutor),
+    Fcmp(Rv32FcmpExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -105,6 +106,17 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
             [
                 FpOpcode::FMIN_S.global_opcode(),
                 FpOpcode::FMAX_S.global_opcode(),
+            ],
+        )?;
+
+        let adapter_exec = Rv32FcmpAdapterExecutor::new(self.fp_register_as);
+        let fcmp = Rv32FcmpExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
+        inventory.add_executor(
+            fcmp,
+            [
+                FpOpcode::FLE_S.global_opcode(),
+                FpOpcode::FLT_S.global_opcode(),
+                FpOpcode::FEQ_S.global_opcode(),
             ],
         )?;
         Ok(())
@@ -168,6 +180,12 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             FminmaxCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fminmax);
+
+        let fcmp = Rv32FcmpAir::new(
+            Rv32FcmpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FcmpCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fcmp);
 
         Ok(())
     }
@@ -260,6 +278,17 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fminmax);
+
+        inventory.next_air::<Rv32FcmpAir>()?;
+        let fcmp = Rv32FcmpChip::new(
+            FcmpFiller::new(
+                Rv32FcmpAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fcmp);
 
         Ok(())
     }

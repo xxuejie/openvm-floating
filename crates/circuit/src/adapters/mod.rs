@@ -1,4 +1,6 @@
+mod fcmp;
 mod fp;
+pub use fcmp::*;
 pub use fp::*;
 
 pub const RV32_FP_REGISTER_AS: u32 = 5;

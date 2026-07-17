@@ -1,8 +1,12 @@
-use openvm_instructions::{instruction::Instruction, riscv::RV32_REGISTER_NUM_LIMBS, LocalOpcode};
+use openvm_instructions::{
+    instruction::Instruction,
+    riscv::{RV32_REGISTER_AS, RV32_REGISTER_NUM_LIMBS},
+    LocalOpcode,
+};
 use openvm_rv32f_guest::{
-    FADD_S_FUNCT7, FDIV_S_FUNCT7, FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMUL_S_FUNCT7,
-    FSGNJN_FUNCT3, FSGNJX_FUNCT3, FSGNJ_FUNCT3, FSGNJ_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE,
-    RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
+    FADD_S_FUNCT7, FCMP_S_FUNCT7, FDIV_S_FUNCT7, FEQ_FUNCT3, FLE_FUNCT3, FLT_FUNCT3, FMAX_FUNCT3,
+    FMIN_FUNCT3, FMIN_S_FUNCT7, FMUL_S_FUNCT7, FSGNJN_FUNCT3, FSGNJX_FUNCT3, FSGNJ_FUNCT3,
+    FSGNJ_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
 };
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_transpiler::{TranspilerExtension, TranspilerOutput};
@@ -99,6 +103,27 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
                 F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
                 F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs2),
                 F::from_u32(self.fp_register_as),
+                F::from_u32(self.fp_register_as),
+                F::ZERO,
+                F::ZERO,
+            )));
+        }
+
+        // Compare family: dispatch on funct3 (not rm), no rounding mode check.
+        // rd is always an integer register (AS 1); rs1/rs2 are FP registers.
+        if funct7 == FCMP_S_FUNCT7 {
+            let opcode_out = match rm {
+                FLE_FUNCT3 => FpOpcode::FLE_S,
+                FLT_FUNCT3 => FpOpcode::FLT_S,
+                FEQ_FUNCT3 => FpOpcode::FEQ_S,
+                _ => return None,
+            };
+            return Some(TranspilerOutput::one_to_one(Instruction::new(
+                openvm_instructions::VmOpcode::from_usize(opcode_out.global_opcode_usize()),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs2),
+                F::from_u32(RV32_REGISTER_AS),
                 F::from_u32(self.fp_register_as),
                 F::ZERO,
                 F::ZERO,

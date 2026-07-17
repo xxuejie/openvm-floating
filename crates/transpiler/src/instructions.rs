@@ -34,4 +34,7 @@ pub enum FpOpcode {
     FSGNJX_S,
     FMIN_S,
     FMAX_S,
+    FLE_S,
+    FLT_S,
+    FEQ_S,
 }

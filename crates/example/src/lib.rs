@@ -96,6 +96,45 @@ fn fmax_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     )
 }
 
+fn feq_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FEQ_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn flt_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FLT_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn fle_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FLE_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 fn run_program(instructions: Vec<Instruction<F>>, init_memory: SparseMemoryImage) -> VmState<F> {
     let program = Program::new_without_debug_infos(&instructions, 0);
     let exe = VmExe::new(program).with_init_memory(init_memory);
@@ -365,6 +404,163 @@ fn test_fminmax_chained() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FEQ.S / FLT.S / FLE.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_feq_equal() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 2.0);
+    write_fp_reg(&mut mem, 2, 2.0);
+
+    let state = run_program(vec![feq_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 1);
+}
+
+#[test]
+fn test_feq_not_equal() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 2.0);
+    write_fp_reg(&mut mem, 2, 3.0);
+
+    let state = run_program(vec![feq_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0);
+}
+
+#[test]
+fn test_flt_true() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, -1.0);
+    write_fp_reg(&mut mem, 2, 1.0);
+
+    let state = run_program(vec![flt_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 1);
+}
+
+#[test]
+fn test_flt_false_when_equal() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.0);
+    write_fp_reg(&mut mem, 2, 1.0);
+
+    let state = run_program(vec![flt_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0);
+}
+
+#[test]
+fn test_fle_true_when_equal() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.0);
+    write_fp_reg(&mut mem, 2, 1.0);
+
+    let state = run_program(vec![fle_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 1);
+}
+
+#[test]
+fn test_fle_false() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.0);
+    write_fp_reg(&mut mem, 2, -1.0);
+
+    let state = run_program(vec![fle_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0);
+}
+
+#[test]
+fn test_fcmp_signed_zero() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 0x8000_0000); // -0.0
+    write_fp_reg_bits(&mut mem, 2, 0x0000_0000); // +0.0
+
+    let state = run_program(
+        vec![
+            feq_s(0, 1, 2), // -0.0 == +0.0 -> 1
+            flt_s(3, 1, 2), // -0.0 < +0.0  -> 0
+            fle_s(4, 1, 2), // -0.0 <= +0.0 -> 1
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 1);
+    assert_eq!(read_fp_reg_bits(&state, 3), 0);
+    assert_eq!(read_fp_reg_bits(&state, 4), 1);
+}
+
+#[test]
+fn test_fcmp_nan_is_false() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, CANONICAL_NAN);
+    write_fp_reg(&mut mem, 2, 1.0);
+
+    let state = run_program(
+        vec![
+            feq_s(0, 1, 2), // NaN == 1.0 -> 0
+            flt_s(3, 1, 2), // NaN < 1.0  -> 0
+            fle_s(4, 2, 1), // 1.0 <= NaN -> 0
+            feq_s(5, 1, 1), // NaN == NaN -> 0
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0);
+    assert_eq!(read_fp_reg_bits(&state, 3), 0);
+    assert_eq!(read_fp_reg_bits(&state, 4), 0);
+    assert_eq!(read_fp_reg_bits(&state, 5), 0);
+}
+
+#[test]
+fn test_fcmp_infinity() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, f32::INFINITY);
+    write_fp_reg(&mut mem, 2, 1.0);
+
+    let state = run_program(
+        vec![
+            flt_s(0, 1, 2), // inf < 1.0  -> 0
+            fle_s(3, 2, 1), // 1.0 <= inf -> 1
+            feq_s(4, 1, 1), // inf == inf -> 1
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0);
+    assert_eq!(read_fp_reg_bits(&state, 3), 1);
+    assert_eq!(read_fp_reg_bits(&state, 4), 1);
+}
+
+#[test]
+fn test_fcmp_chained() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 5.0);
+    write_fp_reg(&mut mem, 2, -2.0);
+    write_fp_reg(&mut mem, 3, -2.0);
+
+    let state = run_program(
+        vec![
+            flt_s(0, 1, 2), // 5.0 < -2.0   -> 0
+            fle_s(4, 2, 3), // -2.0 <= -2.0 -> 1
+            feq_s(5, 2, 3), // -2.0 == -2.0 -> 1
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0);
+    assert_eq!(read_fp_reg_bits(&state, 4), 1);
+    assert_eq!(read_fp_reg_bits(&state, 5), 1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Guest program test: builds a real rv32im ELF with inline-asm F instructions,
 // transpiles with Zfinx, and executes through the VM.
 // ════════════════════════════════════════════════════════════════════════════
@@ -547,5 +743,11 @@ mod guest_program_tests {
     #[test]
     fn test_prove_fminmax() {
         prove_guest_example("fminmax_prove");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fcmp() {
+        prove_guest_example("fcmp_prove");
     }
 }

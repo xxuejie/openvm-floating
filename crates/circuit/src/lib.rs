@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub mod adapters;
 pub mod extension;
 pub mod fadd;
+pub mod fcmp;
 pub mod fminmax;
 pub mod fmul;
 pub mod fsgnj;

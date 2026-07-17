@@ -22,6 +22,14 @@ pub const FMIN_S_FUNCT7: u8 = 0b0010100;
 pub const FMIN_FUNCT3: u8 = 0b000;
 pub const FMAX_FUNCT3: u8 = 0b001;
 
+/// funct7 for compare family (feq.s / flt.s / fle.s).
+/// These write rd to the integer register file, even in F extension mode.
+pub const FCMP_S_FUNCT7: u8 = 0b1010000;
+/// funct3 values within the compare family.
+pub const FLE_FUNCT3: u8 = 0b000;
+pub const FLT_FUNCT3: u8 = 0b001;
+pub const FEQ_FUNCT3: u8 = 0b010;
+
 /// RISC-V rounding mode (rm field, funct3 bits).
 pub const RM_RNE: u8 = 0b000; // Round to Nearest, ties to Even
 pub const RM_RTZ: u8 = 0b001; // Round toward Zero
