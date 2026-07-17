@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "openvm-rv32f-guest-programs"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+openvm = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false }
+openvm-custom-insn = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false }
+openvm-rv32f-guest = { path = "../../guest" }
+
+[profile.release]
+panic = "abort"
+lto = "thin"

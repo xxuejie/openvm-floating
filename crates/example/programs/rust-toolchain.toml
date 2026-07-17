@@ -1,0 +1,7 @@
+[toolchain]
+# Guest programs are compiled to riscv32im ELF, which requires nightly
+# for the custom target and rust-src. This file triggers automatic
+# installation via rustup when the directory is first accessed.
+channel = "nightly-2026-01-18"
+components = ["rust-src"]
+targets = ["riscv32im-risc0-zkvm-elf"]

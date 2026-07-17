@@ -284,6 +284,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d7c8918969267b2932ffd5655509bbbea0833823058c378876953217f5fc50e"
 
 [[package]]
+name = "camino"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e35af189006b9c0f00a064685c727031e3ed2d8020f7ba284d78cc2671bd36ea"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d886547e41f740c616ae73108f6eb70afe6d940c7bc697cb30f13daec073037"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.67"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1052,6 +1084,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openvm-build"
+version = "2.0.1"
+source = "git+https://github.com/openvm-org/openvm?tag=v2.0.1#b820b25baab6c5d9b055f64e0286b6b1058e707c"
+dependencies = [
+ "cargo_metadata",
+ "eyre",
+ "openvm-platform",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "openvm-circuit"
 version = "2.0.1"
 source = "git+https://github.com/openvm-org/openvm?tag=v2.0.1#b820b25baab6c5d9b055f64e0286b6b1058e707c"
@@ -1261,20 +1305,20 @@ dependencies = [
 name = "openvm-rv32f-example"
 version = "0.1.0"
 dependencies = [
+ "openvm-build",
  "openvm-circuit",
  "openvm-instructions",
  "openvm-rv32f-circuit",
- "openvm-rv32f-guest",
  "openvm-rv32f-transpiler",
+ "openvm-rv32im-circuit",
+ "openvm-rv32im-transpiler",
  "openvm-stark-sdk",
+ "openvm-transpiler",
 ]
 
 [[package]]
 name = "openvm-rv32f-guest"
 version = "0.1.0"
-dependencies = [
- "strum",
-]
 
 [[package]]
 name = "openvm-rv32f-transpiler"
@@ -1957,6 +2001,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"

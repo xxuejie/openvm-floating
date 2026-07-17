@@ -190,3 +190,127 @@ fn test_fmul_preserves_inputs() {
     assert_eq!(read_fp_reg(&state, 2), 2.5);
     assert_eq!(read_fp_reg(&state, 0), 3.5 * 2.5);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Guest program test: builds a real rv32im ELF with inline-asm F instructions,
+// transpiles with Zfinx, and executes through the VM.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod guest_program_tests {
+    use std::{fs::read, path::PathBuf};
+
+    use openvm_build::{build_guest_package, get_package, GuestOptions, TargetFilter};
+    use openvm_instructions::exe::VmExe;
+    use openvm_rv32f_transpiler::Rv32FTranspilerExtension;
+    use openvm_rv32im_transpiler::{
+        Rv32ITranspilerExtension, Rv32IoTranspilerExtension, Rv32MTranspilerExtension,
+    };
+    use openvm_transpiler::{
+        elf::Elf, openvm_platform::memory::MEM_SIZE, transpiler::Transpiler, FromElf,
+    };
+
+    use super::*;
+
+    fn programs_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("programs")
+    }
+
+    fn build_and_run_dot3(a: [f32; 3], b: [f32; 3]) -> u32 {
+        let manifest_dir = programs_dir();
+        let pkg = get_package(&manifest_dir);
+        let guest_opts = GuestOptions::default();
+        let output_dir = build_guest_package(
+            &pkg,
+            &guest_opts,
+            None,
+            &Some(TargetFilter {
+                name: "float_ops".to_string(),
+                kind: "example".to_string(),
+            }),
+        )
+        .expect("failed to build guest program");
+
+        let elf_path = output_dir.join("float_ops");
+        let data = read(&elf_path).expect("failed to read ELF");
+        let elf = Elf::decode(&data, MEM_SIZE as u32).expect("failed to decode ELF");
+
+        let exe = VmExe::from_elf(
+            elf,
+            Transpiler::<F>::default()
+                .with_extension(Rv32ITranspilerExtension)
+                .with_extension(Rv32MTranspilerExtension)
+                .with_extension(Rv32IoTranspilerExtension)
+                .with_extension(Rv32FTranspilerExtension::default()), // Zfinx mode
+        )
+        .expect("failed to transpile");
+
+        // Provide inputs: each read() call consumes one Vec<F> chunk from input_stream.
+        // Order: ax, ay, az, bx, by, bz
+        let to_fields =
+            |v: u32| -> Vec<F> { v.to_le_bytes().iter().map(|b| F::from_u8(*b)).collect() };
+        let mut streams = openvm_circuit::arch::Streams::<F>::default();
+        for &v in &[
+            a[0].to_bits(),
+            a[1].to_bits(),
+            a[2].to_bits(),
+            b[0].to_bits(),
+            b[1].to_bits(),
+            b[2].to_bits(),
+        ] {
+            streams.input_stream.push_back(to_fields(v));
+        }
+
+        let config = Rv32FConfig::default();
+        let executor = VmExecutor::new(config).expect("failed to create executor");
+        let instance = executor.instance(&exe).expect("failed to create instance");
+        let _state = instance.execute(streams, None).expect("execution failed");
+
+        // Read the dot3 result from public values slot 0
+        let bytes: [u8; 4] = unsafe { _state.memory.read::<u8, 4>(3, 0) };
+        u32::from_le_bytes(bytes)
+    }
+
+    /// Compute dot3 on the host with the same evaluation order as JoltPhysics:
+    /// ((ax*bx) + (ay*by)) + (az*bz)
+    fn host_dot3(a: [f32; 3], b: [f32; 3]) -> u32 {
+        let m1 = a[0] * b[0];
+        let m2 = a[1] * b[1];
+        let m3 = a[2] * b[2];
+        let s1 = m1 + m2;
+        (s1 + m3).to_bits()
+    }
+
+    #[test]
+    fn test_guest_dot3_basic() {
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 5.0, 6.0];
+        let result = build_and_run_dot3(a, b);
+        assert_eq!(result, host_dot3(a, b), "dot3([1,2,3],[4,5,6]) = 32");
+    }
+
+    #[test]
+    fn test_guest_dot3_fractions() {
+        let a = [0.1f32, 0.2, 0.3];
+        let b = [1.0f32, 1.0, 1.0];
+        let result = build_and_run_dot3(a, b);
+        assert_eq!(result, host_dot3(a, b), "dot3 with fractions");
+    }
+
+    #[test]
+    fn test_guest_dot3_negative() {
+        let a = [-1.0f32, 2.0, -3.0];
+        let b = [4.0f32, -5.0, 6.0];
+        let result = build_and_run_dot3(a, b);
+        assert_eq!(result, host_dot3(a, b), "dot3 with negatives = -32");
+    }
+
+    #[test]
+    fn test_guest_dot3_physics_like() {
+        // Physics-like values: position/velocity magnitudes
+        let a = [9.81f32, -0.001, 3.5];
+        let b = [0.3048f32, 1000.0, -2.0];
+        let result = build_and_run_dot3(a, b);
+        assert_eq!(result, host_dot3(a, b), "physics-like dot3");
+    }
+}

@@ -13,6 +13,11 @@ openvm-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1",
     "test-utils",
 ] }
 openvm-instructions = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-build = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
 openvm-rv32f-circuit = { path = "../circuit" }
 openvm-rv32f-transpiler = { path = "../transpiler" }
-openvm-rv32f-guest = { path = "../guest" }
+
+[dev-dependencies]
+openvm-rv32im-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false }
+openvm-rv32im-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
