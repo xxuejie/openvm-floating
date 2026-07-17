@@ -17,7 +17,7 @@ use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
-use crate::{adapters::*, fmul::*};
+use crate::{adapters::*, fadd::*, fmul::*};
 
 /// RISC-V F (single-precision floating-point) extension config.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -44,6 +44,7 @@ impl Default for Rv32F {
 )]
 pub enum Rv32FExecutor {
     Fmul(Rv32FmulExecutor),
+    Fadd(Rv32FaddExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -55,6 +56,9 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
     ) -> Result<(), ExecutorInventoryError> {
         let fmul = Rv32FmulExecutor::new(Rv32FpAdapterExecutor, FpOpcode::CLASS_OFFSET);
         inventory.add_executor(fmul, [FpOpcode::FMUL_S.global_opcode()])?;
+
+        let fadd = Rv32FaddExecutor::new(Rv32FpAdapterExecutor, FpOpcode::CLASS_OFFSET);
+        inventory.add_executor(fadd, [FpOpcode::FADD_S.global_opcode()])?;
         Ok(())
     }
 }
@@ -91,6 +95,12 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             FmulCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fmul);
+
+        let fadd = Rv32FaddAir::new(
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge),
+            FaddCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fadd);
 
         Ok(())
     }
@@ -143,6 +153,17 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fmul);
+
+        inventory.next_air::<Rv32FaddAir>()?;
+        let fadd = Rv32FaddChip::new(
+            FaddFiller::new(
+                Rv32FpAdapterFiller,
+                range_tuple_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fadd);
 
         Ok(())
     }

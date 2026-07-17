@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod adapters;
 pub mod extension;
+pub mod fadd;
 pub mod fmul;
 
 pub use extension::*;
