@@ -1,11 +1,18 @@
 #![allow(unexpected_cfgs)]
 
 use openvm_circuit::{
-    arch::{InitFileGenerator, SystemConfig},
-    system::SystemExecutor,
+    arch::{
+        AirInventory, ChipInventoryError, InitFileGenerator, MatrixRecordArena, SystemConfig,
+        VmBuilder, VmChipComplex, VmField, VmProverExtension,
+    },
+    system::{SystemChipInventory, SystemCpuBuilder, SystemExecutor},
 };
 use openvm_circuit_derive::VmConfig;
-use openvm_rv32im_circuit::{Rv32I, Rv32IExecutor, Rv32Io, Rv32IoExecutor, Rv32M, Rv32MExecutor};
+use openvm_cpu_backend::{CpuBackend, CpuDevice};
+use openvm_rv32im_circuit::{
+    Rv32I, Rv32IExecutor, Rv32ImCpuProverExt, Rv32Io, Rv32IoExecutor, Rv32M, Rv32MExecutor,
+};
+use openvm_stark_backend::{StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
 pub mod adapters;
@@ -36,8 +43,6 @@ impl Default for Rv32FConfig {
     fn default() -> Self {
         let f = Rv32F::default();
         let mut system = SystemConfig::default();
-        // For F extension mode (AS 5), allocate the FP register file.
-        // Zfinx mode (AS 1) reuses the existing integer register file — no allocation needed.
         if f.fp_register_as != 1 {
             use openvm_circuit::arch::MemoryCellType;
             system.memory_config.addr_spaces[f.fp_register_as as usize].num_cells = 32 * 4;
@@ -50,5 +55,44 @@ impl Default for Rv32FConfig {
             mul: Default::default(),
             f,
         }
+    }
+}
+
+/// CPU builder for rv32imf — chains system + base + io + mul + F prover extensions.
+#[derive(Clone)]
+pub struct Rv32FCpuBuilder;
+
+impl<SC, E> VmBuilder<E> for Rv32FCpuBuilder
+where
+    SC: StarkProtocolConfig,
+    E: StarkEngine<SC = SC, PB = CpuBackend<SC>, PD = CpuDevice<SC>>,
+    Val<SC>: VmField,
+    SC::EF: Ord,
+{
+    type VmConfig = Rv32FConfig;
+    type SystemChipInventory = SystemChipInventory<SC>;
+    type RecordArena = MatrixRecordArena<Val<SC>>;
+
+    fn create_chip_complex(
+        &self,
+        config: &Rv32FConfig,
+        circuit: AirInventory<SC>,
+        device_ctx: &openvm_stark_backend::EngineDeviceCtx<E>,
+    ) -> Result<
+        VmChipComplex<SC, Self::RecordArena, E::PB, Self::SystemChipInventory>,
+        ChipInventoryError,
+    > {
+        let mut chip_complex = VmBuilder::<E>::create_chip_complex(
+            &SystemCpuBuilder,
+            &config.system,
+            circuit,
+            device_ctx,
+        )?;
+        let inventory = &mut chip_complex.inventory;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.base, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.io, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.mul, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32FCpuProverExt, &config.f, inventory)?;
+        Ok(chip_complex)
     }
 }

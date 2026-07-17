@@ -116,3 +116,84 @@ unsafe fn execute_fmul_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
     let pc = exec_state.pc();
     exec_state.set_pc(pc.wrapping_add(DEFAULT_PC_STEP));
 }
+
+// === Metered executor (for proving / preflight) ===
+
+impl<A, F> InterpreterMeteredExecutor<F> for FmulExecutor<A>
+where
+    F: PrimeField32,
+{
+    fn metered_pre_compute_size(&self) -> usize {
+        std::mem::size_of::<E2PreCompute<FpPreCompute>>()
+    }
+
+    #[cfg(not(feature = "tco"))]
+    fn metered_pre_compute<Ctx>(
+        &self,
+        chip_idx: usize,
+        pc: u32,
+        inst: &Instruction<F>,
+        data: &mut [u8],
+    ) -> Result<ExecuteFunc<F, Ctx>, StaticProgramError>
+    where
+        Ctx: MeteredExecutionCtxTrait,
+    {
+        let pre_compute: &mut E2PreCompute<FpPreCompute> = data.borrow_mut();
+        pre_compute.chip_idx = chip_idx as u32;
+        self.pre_compute_impl(pc, inst, &mut pre_compute.data)?;
+        Ok(execute_fmul_metered)
+    }
+
+    #[cfg(feature = "tco")]
+    fn metered_handler<Ctx>(
+        &self,
+        chip_idx: usize,
+        pc: u32,
+        inst: &Instruction<F>,
+        data: &mut [u8],
+    ) -> Result<Handler<F, Ctx>, StaticProgramError>
+    where
+        Ctx: MeteredExecutionCtxTrait,
+    {
+        let pre_compute: &mut E2PreCompute<FpPreCompute> = data.borrow_mut();
+        pre_compute.chip_idx = chip_idx as u32;
+        self.pre_compute_impl(pc, inst, &mut pre_compute.data)?;
+        Ok(execute_fmul_metered_handler)
+    }
+}
+
+#[cfg(not(feature = "tco"))]
+#[create_handler]
+#[inline(always)]
+unsafe fn execute_fmul_metered<F: PrimeField32, CTX: MeteredExecutionCtxTrait>(
+    pre_compute: *const u8,
+    exec_state: &mut VmExecState<F, GuestMemory, CTX>,
+) {
+    let pre_compute: &E2PreCompute<FpPreCompute> = std::slice::from_raw_parts(
+        pre_compute,
+        std::mem::size_of::<E2PreCompute<FpPreCompute>>(),
+    )
+    .borrow();
+    exec_state
+        .ctx
+        .on_height_change(pre_compute.chip_idx as usize, 1);
+    execute_fmul_core(&pre_compute.data, exec_state);
+}
+
+#[cfg(feature = "tco")]
+#[create_handler]
+#[inline(always)]
+unsafe fn execute_fmul_metered_handler<F: PrimeField32, CTX: MeteredExecutionCtxTrait>(
+    pre_compute: *const u8,
+    exec_state: &mut VmExecState<F, GuestMemory, CTX>,
+) {
+    let pre_compute: &E2PreCompute<FpPreCompute> = std::slice::from_raw_parts(
+        pre_compute,
+        std::mem::size_of::<E2PreCompute<FpPreCompute>>(),
+    )
+    .borrow();
+    exec_state
+        .ctx
+        .on_height_change(pre_compute.chip_idx as usize, 1);
+    execute_fmul_core(&pre_compute.data, exec_state);
+}

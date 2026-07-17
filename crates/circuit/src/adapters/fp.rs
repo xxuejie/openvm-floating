@@ -121,7 +121,7 @@ impl<AB: InteractionBuilder> VmAdapterAir<AB> for Rv32FpAdapterAir {
                     local.rs1_ptr.into(),
                     local.rs2_ptr.into(),
                     fp_as.into(),
-                    AB::Expr::ZERO,
+                    fp_as.into(),
                 ],
                 local.from_state,
                 AB::F::from_usize(timestamp_delta),

@@ -313,4 +313,60 @@ mod guest_program_tests {
         let result = build_and_run_dot3(a, b);
         assert_eq!(result, host_dot3(a, b), "physics-like dot3");
     }
+
+    /// Helper: build a guest example, transpile, and run air_test.
+    #[cfg(feature = "proving")]
+    fn prove_guest_example(example_name: &str) {
+        use openvm_circuit::utils::air_test;
+        use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+        let manifest_dir = programs_dir();
+        let pkg = get_package(&manifest_dir);
+        let guest_opts = GuestOptions::default();
+        let output_dir = build_guest_package(
+            &pkg,
+            &guest_opts,
+            None,
+            &Some(TargetFilter {
+                name: example_name.to_string(),
+                kind: "example".to_string(),
+            }),
+        )
+        .unwrap_or_else(|e| panic!("failed to build guest program {example_name}: {e:?}"));
+
+        let elf_path = output_dir.join(example_name);
+        let data = read(&elf_path).expect("failed to read ELF");
+        let elf = Elf::decode(&data, MEM_SIZE as u32).expect("failed to decode ELF");
+
+        let exe = VmExe::from_elf(
+            elf,
+            Transpiler::<F>::default()
+                .with_extension(Rv32ITranspilerExtension)
+                .with_extension(Rv32MTranspilerExtension)
+                .with_extension(Rv32IoTranspilerExtension)
+                .with_extension(Rv32FTranspilerExtension::default()),
+        )
+        .expect("failed to transpile");
+
+        let config = Rv32FConfig::default();
+        air_test(Rv32FCpuBuilder, config, exe);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fmul_only() {
+        prove_guest_example("fmul_only");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fadd_only() {
+        prove_guest_example("fadd_only");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_dot3() {
+        prove_guest_example("dot3_prove");
+    }
 }

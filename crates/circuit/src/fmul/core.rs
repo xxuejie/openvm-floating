@@ -50,6 +50,10 @@ pub struct FmulCoreCols<T> {
     pub b_exp_max_inv: T,
     pub b_mant_sum_inv: T,
 
+    // Significand construction (stored as columns to keep carry chain degree low)
+    pub a_sig: [T; SIG_NUM_LIMBS],
+    pub b_sig: [T; SIG_NUM_LIMBS],
+
     // Product
     pub product: [T; PRODUCT_NUM_LIMBS],
 
@@ -167,16 +171,17 @@ where
         builder.assert_eq(cols.result_sign, r_sign);
 
         // ── Phase 3: Significand construction ────────────────────────────
-        let a_sig: [AB::Expr; SIG_NUM_LIMBS] = [
-            cols.a_mant0.into(),
-            cols.a_mant1.into(),
-            cols.a_mant2 + a_is_normal.clone() * f128,
-        ];
-        let b_sig: [AB::Expr; SIG_NUM_LIMBS] = [
-            cols.b_mant0.into(),
-            cols.b_mant1.into(),
-            cols.b_mant2 + b_is_normal.clone() * f128,
-        ];
+        // Significands are stored as columns (degree 1) to keep the carry chain
+        // at degree 2. Verify: a_sig[2] = a_mant2 + is_normal * 128
+        builder.assert_eq(cols.a_sig[0], cols.a_mant0);
+        builder.assert_eq(cols.a_sig[1], cols.a_mant1);
+        builder.assert_eq(cols.a_sig[2], cols.a_mant2 + a_is_normal.clone() * f128);
+        builder.assert_eq(cols.b_sig[0], cols.b_mant0);
+        builder.assert_eq(cols.b_sig[1], cols.b_mant1);
+        builder.assert_eq(cols.b_sig[2], cols.b_mant2 + b_is_normal.clone() * f128);
+
+        let a_sig: [AB::Var; SIG_NUM_LIMBS] = [cols.a_sig[0], cols.a_sig[1], cols.a_sig[2]];
+        let b_sig: [AB::Var; SIG_NUM_LIMBS] = [cols.b_sig[0], cols.b_sig[1], cols.b_sig[2]];
 
         // ── Phase 4: Product carry chain ─────────────────────────────────
         let carry_divide: AB::F = AB::F::from_u32(1 << LIMB_BITS).inverse();
@@ -191,7 +196,7 @@ where
             let mut expected = prev;
             for k in 0..SIG_NUM_LIMBS {
                 if k <= i && (i - k) < SIG_NUM_LIMBS {
-                    expected += a_sig[k].clone() * b_sig[i - k].clone();
+                    expected += a_sig[k] * b_sig[i - k];
                 }
             }
             carry[i] = (expected - cols.product[i]) * carry_divide;
@@ -207,8 +212,17 @@ where
 
         // ── Phase 5: Normalization ───────────────────────────────────────
         builder.assert_bool(cols.is_high);
-        // product[5] = p5_lo + (is_high + 2) * 64
-        builder.assert_eq(cols.product[5], cols.p5_lo + (cols.is_high + f2) * f64);
+        // product[5] has bit 47 or bit 46 set (for normal×normal).
+        // When is_high=1 (bit 47 set): product[5] = p5_lo + 128
+        // When is_high=0 (bit 46 set, 47 clear): product[5] = p5_lo + 64
+        builder
+            .when(cols.is_valid)
+            .when(cols.is_high)
+            .assert_eq(cols.product[5], cols.p5_lo + f128);
+        builder
+            .when(cols.is_valid)
+            .when(not(cols.is_high))
+            .assert_eq(cols.product[5], cols.p5_lo + f64);
 
         // Verify norm_sig: when is_high, norm_sig = product; when !is_high, norm_sig = product << 1
         let mut shift_carry = AB::Expr::ZERO;
@@ -218,16 +232,19 @@ where
                 .when(cols.is_high)
                 .assert_eq(cols.norm_sig[i], cols.product[i]);
 
-            // !is_high case: shift left by 1
+            // !is_high case: shift left by 1 (carry chain stays degree 1)
             let shifted = cols.product[i] * f2 + shift_carry.clone();
             let new_carry = (shifted.clone() - cols.norm_sig[i]) * carry_divide;
-            // When !is_high: norm_sig[i] = shifted - new_carry * 256
             builder
                 .when(not(cols.is_high))
                 .assert_eq(cols.norm_sig[i], shifted - new_carry.clone() * f256);
             shift_carry = new_carry;
         }
-        builder.when(cols.is_valid).assert_zero(shift_carry);
+        // Only enforce shift carry == 0 when !is_high (skipped for is_high rows)
+        builder
+            .when(cols.is_valid)
+            .when(not(cols.is_high))
+            .assert_zero(shift_carry);
 
         // ── Phase 6: RNE rounding ────────────────────────────────────────
         builder.assert_bool(cols.guard);
@@ -251,8 +268,9 @@ where
         builder.assert_bool(cols.round_up);
 
         // ── Phase 7: Result exponent (normal case) ──────────────────────
-        let exp_normal = a_exp + b_exp - AB::F::from_u32(126) + cols.is_high;
+        let exp_normal = a_exp + b_exp - AB::F::from_u32(127) + cols.is_high;
         builder
+            .when(cols.is_valid)
             .when(not(cols.is_special))
             .assert_eq(cols.result_exp, exp_normal);
 
@@ -515,6 +533,15 @@ fn fill_fmul_witness<F: PrimeField32>(
     } else {
         b_mant0 | (b_mant1 << 8) | (b_mant2 << 16)
     };
+
+    // Fill significand columns
+    row.a_sig[0] = F::from_u32(a_sig & 0xFF);
+    row.a_sig[1] = F::from_u32((a_sig >> 8) & 0xFF);
+    row.a_sig[2] = F::from_u32((a_sig >> 16) & 0xFF);
+    row.b_sig[0] = F::from_u32(b_sig & 0xFF);
+    row.b_sig[1] = F::from_u32((b_sig >> 8) & 0xFF);
+    row.b_sig[2] = F::from_u32((b_sig >> 16) & 0xFF);
+
     let prod = (a_sig as u64) * (b_sig as u64);
 
     // Product limbs + range check sends
@@ -539,7 +566,9 @@ fn fill_fmul_witness<F: PrimeField32>(
     // Normalization
     let is_high = (prod >> 47) & 1 == 1;
     row.is_high = F::from_bool(is_high);
-    row.p5_lo = F::from_u32((prod >> 40) as u32 & 0x3F);
+    let p5 = (prod >> 40) as u32 & 0xFF;
+    let p5_lo = if is_high { p5 - 128 } else { p5 - 64 };
+    row.p5_lo = F::from_u32(p5_lo);
     let norm = if is_high { prod } else { prod << 1 };
     for i in 0..PRODUCT_NUM_LIMBS {
         row.norm_sig[i] = F::from_u32((norm >> (i * LIMB_BITS)) as u32 & 0xFF);

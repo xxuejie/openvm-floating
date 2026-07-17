@@ -51,7 +51,12 @@ impl Default for Rv32F {
 
 /// F-extension executor enum.
 #[derive(
-    Clone, From, AnyEnum, openvm_circuit_derive::Executor, openvm_circuit_derive::PreflightExecutor,
+    Clone,
+    From,
+    AnyEnum,
+    openvm_circuit_derive::Executor,
+    openvm_circuit_derive::MeteredExecutor,
+    openvm_circuit_derive::PreflightExecutor,
 )]
 pub enum Rv32FExecutor {
     Fmul(Rv32FmulExecutor),
