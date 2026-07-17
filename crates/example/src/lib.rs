@@ -70,6 +70,19 @@ fn fadd_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     )
 }
 
+fn fdiv_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FDIV_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 fn fmin_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     Instruction::new(
         VmOpcode::from_usize(FpOpcode::FMIN_S.global_opcode_usize()),
@@ -900,6 +913,75 @@ fn test_fma_zero_operand() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FDIV.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fdiv_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 12.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+
+    let state = run_program(vec![fdiv_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 3.0);
+}
+
+#[test]
+fn test_fdiv_fraction() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.0);
+    write_fp_reg(&mut mem, 2, 3.0);
+
+    let state = run_program(vec![fdiv_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 1.0 / 3.0);
+}
+
+#[test]
+fn test_fdiv_special() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.0);
+    write_fp_reg_bits(&mut mem, 2, 0x0000_0000); // +0.0
+    write_fp_reg(&mut mem, 3, f32::INFINITY);
+
+    let state = run_program(
+        vec![
+            fdiv_s(4, 1, 2), // 1.0 / +0.0 = +inf
+            fdiv_s(5, 2, 2), // 0 / 0 = canonical NaN
+            fdiv_s(6, 3, 3), // inf / inf = canonical NaN
+            fdiv_s(7, 1, 3), // 1.0 / inf = +0.0
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 4), f32::INFINITY);
+    assert_eq!(read_fp_reg_bits(&state, 5), CANONICAL_NAN);
+    assert_eq!(read_fp_reg_bits(&state, 6), CANONICAL_NAN);
+    assert_eq!(read_fp_reg_bits(&state, 7), 0);
+}
+
+#[test]
+fn test_fdiv_negative_sign() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, -7.0);
+    write_fp_reg(&mut mem, 2, 2.0);
+
+    let state = run_program(
+        vec![
+            fdiv_s(0, 1, 2), // -7/2 = -3.5
+            fdiv_s(3, 2, 1), // 2/-7 = -0.2857...
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 0), -3.5);
+    assert_eq!(read_fp_reg(&state, 3), 2.0 / -7.0);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Execution-level fuzz: random operands through the VM interpreter, verified
 // against the native semantics helpers from the circuit crate.
 // ════════════════════════════════════════════════════════════════════════════
@@ -911,6 +993,7 @@ mod fuzz_tests {
         fcmp::{fcmp_result, FcmpOp},
         fcvt_f2i::fcvt_f2i_result,
         fcvt_i2f::fcvt_i2f_result,
+        fdiv::fdiv_s as fdiv_native,
         fma::{fmadd_result, FmaddOp},
         fminmax::fminmax_result,
     };
@@ -1156,6 +1239,19 @@ mod fuzz_tests {
     }
 
     #[test]
+    fn fuzz_exec_fdiv() {
+        let mut rng = XorShift64::new(0xA11C_E007);
+        let cases: Vec<(u32, u32)> = (0..150)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        fuzz_binary(
+            &cases,
+            |rd, rs1, rs2, _| fdiv_s(rd, rs1, rs2),
+            |a, b, _| fdiv_native(a, b),
+        );
+    }
+
+    #[test]
     fn fuzz_exec_fcvt_i2f() {
         let mut rng = XorShift64::new(0xA11C_E005);
         let cases: Vec<u32> = (0..150).map(|_| rand_bits(&mut rng)).collect();
@@ -1279,6 +1375,17 @@ mod fuzz_tests {
                 FmaddOp::Nmsub => fnmsub_s(rd, rs1, rs2, rs3),
                 FmaddOp::Nmadd => fnmadd_s(rd, rs1, rs2, rs3),
             });
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fdiv() {
+        let mut rng = XorShift64::new(0xB0B0_0007);
+        let cases: Vec<(u32, u32)> = (0..15)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fdiv_s(rd, rs1, rs2));
         prove_chunk(instrs, mem);
     }
 }
@@ -1484,6 +1591,12 @@ mod guest_program_tests {
     #[test]
     fn test_prove_fma() {
         prove_guest_example("fma_prove");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fdiv() {
+        prove_guest_example("fdiv_prove");
     }
 }
 

@@ -22,6 +22,7 @@ pub mod fclass;
 pub mod fcmp;
 pub mod fcvt_f2i;
 pub mod fcvt_i2f;
+pub mod fdiv;
 pub mod fma;
 pub mod fminmax;
 pub mod fmul;

@@ -18,8 +18,8 @@ use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolCon
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fma::*, fminmax::*,
-    fmul::*, fsgnj::*, fsub::*,
+    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fdiv::*, fma::*,
+    fminmax::*, fmul::*, fsgnj::*, fsub::*,
 };
 
 /// RISC-V F (single-precision floating-point) extension config.
@@ -72,6 +72,7 @@ pub enum Rv32FExecutor {
     FcvtF2I(Rv32FcvtF2IExecutor),
     FcvtI2F(Rv32FcvtI2FExecutor),
     Fma(Rv32FmaExecutor),
+    Fdiv(Rv32FdivExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -88,6 +89,10 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
         let fadd = Rv32FaddExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
         inventory.add_executor(fadd, [FpOpcode::FADD_S.global_opcode()])?;
+
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fdiv = Rv32FdivExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
+        inventory.add_executor(fdiv, [FpOpcode::FDIV_S.global_opcode()])?;
 
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
         let fsub = Rv32FsubExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
@@ -221,6 +226,12 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         );
         inventory.add_air(fadd);
 
+        let fdiv = Rv32FdivAir::new(
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FdivCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fdiv);
+
         let fsub = Rv32FsubAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
             FsubCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
@@ -346,6 +357,17 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fadd);
+
+        inventory.next_air::<Rv32FdivAir>()?;
+        let fdiv = Rv32FdivChip::new(
+            FdivFiller::new(
+                Rv32FpAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fdiv);
 
         inventory.next_air::<Rv32FsubAir>()?;
         let fsub = Rv32FsubChip::new(
