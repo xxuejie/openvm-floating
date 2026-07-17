@@ -1,0 +1,17 @@
+[package]
+name = "openvm-rv32f-transpiler"
+description = "Transpiler extension for RISC-V F extension on OpenVM"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-instructions = { workspace = true }
+openvm-instructions-derive = { workspace = true }
+openvm-transpiler = { workspace = true }
+openvm-rv32f-guest = { path = "../guest" }
+openvm-stark-backend = { workspace = true }
+rrs-lib = { workspace = true }
+serde = { workspace = true }
+strum = { workspace = true }

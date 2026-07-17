@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/guest", "crates/transpiler", "crates/circuit"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["OpenVM Floating Point Extension Contributors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+openvm-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false }
+openvm-circuit-primitives = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-circuit-primitives-derive = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-circuit-derive = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-instructions = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-instructions-derive = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-rv32im-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false }
+openvm-rv32im-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-rv32im-guest = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-stark-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
+openvm-cpu-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
+openvm-stark-sdk = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+
+# Third-party
+derive-new = "0.7"
+derive_more = { version = "2", features = ["from"] }
+serde = { version = "1", features = ["derive"] }
+strum = { version = "0.26", features = ["derive"] }
+rrs-lib = "0.1"

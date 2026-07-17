@@ -1,0 +1,13 @@
+[package]
+name = "openvm-rv32f-guest"
+description = "Guest library constants for RISC-V F extension on OpenVM"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+strum = { workspace = true }
+
+[lib]
+doctest = false
