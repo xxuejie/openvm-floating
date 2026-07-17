@@ -46,6 +46,14 @@ pub const FCVT_S_W_FUNCT7: u8 = 0b1101000;
 pub const FCVT_RS2_W: u8 = 0b00000;
 pub const FCVT_RS2_WU: u8 = 0b00001;
 
+/// Major opcodes for the fused multiply-add family (R4 format).
+/// All take a third source register rs3 in bits [31:27] and a 2-bit fmt
+/// field in bits [26:25] (0b00 = single precision).
+pub const FMADD_S_OPCODE: u8 = 0b1000011;
+pub const FMSUB_S_OPCODE: u8 = 0b1000111;
+pub const FNMSUB_S_OPCODE: u8 = 0b1001011;
+pub const FNMADD_S_OPCODE: u8 = 0b1001111;
+
 /// RISC-V rounding mode (rm field, funct3 bits).
 pub const RM_RNE: u8 = 0b000; // Round to Nearest, ties to Even
 pub const RM_RTZ: u8 = 0b001; // Round toward Zero

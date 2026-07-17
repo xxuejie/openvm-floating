@@ -18,8 +18,8 @@ use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolCon
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fminmax::*, fmul::*,
-    fsgnj::*, fsub::*,
+    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fma::*, fminmax::*,
+    fmul::*, fsgnj::*, fsub::*,
 };
 
 /// RISC-V F (single-precision floating-point) extension config.
@@ -71,6 +71,7 @@ pub enum Rv32FExecutor {
     Fclass(Rv32FclassExecutor),
     FcvtF2I(Rv32FcvtF2IExecutor),
     FcvtI2F(Rv32FcvtI2FExecutor),
+    Fma(Rv32FmaExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -162,6 +163,18 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
             [
                 FpOpcode::FCVT_S_W.global_opcode(),
                 FpOpcode::FCVT_S_WU.global_opcode(),
+            ],
+        )?;
+
+        let adapter_exec = Rv32Fp3AdapterExecutor::new(self.fp_register_as);
+        let fma = Rv32FmaExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
+        inventory.add_executor(
+            fma,
+            [
+                FpOpcode::FMADD_S.global_opcode(),
+                FpOpcode::FMSUB_S.global_opcode(),
+                FpOpcode::FNMSUB_S.global_opcode(),
+                FpOpcode::FNMADD_S.global_opcode(),
             ],
         )?;
         Ok(())
@@ -264,6 +277,12 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             FcvtI2FCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fcvt_i2f);
+
+        let fma = Rv32FmaAir::new(
+            Rv32Fp3AdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FmaCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fma);
 
         Ok(())
     }
@@ -400,6 +419,17 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fcvt_i2f);
+
+        inventory.next_air::<Rv32FmaAir>()?;
+        let fma = Rv32FmaChip::new(
+            FmaFiller::new(
+                Rv32Fp3AdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fma);
 
         Ok(())
     }

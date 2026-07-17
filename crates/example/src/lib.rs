@@ -169,6 +169,37 @@ fn fcvt_s_wu(rd: u32, rs1: u32) -> Instruction<F> {
     fp_unary(FpOpcode::FCVT_S_WU, rd, rs1)
 }
 
+/// Ternary FP instruction (fused multiply-add family): rd, rs1, rs2, rs3.
+/// Operand layout: a=rd, b=rs1, c=rs2, d=rs3, e=address space.
+fn fp_ternary(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(opcode.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_usize(4 * rs3 as usize),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn fmadd_s(rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+    fp_ternary(FpOpcode::FMADD_S, rd, rs1, rs2, rs3)
+}
+
+fn fmsub_s(rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+    fp_ternary(FpOpcode::FMSUB_S, rd, rs1, rs2, rs3)
+}
+
+fn fnmsub_s(rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+    fp_ternary(FpOpcode::FNMSUB_S, rd, rs1, rs2, rs3)
+}
+
+fn fnmadd_s(rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+    fp_ternary(FpOpcode::FNMADD_S, rd, rs1, rs2, rs3)
+}
+
 fn run_program(instructions: Vec<Instruction<F>>, init_memory: SparseMemoryImage) -> VmState<F> {
     let program = Program::new_without_debug_infos(&instructions, 0);
     let exe = VmExe::new(program).with_init_memory(init_memory);
@@ -763,6 +794,112 @@ fn test_fcvt_roundtrip() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FMADD.S / FMSUB.S / FNMSUB.S / FNMADD.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fmadd_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+    write_fp_reg(&mut mem, 3, 1.0);
+
+    let state = run_program(vec![fmadd_s(0, 1, 2, 3), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 13.0);
+}
+
+#[test]
+fn test_fmsub_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+    write_fp_reg(&mut mem, 3, 1.0);
+
+    let state = run_program(vec![fmsub_s(0, 1, 2, 3), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 11.0);
+}
+
+#[test]
+fn test_fnmsub_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+    write_fp_reg(&mut mem, 3, 1.0);
+
+    let state = run_program(vec![fnmsub_s(0, 1, 2, 3), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), -11.0); // -(3*4) + 1
+}
+
+#[test]
+fn test_fnmadd_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+    write_fp_reg(&mut mem, 3, 1.0);
+
+    let state = run_program(vec![fnmadd_s(0, 1, 2, 3), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), -13.0); // -(3*4) - 1
+}
+
+#[test]
+fn test_fma_fused_single_rounding() {
+    // (1 + 2^-12)^2 - 1 = 2^-11 + 2^-24: only survives with fused rounding.
+    let mut mem = SparseMemoryImage::new();
+    let a = 1.0f32 + 2f32.powi(-12);
+    write_fp_reg(&mut mem, 1, a);
+    write_fp_reg(&mut mem, 2, -1.0);
+
+    let state = run_program(vec![fmadd_s(0, 1, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 2f32.powi(-11) + 2f32.powi(-24));
+}
+
+#[test]
+fn test_fma_inf_and_nan() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, f32::INFINITY);
+    write_fp_reg(&mut mem, 2, 2.0);
+    write_fp_reg(&mut mem, 3, 1.0);
+    write_fp_reg(&mut mem, 4, f32::NEG_INFINITY);
+    write_fp_reg_bits(&mut mem, 5, CANONICAL_NAN);
+
+    let state = run_program(
+        vec![
+            fmadd_s(6, 1, 2, 3),   // inf * 2 + 1 = inf
+            fmadd_s(7, 1, 2, 4),   // inf * 2 + (-inf) = canonical NaN
+            fmadd_s(8, 1, 3, 5),   // inf * 1 + NaN = canonical NaN
+            fmsub_s(9, 2, 2, 3),   // 2*2 - 1 = 3.0
+            fnmsub_s(10, 1, 2, 4), // -(inf * 2) + (-inf) = -inf
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 6), f32::INFINITY);
+    assert_eq!(read_fp_reg_bits(&state, 7), CANONICAL_NAN);
+    assert_eq!(read_fp_reg_bits(&state, 8), CANONICAL_NAN);
+    assert_eq!(read_fp_reg(&state, 9), 3.0);
+    assert_eq!(read_fp_reg(&state, 10), f32::NEG_INFINITY);
+}
+
+#[test]
+fn test_fma_zero_operand() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 0x0000_0000); // +0.0
+    write_fp_reg(&mut mem, 2, f32::INFINITY);
+    write_fp_reg(&mut mem, 3, 1.0);
+
+    let state = run_program(vec![fmadd_s(0, 1, 2, 3), terminate()], mem);
+
+    // 0 * inf is invalid -> canonical NaN
+    assert_eq!(read_fp_reg_bits(&state, 0), CANONICAL_NAN);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Execution-level fuzz: random operands through the VM interpreter, verified
 // against the native semantics helpers from the circuit crate.
 // ════════════════════════════════════════════════════════════════════════════
@@ -774,6 +911,7 @@ mod fuzz_tests {
         fcmp::{fcmp_result, FcmpOp},
         fcvt_f2i::fcvt_f2i_result,
         fcvt_i2f::fcvt_i2f_result,
+        fma::{fmadd_result, FmaddOp},
         fminmax::fminmax_result,
     };
 
@@ -960,6 +1098,63 @@ mod fuzz_tests {
         );
     }
 
+    /// Builds one program of ternary FP ops (inputs in regs 1..30, rd aliases
+    /// rs1 so results stay readable; max 10 cases).
+    fn build_ternary_chunk(
+        chunk: &[(u32, u32, u32)],
+        make: &mut impl FnMut(u32, u32, u32, u32, usize) -> Instruction<F>,
+    ) -> (Vec<Instruction<F>>, SparseMemoryImage) {
+        let mut mem = SparseMemoryImage::new();
+        let mut instrs = Vec::new();
+        for (i, &(a, b, c)) in chunk.iter().enumerate() {
+            let rs1 = 3 * i as u32 + 1;
+            let rs2 = rs1 + 1;
+            let rs3 = rs1 + 2;
+            write_fp_reg_bits(&mut mem, rs1, a);
+            write_fp_reg_bits(&mut mem, rs2, b);
+            write_fp_reg_bits(&mut mem, rs3, c);
+            instrs.push(make(rs1, rs1, rs2, rs3, i));
+        }
+        instrs.push(terminate());
+        (instrs, mem)
+    }
+
+    #[test]
+    fn fuzz_exec_fma() {
+        const OPS: [FmaddOp; 4] = [FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd];
+        let mut rng = XorShift64::new(0xA11C_E006);
+        let cases: Vec<(u32, u32, u32)> = (0..100)
+            .map(|_| {
+                (
+                    rand_bits(&mut rng),
+                    rand_bits(&mut rng),
+                    rand_bits(&mut rng),
+                )
+            })
+            .collect();
+        for (chunk_idx, chunk) in cases.chunks(10).enumerate() {
+            let (instrs, mem) =
+                build_ternary_chunk(chunk, &mut |rd, rs1, rs2, rs3, i| match OPS[i % 4] {
+                    FmaddOp::Madd => fmadd_s(rd, rs1, rs2, rs3),
+                    FmaddOp::Msub => fmsub_s(rd, rs1, rs2, rs3),
+                    FmaddOp::Nmsub => fnmsub_s(rd, rs1, rs2, rs3),
+                    FmaddOp::Nmadd => fnmadd_s(rd, rs1, rs2, rs3),
+                });
+            let state = run_program(instrs, mem);
+            for (i, &(a, b, c)) in chunk.iter().enumerate() {
+                let rs1 = 3 * i as u32 + 1;
+                let got = read_fp_reg_bits(&state, rs1);
+                let want = fmadd_result(a, b, c, OPS[i % 4]);
+                assert_eq!(
+                    got,
+                    want,
+                    "chunk {chunk_idx} case {i}: {:?} a={a:#010x} b={b:#010x} c={c:#010x}",
+                    OPS[i % 4]
+                );
+            }
+        }
+    }
+
     #[test]
     fn fuzz_exec_fcvt_i2f() {
         let mut rng = XorShift64::new(0xA11C_E005);
@@ -1060,6 +1255,30 @@ mod fuzz_tests {
                 fcvt_s_wu(rd, rs1)
             }
         });
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fma() {
+        const OPS: [FmaddOp; 4] = [FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd];
+        let mut rng = XorShift64::new(0xB0B0_0006);
+        let cases: Vec<(u32, u32, u32)> = (0..10)
+            .map(|_| {
+                (
+                    rand_bits(&mut rng),
+                    rand_bits(&mut rng),
+                    rand_bits(&mut rng),
+                )
+            })
+            .collect();
+        let (instrs, mem) =
+            build_ternary_chunk(&cases, &mut |rd, rs1, rs2, rs3, i| match OPS[i % 4] {
+                FmaddOp::Madd => fmadd_s(rd, rs1, rs2, rs3),
+                FmaddOp::Msub => fmsub_s(rd, rs1, rs2, rs3),
+                FmaddOp::Nmsub => fnmsub_s(rd, rs1, rs2, rs3),
+                FmaddOp::Nmadd => fnmadd_s(rd, rs1, rs2, rs3),
+            });
         prove_chunk(instrs, mem);
     }
 }
@@ -1259,6 +1478,12 @@ mod guest_program_tests {
     #[test]
     fn test_prove_fcvt() {
         prove_guest_example("fcvt_prove");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fma() {
+        prove_guest_example("fma_prove");
     }
 }
 

@@ -42,4 +42,8 @@ pub enum FpOpcode {
     FCVT_WU_S,
     FCVT_S_W,
     FCVT_S_WU,
+    FMADD_S,
+    FMSUB_S,
+    FNMSUB_S,
+    FNMADD_S,
 }

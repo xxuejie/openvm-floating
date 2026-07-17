@@ -6,9 +6,9 @@ use openvm_instructions::{
 use openvm_rv32f_guest::{
     FADD_S_FUNCT7, FCLASS_FUNCT3, FCLASS_S_FUNCT7, FCMP_S_FUNCT7, FCVT_RS2_W, FCVT_RS2_WU,
     FCVT_S_W_FUNCT7, FCVT_W_S_FUNCT7, FDIV_S_FUNCT7, FEQ_FUNCT3, FLE_FUNCT3, FLT_FUNCT3,
-    FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMUL_S_FUNCT7, FSGNJN_FUNCT3, FSGNJX_FUNCT3,
-    FSGNJ_FUNCT3, FSGNJ_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE,
-    RV32_FP_REGISTER_AS,
+    FMADD_S_OPCODE, FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMSUB_S_OPCODE, FMUL_S_FUNCT7,
+    FNMADD_S_OPCODE, FNMSUB_S_OPCODE, FSGNJN_FUNCT3, FSGNJX_FUNCT3, FSGNJ_FUNCT3, FSGNJ_S_FUNCT7,
+    FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
 };
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_transpiler::{TranspilerExtension, TranspilerOutput};
@@ -64,6 +64,43 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
         let instruction_u32 = instruction_stream[0];
 
         let opcode = (instruction_u32 & 0x7f) as u8;
+
+        // Fused multiply-add family (R4 format): rs3 in bits [31:27],
+        // fmt in bits [26:25] (0b00 = single precision), funct3 = rm.
+        let fused_opcode = match opcode {
+            FMADD_S_OPCODE => Some(FpOpcode::FMADD_S),
+            FMSUB_S_OPCODE => Some(FpOpcode::FMSUB_S),
+            FNMSUB_S_OPCODE => Some(FpOpcode::FNMSUB_S),
+            FNMADD_S_OPCODE => Some(FpOpcode::FNMADD_S),
+            _ => None,
+        };
+        if let Some(opcode_out) = fused_opcode {
+            let funct3 = ((instruction_u32 >> 12) & 0b111) as u8;
+            let fmt = ((instruction_u32 >> 25) & 0b11) as u8;
+            if fmt != 0b00 {
+                return None; // not single-precision (e.g. fmadd.d)
+            }
+            if funct3 != RM_RNE && funct3 != RM_DYN {
+                return Some(TranspilerOutput::one_to_one(
+                    openvm_transpiler::util::unimp(),
+                ));
+            }
+            let rd = ((instruction_u32 >> 7) & 0b11111) as usize;
+            let rs1 = ((instruction_u32 >> 15) & 0b11111) as usize;
+            let rs2 = ((instruction_u32 >> 20) & 0b11111) as usize;
+            let rs3 = ((instruction_u32 >> 27) & 0b11111) as usize;
+            return Some(TranspilerOutput::one_to_one(Instruction::new(
+                openvm_instructions::VmOpcode::from_usize(opcode_out.global_opcode_usize()),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * rd),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * rs1),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * rs2),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * rs3),
+                F::from_u32(self.fp_register_as),
+                F::ZERO,
+                F::ZERO,
+            )));
+        }
+
         if opcode != RV32_FP_OPCODE {
             return None;
         }
