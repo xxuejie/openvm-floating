@@ -314,6 +314,7 @@ pub struct FmulCoreRecord {
 pub struct FmulExecutor<A> {
     adapter: A,
     pub offset: usize,
+    pub register_as: u32,
 }
 
 impl<A, F, RA> PreflightExecutor<F, RA> for FmulExecutor<A>

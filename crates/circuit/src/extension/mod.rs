@@ -20,20 +20,31 @@ use serde::{Deserialize, Serialize};
 use crate::{adapters::*, fadd::*, fmul::*};
 
 /// RISC-V F (single-precision floating-point) extension config.
+///
+/// Supports both F extension and Zfinx mode via `fp_register_as`:
+/// - `1` (default): Zfinx — floats in integer registers (AS 1)
+/// - `5`: F extension — separate FP register file (AS 5)
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Rv32F {
     #[serde(default = "default_range_tuple_checker_sizes")]
     pub range_tuple_checker_sizes: [u32; 2],
+    #[serde(default = "default_fp_register_as")]
+    pub fp_register_as: u32,
 }
 
 fn default_range_tuple_checker_sizes() -> [u32; 2] {
     [1 << 8, 8 * (1 << 8)]
 }
 
+fn default_fp_register_as() -> u32 {
+    1 // Zfinx: integer register file
+}
+
 impl Default for Rv32F {
     fn default() -> Self {
         Self {
             range_tuple_checker_sizes: default_range_tuple_checker_sizes(),
+            fp_register_as: default_fp_register_as(),
         }
     }
 }
@@ -54,10 +65,12 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
         &self,
         inventory: &mut ExecutorInventoryBuilder<F, Rv32FExecutor>,
     ) -> Result<(), ExecutorInventoryError> {
-        let fmul = Rv32FmulExecutor::new(Rv32FpAdapterExecutor, FpOpcode::CLASS_OFFSET);
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fmul = Rv32FmulExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
         inventory.add_executor(fmul, [FpOpcode::FMUL_S.global_opcode()])?;
 
-        let fadd = Rv32FaddExecutor::new(Rv32FpAdapterExecutor, FpOpcode::CLASS_OFFSET);
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fadd = Rv32FaddExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
         inventory.add_executor(fadd, [FpOpcode::FADD_S.global_opcode()])?;
         Ok(())
     }
@@ -91,13 +104,13 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         };
 
         let fmul = Rv32FmulAir::new(
-            Rv32FpAdapterAir::new(exec_bridge, memory_bridge),
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
             FmulCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fmul);
 
         let fadd = Rv32FaddAir::new(
-            Rv32FpAdapterAir::new(exec_bridge, memory_bridge),
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
             FaddCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fadd);

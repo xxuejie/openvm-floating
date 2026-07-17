@@ -257,6 +257,7 @@ pub struct FaddCoreRecord {
 pub struct FaddExecutor<A> {
     adapter: A,
     pub offset: usize,
+    pub register_as: u32,
 }
 
 impl<A, F, RA> PreflightExecutor<F, RA> for FaddExecutor<A>

@@ -11,10 +11,10 @@ use openvm_instructions::{
     exe::{SparseMemoryImage, VmExe},
     instruction::Instruction,
     program::Program,
+    riscv::RV32_REGISTER_AS,
     LocalOpcode, SystemOpcode, VmOpcode,
 };
 use openvm_rv32f_circuit::Rv32FConfig;
-use openvm_rv32f_guest::RV32_FP_REGISTER_AS;
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_sdk::{
     openvm_stark_backend::p3_field::PrimeCharacteristicRing, p3_baby_bear::BabyBear,
@@ -22,16 +22,18 @@ use openvm_stark_sdk::{
 
 type F = BabyBear;
 
+/// Address space for FP registers — AS 1 (integer registers) for Zfinx.
+const FP_AS: u32 = RV32_REGISTER_AS;
 fn write_fp_reg(mem: &mut SparseMemoryImage, reg_idx: u32, val: f32) {
     let offset = reg_idx * 4;
     for (i, byte) in val.to_le_bytes().iter().enumerate() {
-        mem.insert((RV32_FP_REGISTER_AS, offset + i as u32), *byte);
+        mem.insert((FP_AS, offset + i as u32), *byte);
     }
 }
 
 fn read_fp_reg(state: &VmState<F>, reg_idx: u32) -> f32 {
     let offset = reg_idx * 4;
-    let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(RV32_FP_REGISTER_AS, offset) };
+    let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(FP_AS, offset) };
     f32::from_le_bytes(bytes)
 }
 
@@ -48,8 +50,8 @@ fn fmul_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
         F::from_usize(4 * rd as usize),
         F::from_usize(4 * rs1 as usize),
         F::from_usize(4 * rs2 as usize),
-        F::from_u32(RV32_FP_REGISTER_AS),
-        F::from_u32(RV32_FP_REGISTER_AS),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
         F::ZERO,
         F::ZERO,
     )
@@ -61,8 +63,8 @@ fn fadd_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
         F::from_usize(4 * rd as usize),
         F::from_usize(4 * rs1 as usize),
         F::from_usize(4 * rs2 as usize),
-        F::from_u32(RV32_FP_REGISTER_AS),
-        F::from_u32(RV32_FP_REGISTER_AS),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
         F::ZERO,
         F::ZERO,
     )

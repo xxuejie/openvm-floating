@@ -34,19 +34,21 @@ impl InitFileGenerator for Rv32FConfig {}
 
 impl Default for Rv32FConfig {
     fn default() -> Self {
-        use openvm_circuit::arch::MemoryCellType;
+        let f = Rv32F::default();
         let mut system = SystemConfig::default();
-        // Allocate FP register file (32 registers × 4 bytes) in address space 5
-        system.memory_config.addr_spaces[crate::adapters::RV32_FP_REGISTER_AS as usize].num_cells =
-            32 * 4;
-        system.memory_config.addr_spaces[crate::adapters::RV32_FP_REGISTER_AS as usize].layout =
-            MemoryCellType::U8;
+        // For F extension mode (AS 5), allocate the FP register file.
+        // Zfinx mode (AS 1) reuses the existing integer register file — no allocation needed.
+        if f.fp_register_as != 1 {
+            use openvm_circuit::arch::MemoryCellType;
+            system.memory_config.addr_spaces[f.fp_register_as as usize].num_cells = 32 * 4;
+            system.memory_config.addr_spaces[f.fp_register_as as usize].layout = MemoryCellType::U8;
+        }
         Self {
             system,
             base: Default::default(),
             io: Default::default(),
             mul: Default::default(),
-            f: Default::default(),
+            f,
         }
     }
 }

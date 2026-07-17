@@ -10,15 +10,44 @@ use rrs_lib::instruction_formats::RType;
 mod instructions;
 pub use instructions::*;
 
-/// Transpiler extension for RISC-V F (single-precision floating-point) instructions.
+/// Transpiler extension for RISC-V F / Zfinx single-precision floating-point instructions.
 ///
 /// Recognizes OPC-FP (0x53) instructions and converts them to OpenVM opcodes.
-/// FP register operands (rd, rs1, rs2) are mapped to address space
-/// [`RV32_FP_REGISTER_AS`] (5).
+/// Register operands (rd, rs1, rs2) are mapped to the configured address space:
+/// - AS 1 (integer registers) for Zfinx mode — default
+/// - AS 5 (FP registers) for F extension mode
 ///
 /// Only RNE (rm=0) and DYN (rm=7, treated as RNE) rounding modes are accepted.
 /// All other rounding modes are transpiled to UNIMP.
-pub struct Rv32FTranspilerExtension;
+pub struct Rv32FTranspilerExtension {
+    /// Address space for FP register operands.
+    /// 1 = Zfinx (integer registers), 5 = F extension (FP registers).
+    pub fp_register_as: u32,
+}
+
+impl Default for Rv32FTranspilerExtension {
+    fn default() -> Self {
+        Self {
+            fp_register_as: openvm_instructions::riscv::RV32_REGISTER_AS, // Zfinx
+        }
+    }
+}
+
+impl Rv32FTranspilerExtension {
+    /// Create a transpiler for Zfinx mode (floats in integer registers).
+    pub fn new_zfinx() -> Self {
+        Self {
+            fp_register_as: openvm_instructions::riscv::RV32_REGISTER_AS,
+        }
+    }
+
+    /// Create a transpiler for F extension mode (separate FP registers).
+    pub fn new_f() -> Self {
+        Self {
+            fp_register_as: RV32_FP_REGISTER_AS,
+        }
+    }
+}
 
 impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
     fn process_custom(&self, instruction_stream: &[u32]) -> Option<TranspilerOutput<F>> {
@@ -56,8 +85,8 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
             F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
             F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
             F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs2),
-            F::from_u32(RV32_FP_REGISTER_AS), // d: rd is FP register
-            F::from_u32(RV32_FP_REGISTER_AS), // e: rs2 is FP register
+            F::from_u32(self.fp_register_as), // d: rd address space
+            F::from_u32(self.fp_register_as), // e: rs2 address space
             F::ZERO,
             F::ZERO,
         );

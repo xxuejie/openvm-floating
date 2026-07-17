@@ -28,7 +28,6 @@ use openvm_stark_backend::{
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
 };
 
-use super::RV32_FP_REGISTER_AS;
 use crate::adapters::RV32_REGISTER_NUM_LIMBS;
 
 /// Adapter columns for FP register read/write.
@@ -43,12 +42,16 @@ pub struct Rv32FpAdapterCols<T> {
     pub writes_aux: MemoryWriteAuxCols<T, RV32_REGISTER_NUM_LIMBS>,
 }
 
-/// Adapter AIR: reads 2 FP registers (AS 5), writes 1 FP register.
+/// Adapter AIR for FP operations: reads 2 registers, writes 1 register.
+/// The `register_as` field selects the address space:
+/// - `1` (RV32_REGISTER_AS) for Zfinx mode
+/// - `5` for F extension mode
 #[derive(Clone, Copy, Debug, derive_new::new, ColumnsAir)]
 #[columns_via(Rv32FpAdapterCols<u8>)]
 pub struct Rv32FpAdapterAir {
     pub execution_bridge: ExecutionBridge,
     pub memory_bridge: MemoryBridge,
+    pub register_as: u32,
 }
 
 impl<F: Field> BaseAir<F> for Rv32FpAdapterAir {
@@ -81,9 +84,11 @@ impl<AB: InteractionBuilder> VmAdapterAir<AB> for Rv32FpAdapterAir {
             timestamp + AB::F::from_usize(timestamp_delta - 1)
         };
 
+        let fp_as = AB::F::from_u32(self.register_as);
+
         self.memory_bridge
             .read(
-                MemoryAddress::new(AB::F::from_u32(RV32_FP_REGISTER_AS), local.rs1_ptr),
+                MemoryAddress::new(fp_as, local.rs1_ptr),
                 ctx.reads[0].clone(),
                 timestamp_pp(),
                 &local.reads_aux[0],
@@ -92,7 +97,7 @@ impl<AB: InteractionBuilder> VmAdapterAir<AB> for Rv32FpAdapterAir {
 
         self.memory_bridge
             .read(
-                MemoryAddress::new(AB::F::from_u32(RV32_FP_REGISTER_AS), local.rs2_ptr),
+                MemoryAddress::new(fp_as, local.rs2_ptr),
                 ctx.reads[1].clone(),
                 timestamp_pp(),
                 &local.reads_aux[1],
@@ -101,7 +106,7 @@ impl<AB: InteractionBuilder> VmAdapterAir<AB> for Rv32FpAdapterAir {
 
         self.memory_bridge
             .write(
-                MemoryAddress::new(AB::F::from_u32(RV32_FP_REGISTER_AS), local.rd_ptr),
+                MemoryAddress::new(fp_as, local.rd_ptr),
                 ctx.writes[0].clone(),
                 timestamp_pp(),
                 &local.writes_aux,
@@ -115,7 +120,7 @@ impl<AB: InteractionBuilder> VmAdapterAir<AB> for Rv32FpAdapterAir {
                     local.rd_ptr.into(),
                     local.rs1_ptr.into(),
                     local.rs2_ptr.into(),
-                    AB::F::from_u32(RV32_FP_REGISTER_AS).into(),
+                    fp_as.into(),
                     AB::Expr::ZERO,
                 ],
                 local.from_state,
@@ -148,7 +153,9 @@ pub struct Rv32FpAdapterRecord {
 // === Executor ===
 
 #[derive(Clone, Copy, derive_new::new)]
-pub struct Rv32FpAdapterExecutor;
+pub struct Rv32FpAdapterExecutor {
+    pub register_as: u32,
+}
 
 impl<F> AdapterTraceExecutor<F> for Rv32FpAdapterExecutor
 where
@@ -173,15 +180,15 @@ where
         record: &mut Self::RecordMut<'_>,
     ) -> Self::ReadData {
         let &Instruction { b, c, d, .. } = instruction;
-        debug_assert_eq!(d.as_canonical_u32(), RV32_FP_REGISTER_AS);
+        debug_assert_eq!(d.as_canonical_u32(), self.register_as);
 
         record.rs1_ptr = b.as_canonical_u32();
         let (t0, rs1) = unsafe {
-            memory.read::<u8, RV32_REGISTER_NUM_LIMBS>(RV32_FP_REGISTER_AS, b.as_canonical_u32())
+            memory.read::<u8, RV32_REGISTER_NUM_LIMBS>(self.register_as, b.as_canonical_u32())
         };
         record.rs2_ptr = c.as_canonical_u32();
         let (t1, rs2) = unsafe {
-            memory.read::<u8, RV32_REGISTER_NUM_LIMBS>(RV32_FP_REGISTER_AS, c.as_canonical_u32())
+            memory.read::<u8, RV32_REGISTER_NUM_LIMBS>(self.register_as, c.as_canonical_u32())
         };
         record.reads_aux[0].prev_timestamp = t0;
         record.reads_aux[1].prev_timestamp = t1;
@@ -198,16 +205,12 @@ where
         record: &mut Self::RecordMut<'_>,
     ) {
         let &Instruction { a, d, .. } = instruction;
-        debug_assert_eq!(d.as_canonical_u32(), RV32_FP_REGISTER_AS);
+        debug_assert_eq!(d.as_canonical_u32(), self.register_as);
 
         record.rd_ptr = a.as_canonical_u32();
         let [rd] = write_data;
         let (t_prev, prev_data) = unsafe {
-            memory.write::<u8, RV32_REGISTER_NUM_LIMBS>(
-                RV32_FP_REGISTER_AS,
-                a.as_canonical_u32(),
-                rd,
-            )
+            memory.write::<u8, RV32_REGISTER_NUM_LIMBS>(self.register_as, a.as_canonical_u32(), rd)
         };
         record.writes_aux.prev_timestamp = t_prev;
         record.writes_aux.prev_data = prev_data;

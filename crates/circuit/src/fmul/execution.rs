@@ -3,7 +3,6 @@ use std::borrow::{Borrow, BorrowMut};
 use openvm_circuit::{arch::*, system::memory::online::GuestMemory};
 use openvm_circuit_primitives_derive::AlignedBytesBorrow;
 use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, LocalOpcode};
-use openvm_rv32f_guest::RV32_FP_REGISTER_AS;
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::p3_field::PrimeField32;
 
@@ -15,6 +14,7 @@ struct FpPreCompute {
     a: u8,
     b: u8,
     c: u8,
+    register_as: u8,
 }
 
 impl<A> FmulExecutor<A> {
@@ -27,13 +27,11 @@ impl<A> FmulExecutor<A> {
         if FpOpcode::from_usize(inst.opcode.local_opcode_idx(self.offset)) != FpOpcode::FMUL_S {
             return Err(StaticProgramError::InvalidInstruction(pc));
         }
-        if inst.d.as_canonical_u32() != RV32_FP_REGISTER_AS {
-            return Err(StaticProgramError::InvalidInstruction(pc));
-        }
         *data = FpPreCompute {
             a: inst.a.as_canonical_u32() as u8,
             b: inst.b.as_canonical_u32() as u8,
             c: inst.c.as_canonical_u32() as u8,
+            register_as: self.register_as as u8,
         };
         Ok(())
     }
@@ -107,12 +105,13 @@ unsafe fn execute_fmul_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
     pre_compute: &FpPreCompute,
     exec_state: &mut VmExecState<F, GuestMemory, CTX>,
 ) {
-    let rs1: [u8; 4] = exec_state.vm_read(RV32_FP_REGISTER_AS, pre_compute.b as u32);
-    let rs2: [u8; 4] = exec_state.vm_read(RV32_FP_REGISTER_AS, pre_compute.c as u32);
+    let as_u32 = pre_compute.register_as as u32;
+    let rs1: [u8; 4] = exec_state.vm_read(as_u32, pre_compute.b as u32);
+    let rs2: [u8; 4] = exec_state.vm_read(as_u32, pre_compute.c as u32);
     let a = f32::from_le_bytes(rs1);
     let b = f32::from_le_bytes(rs2);
     let result = (a * b).to_le_bytes();
-    exec_state.vm_write(RV32_FP_REGISTER_AS, pre_compute.a as u32, &result);
+    exec_state.vm_write(as_u32, pre_compute.a as u32, &result);
 
     let pc = exec_state.pc();
     exec_state.set_pc(pc.wrapping_add(DEFAULT_PC_STEP));
