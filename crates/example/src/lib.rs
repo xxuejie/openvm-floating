@@ -70,6 +70,32 @@ fn fadd_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     )
 }
 
+fn fmin_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FMIN_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn fmax_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FMAX_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 fn run_program(instructions: Vec<Instruction<F>>, init_memory: SparseMemoryImage) -> VmState<F> {
     let program = Program::new_without_debug_infos(&instructions, 0);
     let exe = VmExe::new(program).with_init_memory(init_memory);
@@ -189,6 +215,153 @@ fn test_fmul_preserves_inputs() {
     assert_eq!(read_fp_reg(&state, 1), 3.5);
     assert_eq!(read_fp_reg(&state, 2), 2.5);
     assert_eq!(read_fp_reg(&state, 0), 3.5 * 2.5);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FMIN.S / FMAX.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+const CANONICAL_NAN: u32 = 0x7FC0_0000;
+
+fn write_fp_reg_bits(mem: &mut SparseMemoryImage, reg_idx: u32, bits: u32) {
+    let offset = reg_idx * 4;
+    for (i, byte) in bits.to_le_bytes().iter().enumerate() {
+        mem.insert((FP_AS, offset + i as u32), *byte);
+    }
+}
+
+fn read_fp_reg_bits(state: &VmState<F>, reg_idx: u32) -> u32 {
+    let offset = reg_idx * 4;
+    let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(FP_AS, offset) };
+    u32::from_le_bytes(bytes)
+}
+
+#[test]
+fn test_fmin_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+
+    let state = run_program(vec![fmin_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 3.0);
+}
+
+#[test]
+fn test_fmax_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.0);
+    write_fp_reg(&mut mem, 2, 4.0);
+
+    let state = run_program(vec![fmax_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 4.0);
+}
+
+#[test]
+fn test_fmin_negative() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, -3.0);
+    write_fp_reg(&mut mem, 2, 7.0);
+
+    let state = run_program(vec![fmin_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), -3.0);
+}
+
+#[test]
+fn test_fmax_negative() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, -3.0);
+    write_fp_reg(&mut mem, 2, -7.0);
+
+    let state = run_program(vec![fmax_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), -3.0);
+}
+
+#[test]
+fn test_fmin_nan_first() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, CANONICAL_NAN);
+    write_fp_reg(&mut mem, 2, 2.0);
+
+    let state = run_program(vec![fmin_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 2.0);
+}
+
+#[test]
+fn test_fmax_nan_second() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 1.5);
+    write_fp_reg_bits(&mut mem, 2, CANONICAL_NAN);
+
+    let state = run_program(vec![fmax_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 1.5);
+}
+
+#[test]
+fn test_fminmax_both_nan() {
+    let snan = 0x7FA0_0001u32;
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, CANONICAL_NAN);
+    write_fp_reg_bits(&mut mem, 2, snan);
+
+    let state = run_program(
+        vec![
+            fmin_s(0, 1, 2), // f0 = canonical NaN
+            fmax_s(3, 1, 2), // f3 = canonical NaN
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 0), CANONICAL_NAN);
+    assert_eq!(read_fp_reg_bits(&state, 3), CANONICAL_NAN);
+}
+
+#[test]
+fn test_fmin_signed_zero() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 0x0000_0000); // +0.0
+    write_fp_reg_bits(&mut mem, 2, 0x8000_0000); // -0.0
+
+    let state = run_program(vec![fmin_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0x8000_0000); // -0.0
+}
+
+#[test]
+fn test_fmax_signed_zero() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 0x8000_0000); // -0.0
+    write_fp_reg_bits(&mut mem, 2, 0x0000_0000); // +0.0
+
+    let state = run_program(vec![fmax_s(0, 1, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg_bits(&state, 0), 0x0000_0000); // +0.0
+}
+
+#[test]
+fn test_fminmax_chained() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 5.0);
+    write_fp_reg(&mut mem, 2, -2.0);
+    write_fp_reg(&mut mem, 3, 3.5);
+
+    let state = run_program(
+        vec![
+            fmin_s(0, 1, 2), // f0 = -2.0
+            fmax_s(4, 0, 3), // f4 = 3.5
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 0), -2.0);
+    assert_eq!(read_fp_reg(&state, 4), 3.5);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -368,5 +541,11 @@ mod guest_program_tests {
     #[test]
     fn test_prove_dot3() {
         prove_guest_example("dot3_prove");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fminmax() {
+        prove_guest_example("fminmax_prove");
     }
 }

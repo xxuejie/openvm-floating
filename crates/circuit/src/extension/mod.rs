@@ -17,7 +17,7 @@ use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
-use crate::{adapters::*, fadd::*, fmul::*, fsgnj::*, fsub::*};
+use crate::{adapters::*, fadd::*, fminmax::*, fmul::*, fsgnj::*, fsub::*};
 
 /// RISC-V F (single-precision floating-point) extension config.
 ///
@@ -63,6 +63,7 @@ pub enum Rv32FExecutor {
     Fadd(Rv32FaddExecutor),
     Fsub(Rv32FsubExecutor),
     Fsgnj(Rv32FsgnjExecutor),
+    Fminmax(Rv32FminmaxExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -95,6 +96,17 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
                 FpOpcode::FSGNJX_S.global_opcode(),
             ],
         )?;
+
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fminmax =
+            Rv32FminmaxExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
+        inventory.add_executor(
+            fminmax,
+            [
+                FpOpcode::FMIN_S.global_opcode(),
+                FpOpcode::FMAX_S.global_opcode(),
+            ],
+        )?;
         Ok(())
     }
 }
@@ -107,6 +119,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             memory_bridge,
         } = inventory.system().port();
         let exec_bridge = ExecutionBridge::new(execution_bus, program_bus);
+        let range_checker_bus = inventory.range_checker().bus;
 
         let range_tuple_checker = {
             let existing_air = inventory.find_air::<RangeTupleCheckerAir<2>>().find(|c| {
@@ -149,6 +162,12 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             FsgnjCoreAir::new(FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fsgnj);
+
+        let fminmax = Rv32FminmaxAir::new(
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FminmaxCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fminmax);
 
         Ok(())
     }
@@ -230,6 +249,17 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fsgnj);
+
+        inventory.next_air::<Rv32FminmaxAir>()?;
+        let fminmax = Rv32FminmaxChip::new(
+            FminmaxFiller::new(
+                Rv32FpAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fminmax);
 
         Ok(())
     }

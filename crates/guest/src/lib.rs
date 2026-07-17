@@ -16,6 +16,12 @@ pub const FSGNJ_FUNCT3: u8 = 0b000;
 pub const FSGNJN_FUNCT3: u8 = 0b001;
 pub const FSGNJX_FUNCT3: u8 = 0b010;
 
+/// funct7 for min/max family (fmin.s / fmax.s).
+pub const FMIN_S_FUNCT7: u8 = 0b0010100;
+/// funct3 values within the min/max family.
+pub const FMIN_FUNCT3: u8 = 0b000;
+pub const FMAX_FUNCT3: u8 = 0b001;
+
 /// RISC-V rounding mode (rm field, funct3 bits).
 pub const RM_RNE: u8 = 0b000; // Round to Nearest, ties to Even
 pub const RM_RTZ: u8 = 0b001; // Round toward Zero
