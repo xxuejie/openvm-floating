@@ -148,15 +148,15 @@ where
         let b_mant_is_zero = one.clone() - b_mant_sum.clone() * cols.b_mant_sum_inv;
         builder.assert_bool(b_mant_is_zero.clone());
 
-        let a_is_nan = a_exp_is_max.clone() * (one.clone() - a_mant_is_zero.clone());
-        let a_is_inf = a_exp_is_max.clone() * a_mant_is_zero.clone();
-        let a_is_zero_f = a_exp_is_zero.clone() * a_mant_is_zero.clone();
+        let _a_is_nan = a_exp_is_max.clone() * (one.clone() - a_mant_is_zero.clone());
+        let _a_is_inf = a_exp_is_max.clone() * a_mant_is_zero.clone();
+        let _a_is_zero_f = a_exp_is_zero.clone() * a_mant_is_zero.clone();
         let a_is_normal =
             (one.clone() - a_exp_is_zero.clone()) * (one.clone() - a_exp_is_max.clone());
 
-        let b_is_nan = b_exp_is_max.clone() * (one.clone() - b_mant_is_zero.clone());
-        let b_is_inf = b_exp_is_max.clone() * b_mant_is_zero.clone();
-        let b_is_zero_f = b_exp_is_zero.clone() * b_mant_is_zero.clone();
+        let _b_is_nan = b_exp_is_max.clone() * (one.clone() - b_mant_is_zero.clone());
+        let _b_is_inf = b_exp_is_max.clone() * b_mant_is_zero.clone();
+        let _b_is_zero_f = b_exp_is_zero.clone() * b_mant_is_zero.clone();
         let b_is_normal =
             (one.clone() - b_exp_is_zero.clone()) * (one.clone() - b_exp_is_max.clone());
 
@@ -274,14 +274,11 @@ where
             .when(not(cols.is_special))
             .assert_eq(cols.result_exp, exp_normal);
 
-        // ── Phase 8: Special-case mux ────────────────────────────────────
-        // TODO: Full verification of NaN/inf/zero result flags.
-        // The executor fills correct values; soundness constraints to be added.
-        let inf_times_zero =
-            a_is_inf.clone() * b_is_zero_f.clone() + a_is_zero_f.clone() * b_is_inf.clone();
-        let _nan_cond = a_is_nan + b_is_nan + inf_times_zero;
-        let _inf_cond = (a_is_inf + b_is_inf) * (AB::Expr::ONE - _nan_cond.clone());
-        let _zero_cond = (a_is_zero_f + b_is_zero_f) * (AB::Expr::ONE - _nan_cond);
+        // ── Phase 8: Special-case flags ─────────────────────────────────
+        // TODO: Verify NaN/inf/zero result flags from input classification.
+        // This requires storing classification flags (is_nan, is_inf, is_zero) as
+        // columns to keep constraint degree ≤ 4. Currently degree-4 classification
+        // expressions cannot be multiplied without exceeding the limit.
 
         // ── Output ───────────────────────────────────────────────────────
         let expected_opcode = VmCoreAir::<AB, I>::opcode_to_global_expr(self, FpOpcode::FMUL_S);
