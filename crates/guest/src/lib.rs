@@ -9,6 +9,13 @@ pub const FSUB_S_FUNCT7: u8 = 0b0000100;
 pub const FMUL_S_FUNCT7: u8 = 0b0001000;
 pub const FDIV_S_FUNCT7: u8 = 0b0001100;
 
+/// funct7 for sign injection family (fsgnj.s / fsgnjn.s / fsgnjx.s).
+pub const FSGNJ_S_FUNCT7: u8 = 0b0010000;
+/// funct3 values within the sign injection family.
+pub const FSGNJ_FUNCT3: u8 = 0b000;
+pub const FSGNJN_FUNCT3: u8 = 0b001;
+pub const FSGNJX_FUNCT3: u8 = 0b010;
+
 /// RISC-V rounding mode (rm field, funct3 bits).
 pub const RM_RNE: u8 = 0b000; // Round to Nearest, ties to Even
 pub const RM_RTZ: u8 = 0b001; // Round toward Zero

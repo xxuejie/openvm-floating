@@ -19,6 +19,8 @@ pub mod adapters;
 pub mod extension;
 pub mod fadd;
 pub mod fmul;
+pub mod fsgnj;
+pub mod fsub;
 
 pub use extension::*;
 

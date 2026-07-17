@@ -17,7 +17,7 @@ use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
-use crate::{adapters::*, fadd::*, fmul::*};
+use crate::{adapters::*, fadd::*, fmul::*, fsgnj::*, fsub::*};
 
 /// RISC-V F (single-precision floating-point) extension config.
 ///
@@ -61,6 +61,8 @@ impl Default for Rv32F {
 pub enum Rv32FExecutor {
     Fmul(Rv32FmulExecutor),
     Fadd(Rv32FaddExecutor),
+    Fsub(Rv32FsubExecutor),
+    Fsgnj(Rv32FsgnjExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -77,6 +79,22 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
         let fadd = Rv32FaddExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
         inventory.add_executor(fadd, [FpOpcode::FADD_S.global_opcode()])?;
+
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fsub = Rv32FsubExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
+        inventory.add_executor(fsub, [FpOpcode::FSUB_S.global_opcode()])?;
+
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fsgnj =
+            Rv32FsgnjExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
+        inventory.add_executor(
+            fsgnj,
+            [
+                FpOpcode::FSGNJ_S.global_opcode(),
+                FpOpcode::FSGNJN_S.global_opcode(),
+                FpOpcode::FSGNJX_S.global_opcode(),
+            ],
+        )?;
         Ok(())
     }
 }
@@ -119,6 +137,18 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
             FaddCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fadd);
+
+        let fsub = Rv32FsubAir::new(
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FsubCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fsub);
+
+        let fsgnj = Rv32FsgnjAir::new(
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FsgnjCoreAir::new(FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fsgnj);
 
         Ok(())
     }
@@ -182,6 +212,24 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fadd);
+
+        inventory.next_air::<Rv32FsubAir>()?;
+        let fsub = Rv32FsubChip::new(
+            FsubFiller::new(
+                Rv32FpAdapterFiller,
+                range_tuple_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fsub);
+
+        inventory.next_air::<Rv32FsgnjAir>()?;
+        let fsgnj = Rv32FsgnjChip::new(
+            FsgnjFiller::new(Rv32FpAdapterFiller, FpOpcode::CLASS_OFFSET),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fsgnj);
 
         Ok(())
     }

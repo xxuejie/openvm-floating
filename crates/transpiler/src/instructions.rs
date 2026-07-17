@@ -29,4 +29,7 @@ pub enum FpOpcode {
     FSUB_S,
     FMUL_S,
     FDIV_S,
+    FSGNJ_S,
+    FSGNJN_S,
+    FSGNJX_S,
 }

@@ -1,7 +1,7 @@
 use openvm_instructions::{instruction::Instruction, riscv::RV32_REGISTER_NUM_LIMBS, LocalOpcode};
 use openvm_rv32f_guest::{
-    FADD_S_FUNCT7, FDIV_S_FUNCT7, FMUL_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE,
-    RV32_FP_REGISTER_AS,
+    FADD_S_FUNCT7, FDIV_S_FUNCT7, FMUL_S_FUNCT7, FSGNJN_FUNCT3, FSGNJX_FUNCT3, FSGNJ_FUNCT3,
+    FSGNJ_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
 };
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_transpiler::{TranspilerExtension, TranspilerOutput};
@@ -65,7 +65,27 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
         let funct7 = dec_insn.funct7 as u8;
         let rm = ((instruction_u32 >> 12) & 0b111) as u8;
 
-        // Only RNE and DYN (treated as RNE) are supported.
+        // Sign injection family: dispatch on funct3 (not rm), no rounding mode check
+        if funct7 == FSGNJ_S_FUNCT7 {
+            let opcode_out = match rm {
+                FSGNJ_FUNCT3 => FpOpcode::FSGNJ_S,
+                FSGNJN_FUNCT3 => FpOpcode::FSGNJN_S,
+                FSGNJX_FUNCT3 => FpOpcode::FSGNJX_S,
+                _ => return None,
+            };
+            return Some(TranspilerOutput::one_to_one(Instruction::new(
+                openvm_instructions::VmOpcode::from_usize(opcode_out.global_opcode_usize()),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs2),
+                F::from_u32(self.fp_register_as),
+                F::from_u32(self.fp_register_as),
+                F::ZERO,
+                F::ZERO,
+            )));
+        }
+
+        // Arithmetic instructions: only RNE and DYN (treated as RNE) are supported.
         if rm != RM_RNE && rm != RM_DYN {
             return Some(TranspilerOutput::one_to_one(
                 openvm_transpiler::util::unimp(),
