@@ -27,6 +27,7 @@ pub mod fma;
 pub mod fminmax;
 pub mod fmul;
 pub mod fsgnj;
+pub mod fsqrt;
 pub mod fsub;
 
 pub use extension::*;

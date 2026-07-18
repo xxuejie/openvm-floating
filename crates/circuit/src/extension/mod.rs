@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fdiv::*, fma::*,
-    fminmax::*, fmul::*, fsgnj::*, fsub::*,
+    fminmax::*, fmul::*, fsgnj::*, fsqrt::*, fsub::*,
 };
 
 /// RISC-V F (single-precision floating-point) extension config.
@@ -73,6 +73,7 @@ pub enum Rv32FExecutor {
     FcvtI2F(Rv32FcvtI2FExecutor),
     Fma(Rv32FmaExecutor),
     Fdiv(Rv32FdivExecutor),
+    Fsqrt(Rv32FsqrtExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -93,6 +94,16 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
         let fdiv = Rv32FdivExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
         inventory.add_executor(fdiv, [FpOpcode::FDIV_S.global_opcode()])?;
+
+        let adapter_exec =
+            Rv32FpUnaryAdapterExecutor::new(self.fp_register_as, self.fp_register_as);
+        let fsqrt = Rv32FsqrtExecutor::new(
+            adapter_exec,
+            FpOpcode::CLASS_OFFSET,
+            self.fp_register_as,
+            self.fp_register_as,
+        );
+        inventory.add_executor(fsqrt, [FpOpcode::FSQRT_S.global_opcode()])?;
 
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
         let fsub = Rv32FsubExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
@@ -232,6 +243,17 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         );
         inventory.add_air(fdiv);
 
+        let fsqrt = Rv32FsqrtAir::new(
+            Rv32FpUnaryAdapterAir::new(
+                exec_bridge,
+                memory_bridge,
+                self.fp_register_as,
+                self.fp_register_as,
+            ),
+            FsqrtCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fsqrt);
+
         let fsub = Rv32FsubAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
             FsubCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
@@ -368,6 +390,17 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fdiv);
+
+        inventory.next_air::<Rv32FsqrtAir>()?;
+        let fsqrt = Rv32FsqrtChip::new(
+            FsqrtFiller::new(
+                Rv32FpUnaryAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fsqrt);
 
         inventory.next_air::<Rv32FsubAir>()?;
         let fsub = Rv32FsubChip::new(

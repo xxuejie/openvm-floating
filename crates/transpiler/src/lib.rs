@@ -8,7 +8,7 @@ use openvm_rv32f_guest::{
     FCVT_S_W_FUNCT7, FCVT_W_S_FUNCT7, FDIV_S_FUNCT7, FEQ_FUNCT3, FLE_FUNCT3, FLT_FUNCT3,
     FMADD_S_OPCODE, FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMSUB_S_OPCODE, FMUL_S_FUNCT7,
     FNMADD_S_OPCODE, FNMSUB_S_OPCODE, FSGNJN_FUNCT3, FSGNJX_FUNCT3, FSGNJ_FUNCT3, FSGNJ_S_FUNCT7,
-    FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
+    FSQRT_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
 };
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_transpiler::{TranspilerExtension, TranspilerOutput};
@@ -180,6 +180,29 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
                 F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
                 F::ZERO,
                 F::from_u32(RV32_REGISTER_AS),
+                F::from_u32(self.fp_register_as),
+                F::ZERO,
+                F::ZERO,
+            )));
+        }
+
+        // fsqrt.s: single FP source, rd is an FP register. rs2 must be 0.
+        // Only RNE and DYN rounding modes are supported.
+        if funct7 == FSQRT_S_FUNCT7 {
+            if dec_insn.rs2 != 0 {
+                return None;
+            }
+            if rm != RM_RNE && rm != RM_DYN {
+                return Some(TranspilerOutput::one_to_one(
+                    openvm_transpiler::util::unimp(),
+                ));
+            }
+            return Some(TranspilerOutput::one_to_one(Instruction::new(
+                openvm_instructions::VmOpcode::from_usize(FpOpcode::FSQRT_S.global_opcode_usize()),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
+                F::ZERO,
+                F::from_u32(self.fp_register_as),
                 F::from_u32(self.fp_register_as),
                 F::ZERO,
                 F::ZERO,

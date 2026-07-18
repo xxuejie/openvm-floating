@@ -36,6 +36,9 @@ pub const FCLASS_S_FUNCT7: u8 = 0b1110000;
 /// funct3 for fclass.s.
 pub const FCLASS_FUNCT3: u8 = 0b001;
 
+/// funct7 for fsqrt.s. Single FP source operand; rs2 field must be 0.
+pub const FSQRT_S_FUNCT7: u8 = 0b0101100;
+
 /// funct7 for fcvt.w.s / fcvt.wu.s (float -> int); the rs2 field selects
 /// the integer type (0 = int32, 1 = uint32). rd is an integer register.
 pub const FCVT_W_S_FUNCT7: u8 = 0b1100000;

@@ -182,6 +182,10 @@ fn fcvt_s_wu(rd: u32, rs1: u32) -> Instruction<F> {
     fp_unary(FpOpcode::FCVT_S_WU, rd, rs1)
 }
 
+fn fsqrt_s(rd: u32, rs1: u32) -> Instruction<F> {
+    fp_unary(FpOpcode::FSQRT_S, rd, rs1)
+}
+
 /// Ternary FP instruction (fused multiply-add family): rd, rs1, rs2, rs3.
 /// Operand layout: a=rd, b=rs1, c=rs2, d=rs3, e=address space.
 fn fp_ternary(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
@@ -982,6 +986,57 @@ fn test_fdiv_negative_sign() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FSQRT.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fsqrt_basic() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 4.0);
+    write_fp_reg(&mut mem, 2, 2.0);
+
+    let state = run_program(vec![fsqrt_s(0, 1), fsqrt_s(3, 2), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), 2.0);
+    assert_eq!(read_fp_reg(&state, 3), f32::sqrt(2.0));
+}
+
+#[test]
+fn test_fsqrt_special() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 0x0000_0000); // +0.0
+    write_fp_reg_bits(&mut mem, 2, 0x8000_0000); // -0.0
+    write_fp_reg(&mut mem, 3, f32::INFINITY);
+    write_fp_reg(&mut mem, 4, -1.0);
+
+    let state = run_program(
+        vec![
+            fsqrt_s(5, 1), // sqrt(+0.0) = +0.0
+            fsqrt_s(6, 2), // sqrt(-0.0) = -0.0
+            fsqrt_s(7, 3), // sqrt(+inf) = +inf
+            fsqrt_s(8, 4), // sqrt(-1.0) = canonical NaN
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 5), 0);
+    assert_eq!(read_fp_reg_bits(&state, 6), 0x8000_0000);
+    assert_eq!(read_fp_reg(&state, 7), f32::INFINITY);
+    assert_eq!(read_fp_reg_bits(&state, 8), CANONICAL_NAN);
+}
+
+#[test]
+fn test_fsqrt_subnormal_input() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 0x0000_0001); // min subnormal
+
+    let state = run_program(vec![fsqrt_s(0, 1), terminate()], mem);
+
+    assert_eq!(read_fp_reg(&state, 0), f32::from_bits(0x0000_0001).sqrt());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Execution-level fuzz: random operands through the VM interpreter, verified
 // against the native semantics helpers from the circuit crate.
 // ════════════════════════════════════════════════════════════════════════════
@@ -996,6 +1051,7 @@ mod fuzz_tests {
         fdiv::fdiv_s as fdiv_native,
         fma::{fmadd_result, FmaddOp},
         fminmax::fminmax_result,
+        fsqrt::fsqrt_s as fsqrt_native,
     };
 
     use super::*;
@@ -1252,6 +1308,17 @@ mod fuzz_tests {
     }
 
     #[test]
+    fn fuzz_exec_fsqrt() {
+        let mut rng = XorShift64::new(0xA11C_E008);
+        let cases: Vec<u32> = (0..300).map(|_| rand_bits(&mut rng)).collect();
+        fuzz_unary(
+            &cases,
+            |rd, rs1, _| fsqrt_s(rd, rs1),
+            |a, _| fsqrt_native(a),
+        );
+    }
+
+    #[test]
     fn fuzz_exec_fcvt_i2f() {
         let mut rng = XorShift64::new(0xA11C_E005);
         let cases: Vec<u32> = (0..150).map(|_| rand_bits(&mut rng)).collect();
@@ -1386,6 +1453,15 @@ mod fuzz_tests {
             .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
             .collect();
         let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fdiv_s(rd, rs1, rs2));
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fsqrt() {
+        let mut rng = XorShift64::new(0xB0B0_0008);
+        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fsqrt_s(rd, rs1));
         prove_chunk(instrs, mem);
     }
 }
@@ -1597,6 +1673,12 @@ mod guest_program_tests {
     #[test]
     fn test_prove_fdiv() {
         prove_guest_example("fdiv_prove");
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fsqrt() {
+        prove_guest_example("fsqrt_prove");
     }
 }
 
