@@ -19,6 +19,7 @@ use openvm_instructions::{
     LocalOpcode, SystemOpcode, VmOpcode,
 };
 use openvm_rv32f_circuit::{
+    fadd::fadd_s,
     fclass::fclass_s,
     fcmp::{fcmp_result, FcmpOp},
     fcvt_f2i::fcvt_f2i_result,
@@ -26,7 +27,9 @@ use openvm_rv32f_circuit::{
     fdiv::fdiv_s,
     fma::{fmadd_result, FmaddOp},
     fminmax::fminmax_result,
+    fmul::fmul_s,
     fsqrt::fsqrt_s,
+    fsub::fsub_s,
     Rv32FConfig,
 };
 use openvm_rv32f_transpiler::FpOpcode;
@@ -113,11 +116,10 @@ fn make_instruction(sel: u8, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instructi
 }
 
 fn expected(sel: u8, a: u32, b: u32, c: u32) -> u32 {
-    let (fa, fb) = (f32::from_bits(a), f32::from_bits(b));
     match sel {
-        0 => (fa + fb).to_bits(),
-        1 => (fa - fb).to_bits(),
-        2 => (fa * fb).to_bits(),
+        0 => fadd_s(a, b),
+        1 => fsub_s(a, b),
+        2 => fmul_s(a, b),
         3 => fdiv_s(a, b),
         4 => fminmax_result(a, b, true),
         5 => fminmax_result(a, b, false),
@@ -204,33 +206,14 @@ fuzz_target!(|data: &[u8]| {
     let program = Program::new_without_debug_infos(&instrs, 0);
     let exe = VmExe::new(program).with_init_memory(init);
 
-    // Simulate with full aliasing semantics. NaN *payloads* produced by
-    // fadd/fsub/fmul are implementation-defined (x86 propagates by source
-    // operand; LLVM may reorder), so those results — and anything reading
-    // them later — are tracked as Unknown and skipped in the comparison.
-    #[derive(Clone, Copy)]
-    enum Val {
-        Bits(u32),
-        Unknown,
-    }
-    let mut model: BTreeMap<u32, Val> = regs.iter().map(|(&r, &v)| (r, Val::Bits(v))).collect();
+    // Simulate with full aliasing semantics. All FP results are deterministic
+    // (canonical NaN everywhere), so registers can be compared bit-exactly.
+    let mut model = regs.clone();
     for op in &ops {
-        let a = model.get(&op.rs1).copied().unwrap_or(Val::Bits(0));
-        let b = model.get(&op.rs2).copied().unwrap_or(Val::Bits(0));
-        let c = model.get(&op.rs3).copied().unwrap_or(Val::Bits(0));
-        let out = match (a, b, c) {
-            (Val::Bits(a), Val::Bits(b), Val::Bits(c)) => {
-                let r = expected(op.sel, a, b, c);
-                // fadd/fsub/fmul with a NaN result: payload is impl-defined
-                if op.sel <= 2 && f32::from_bits(r).is_nan() {
-                    Val::Unknown
-                } else {
-                    Val::Bits(r)
-                }
-            }
-            _ => Val::Unknown,
-        };
-        model.insert(op.rd, out);
+        let a = *model.get(&op.rs1).unwrap_or(&0);
+        let b = *model.get(&op.rs2).unwrap_or(&0);
+        let c = *model.get(&op.rs3).unwrap_or(&0);
+        model.insert(op.rd, expected(op.sel, a, b, c));
     }
 
     let executor =
@@ -239,9 +222,6 @@ fuzz_target!(|data: &[u8]| {
     let state = instance.execute(vec![], None).expect("execution failed");
 
     for (reg, want) in &model {
-        let Val::Bits(want) = want else {
-            continue;
-        };
         let got: [u8; 4] = unsafe { state.memory.read::<u8, 4>(FP_AS, reg * 4) };
         assert_eq!(
             u32::from_le_bytes(got),

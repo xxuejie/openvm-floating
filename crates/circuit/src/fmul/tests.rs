@@ -538,3 +538,25 @@ fn fuzz_fmul_special_combinations() {
         }
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// NaN determinism: results must be the RISC-V canonical NaN on every platform
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fmul_nan_canonical() {
+    use openvm_rv32f_guest::CANONICAL_NAN;
+
+    use super::fmul_s;
+
+    let one = 1.0f32.to_bits();
+    let inf = f32::INFINITY.to_bits();
+    let snan = 0x7FA0_0001;
+    assert_eq!(fmul_s(CANONICAL_NAN, one), CANONICAL_NAN);
+    assert_eq!(fmul_s(one, CANONICAL_NAN), CANONICAL_NAN);
+    assert_eq!(fmul_s(snan, one), CANONICAL_NAN);
+    assert_eq!(fmul_s(CANONICAL_NAN, CANONICAL_NAN), CANONICAL_NAN);
+    // 0 * inf is invalid -> canonical NaN
+    assert_eq!(fmul_s(0, inf), CANONICAL_NAN);
+    assert_eq!(fmul_s(inf, 0x8000_0000), CANONICAL_NAN);
+}

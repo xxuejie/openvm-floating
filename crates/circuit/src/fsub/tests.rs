@@ -97,3 +97,28 @@ fn fuzz_fsub_normal() {
         assert_eq!(r.result_bits, expected.to_bits());
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// NaN determinism: results must be the RISC-V canonical NaN on every platform
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fsub_nan_canonical() {
+    use openvm_rv32f_guest::CANONICAL_NAN;
+
+    use super::fsub_s;
+
+    let one = 1.0f32.to_bits();
+    let inf = f32::INFINITY.to_bits();
+    let snan = 0x7FA0_0001;
+    assert_eq!(fsub_s(CANONICAL_NAN, one), CANONICAL_NAN);
+    assert_eq!(fsub_s(one, CANONICAL_NAN), CANONICAL_NAN);
+    assert_eq!(fsub_s(snan, one), CANONICAL_NAN);
+    assert_eq!(fsub_s(CANONICAL_NAN, CANONICAL_NAN), CANONICAL_NAN);
+    // inf - inf is invalid -> canonical NaN
+    assert_eq!(fsub_s(inf, inf), CANONICAL_NAN);
+    assert_eq!(
+        fsub_s(f32::NEG_INFINITY.to_bits(), f32::NEG_INFINITY.to_bits()),
+        CANONICAL_NAN
+    );
+}

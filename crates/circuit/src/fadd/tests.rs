@@ -566,3 +566,25 @@ fn fuzz_fadd_accumulator() {
         }
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// NaN determinism: results must be the RISC-V canonical NaN on every platform
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fadd_nan_canonical() {
+    use openvm_rv32f_guest::CANONICAL_NAN;
+
+    use super::fadd_s;
+
+    let one = 1.0f32.to_bits();
+    let inf = f32::INFINITY.to_bits();
+    let snan = 0x7FA0_0001;
+    // NaN inputs -> canonical NaN (not payload propagation)
+    assert_eq!(fadd_s(CANONICAL_NAN, one), CANONICAL_NAN);
+    assert_eq!(fadd_s(one, CANONICAL_NAN), CANONICAL_NAN);
+    assert_eq!(fadd_s(snan, one), CANONICAL_NAN);
+    assert_eq!(fadd_s(CANONICAL_NAN, CANONICAL_NAN), CANONICAL_NAN);
+    // inf + (-inf) is invalid -> canonical NaN
+    assert_eq!(fadd_s(inf, f32::NEG_INFINITY.to_bits()), CANONICAL_NAN);
+}

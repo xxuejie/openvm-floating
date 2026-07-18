@@ -6,7 +6,7 @@ use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, Lo
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::p3_field::PrimeField32;
 
-use crate::fmul::FmulExecutor;
+use crate::fmul::{fmul_s, FmulExecutor};
 
 #[derive(AlignedBytesBorrow, Clone)]
 #[repr(C)]
@@ -108,9 +108,7 @@ unsafe fn execute_fmul_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
     let as_u32 = pre_compute.register_as as u32;
     let rs1: [u8; 4] = exec_state.vm_read(as_u32, pre_compute.b as u32);
     let rs2: [u8; 4] = exec_state.vm_read(as_u32, pre_compute.c as u32);
-    let a = f32::from_le_bytes(rs1);
-    let b = f32::from_le_bytes(rs2);
-    let result = (a * b).to_le_bytes();
+    let result = fmul_s(u32::from_le_bytes(rs1), u32::from_le_bytes(rs2)).to_le_bytes();
     exec_state.vm_write(as_u32, pre_compute.a as u32, &result);
 
     let pc = exec_state.pc();

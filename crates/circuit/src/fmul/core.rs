@@ -11,6 +11,7 @@ use openvm_circuit_primitives::{
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
 use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, LocalOpcode};
+use openvm_rv32f_guest::CANONICAL_NAN;
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{
     interaction::InteractionBuilder,
@@ -22,6 +23,19 @@ use openvm_stark_backend::{
 pub const SIG_NUM_LIMBS: usize = 3;
 pub const PRODUCT_NUM_LIMBS: usize = 6;
 pub const LIMB_BITS: usize = 8;
+
+/// IEEE 754 / RISC-V FFMUL.S: correctly-rounded (RNE) multiplication.
+/// Returns the canonical NaN whenever the result is any NaN (NaN inputs, or
+/// inf * (-inf)) — the result is deterministic across platforms.
+#[inline(always)]
+pub fn fmul_s(a: u32, b: u32) -> u32 {
+    let r = f32::from_bits(a) * f32::from_bits(b);
+    if r.is_nan() {
+        CANONICAL_NAN
+    } else {
+        r.to_bits()
+    }
+}
 
 #[repr(C)]
 #[derive(AlignedBorrow, StructReflection, Debug)]
@@ -366,8 +380,8 @@ where
             .read(state.memory, instruction, &mut adapter_record)
             .into();
 
-        // Native f32 multiply = IEEE 754 correctly-rounded (RNE)
-        let result = (f32::from_le_bytes(a) * f32::from_le_bytes(b)).to_le_bytes();
+        // Native f32 multiply = IEEE 754 correctly-rounded (RNE), canonical NaN
+        let result = fmul_s(u32::from_le_bytes(a), u32::from_le_bytes(b)).to_le_bytes();
 
         core_record.a = a;
         core_record.b = b;
@@ -420,7 +434,7 @@ where
 
         let a_bits = u32::from_le_bytes(record.a);
         let b_bits = u32::from_le_bytes(record.b);
-        let result_bits = (f32::from_le_bytes(record.a) * f32::from_le_bytes(record.b)).to_bits();
+        let result_bits = fmul_s(a_bits, b_bits);
 
         fill_fmul_witness(
             core_row,
