@@ -15,6 +15,7 @@ struct FpPreCompute {
     b: u8,
     c: u8,
     register_as: u8,
+    op: u8, // 0 = fsgnj, 1 = fsgnjn, 2 = fsgnjx
 }
 
 impl<A> FsgnjExecutor<A> {
@@ -25,18 +26,18 @@ impl<A> FsgnjExecutor<A> {
         data: &mut FpPreCompute,
     ) -> Result<(), StaticProgramError> {
         let local = inst.opcode.local_opcode_idx(self.offset);
-        let op = FpOpcode::from_usize(local);
-        if !matches!(
-            op,
-            FpOpcode::FSGNJ_S | FpOpcode::FSGNJN_S | FpOpcode::FSGNJX_S
-        ) {
-            return Err(StaticProgramError::InvalidInstruction(pc));
-        }
+        let op = match FpOpcode::from_usize(local) {
+            FpOpcode::FSGNJ_S => 0,
+            FpOpcode::FSGNJN_S => 1,
+            FpOpcode::FSGNJX_S => 2,
+            _ => return Err(StaticProgramError::InvalidInstruction(pc)),
+        };
         *data = FpPreCompute {
             a: inst.a.as_canonical_u32() as u8,
             b: inst.b.as_canonical_u32() as u8,
             c: inst.c.as_canonical_u32() as u8,
             register_as: self.register_as as u8,
+            op,
         };
         Ok(())
     }
@@ -115,7 +116,11 @@ unsafe fn execute_fsgnj_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
     let rs2: [u8; 4] = exec_state.vm_read(as_u32, pre_compute.c as u32);
     let a = u32::from_le_bytes(rs1);
     let b = u32::from_le_bytes(rs2);
-    let result = (a & 0x7FFF_FFFF) | (b & 0x8000_0000); // fsgnj default
+    let result = match pre_compute.op {
+        0 => (a & 0x7FFF_FFFF) | (b & 0x8000_0000),  // fsgnj
+        1 => (a & 0x7FFF_FFFF) | (!b & 0x8000_0000), // fsgnjn
+        _ => a ^ (b & 0x8000_0000),                  // fsgnjx
+    };
     exec_state.vm_write(as_u32, pre_compute.a as u32, &result.to_le_bytes());
     let pc = exec_state.pc();
     exec_state.set_pc(pc.wrapping_add(DEFAULT_PC_STEP));

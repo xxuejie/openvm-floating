@@ -1,0 +1,32 @@
+[package]
+name = "openvm-rv32f-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+openvm-rv32f-circuit = { path = "../crates/circuit" }
+openvm-rv32f-transpiler = { path = "../crates/transpiler" }
+openvm-rv32f-guest = { path = "../crates/guest" }
+openvm-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", features = ["test-utils"] }
+openvm-instructions = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", features = ["cpu-backend"] }
+
+[[bin]]
+name = "fuzz_fp_exec"
+path = "fuzz_targets/fuzz_fp_exec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_transpiler"
+path = "fuzz_targets/fuzz_transpiler.rs"
+test = false
+doc = false

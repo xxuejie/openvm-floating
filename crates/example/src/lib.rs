@@ -83,6 +83,45 @@ fn fdiv_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     )
 }
 
+fn fsgnj_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FSGNJ_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn fsgnjn_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FSGNJN_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+fn fsgnjx_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FSGNJX_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 fn fmin_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     Instruction::new(
         VmOpcode::from_usize(FpOpcode::FMIN_S.global_opcode_usize()),
@@ -1034,6 +1073,39 @@ fn test_fsqrt_subnormal_input() {
     let state = run_program(vec![fsqrt_s(0, 1), terminate()], mem);
 
     assert_eq!(read_fp_reg(&state, 0), f32::from_bits(0x0000_0001).sqrt());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FSGNJ.S / FSGNJN.S / FSGNJX.S execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fsgnj_family() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg(&mut mem, 1, 3.5);
+    write_fp_reg(&mut mem, 2, -2.71);
+
+    let a = 3.5f32.to_bits();
+    let b = (-2.71f32).to_bits();
+
+    let state = run_program(
+        vec![
+            fsgnj_s(0, 1, 2),  // 3.5 with sign of -2.71 -> -3.5
+            fsgnjn_s(3, 1, 2), // 3.5 with negated sign of -2.71 -> +3.5
+            fsgnjx_s(4, 1, 2), // 3.5 with sign ^ of (+,-) -> -3.5
+            fsgnjx_s(5, 2, 2), // -2.71 with sign ^ of (-,-) -> +2.71
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 0), -3.5);
+    assert_eq!(read_fp_reg(&state, 3), 3.5);
+    assert_eq!(read_fp_reg(&state, 4), -3.5);
+    assert_eq!(read_fp_reg(&state, 5), 2.71);
+    // inputs preserved
+    assert_eq!(read_fp_reg_bits(&state, 1), a);
+    assert_eq!(read_fp_reg_bits(&state, 2), b);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
