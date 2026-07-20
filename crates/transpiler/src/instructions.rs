@@ -47,4 +47,8 @@ pub enum FpOpcode {
     FNMSUB_S,
     FNMADD_S,
     FSQRT_S,
+    FLW,
+    FSW,
+    FMV_X_S,
+    FMV_S_X,
 }

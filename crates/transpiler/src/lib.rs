@@ -6,13 +6,14 @@ use openvm_instructions::{
 use openvm_rv32f_guest::{
     FADD_S_FUNCT7, FCLASS_FUNCT3, FCLASS_S_FUNCT7, FCMP_S_FUNCT7, FCVT_RS2_W, FCVT_RS2_WU,
     FCVT_S_W_FUNCT7, FCVT_W_S_FUNCT7, FDIV_S_FUNCT7, FEQ_FUNCT3, FLE_FUNCT3, FLT_FUNCT3,
-    FMADD_S_OPCODE, FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMSUB_S_OPCODE, FMUL_S_FUNCT7,
-    FNMADD_S_OPCODE, FNMSUB_S_OPCODE, FSGNJN_FUNCT3, FSGNJX_FUNCT3, FSGNJ_FUNCT3, FSGNJ_S_FUNCT7,
-    FSQRT_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE, RV32_FP_OPCODE, RV32_FP_REGISTER_AS,
+    FLW_FSW_FUNCT3, FMADD_S_OPCODE, FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMSUB_S_OPCODE,
+    FMUL_S_FUNCT7, FMV_S_X_FUNCT7, FMV_X_S_FUNCT3, FNMADD_S_OPCODE, FNMSUB_S_OPCODE, FSGNJN_FUNCT3,
+    FSGNJX_FUNCT3, FSGNJ_FUNCT3, FSGNJ_S_FUNCT7, FSQRT_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE,
+    RV32_FP_OPCODE, RV32_FP_REGISTER_AS, RV32_LOAD_FP_OPCODE, RV32_STORE_FP_OPCODE,
 };
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_transpiler::{TranspilerExtension, TranspilerOutput};
-use rrs_lib::instruction_formats::RType;
+use rrs_lib::instruction_formats::{IType, RType, SType};
 
 mod instructions;
 pub use instructions::*;
@@ -102,12 +103,76 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
         }
 
         if opcode != RV32_FP_OPCODE {
+            // flw: load float from memory to FP register
+            if opcode == RV32_LOAD_FP_OPCODE {
+                let dec_insn = IType::new(instruction_u32);
+                let funct3 = ((instruction_u32 >> 12) & 0b111) as u8;
+                if funct3 != FLW_FSW_FUNCT3 {
+                    return None; // fld (double) not supported
+                }
+                return Some(TranspilerOutput::one_to_one(Instruction::new(
+                    openvm_instructions::VmOpcode::from_usize(FpOpcode::FLW.global_opcode_usize()),
+                    F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
+                    F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
+                    F::from_u32((dec_insn.imm as u32) & 0xFFFF),
+                    F::from_u32(self.fp_register_as), // d: FP register AS
+                    F::from_u32(2),                   // e: memory AS
+                    F::ZERO,
+                    F::ZERO,
+                )));
+            }
+            // fsw: store float from FP register to memory
+            if opcode == RV32_STORE_FP_OPCODE {
+                let dec_insn = SType::new(instruction_u32);
+                let funct3 = ((instruction_u32 >> 12) & 0b111) as u8;
+                if funct3 != FLW_FSW_FUNCT3 {
+                    return None;
+                }
+                return Some(TranspilerOutput::one_to_one(Instruction::new(
+                    openvm_instructions::VmOpcode::from_usize(FpOpcode::FSW.global_opcode_usize()),
+                    F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1), // base addr reg
+                    F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs2), // FP source reg
+                    F::from_u32((dec_insn.imm as u32) & 0xFFFF),
+                    F::from_u32(2),                   // d: memory AS (base addr)
+                    F::from_u32(self.fp_register_as), // e: FP register AS (source)
+                    F::ONE,                           // f: indicates store (a=base, b=src)
+                    F::ZERO,
+                )));
+            }
             return None;
         }
 
         let dec_insn = RType::new(instruction_u32);
         let funct7 = dec_insn.funct7 as u8;
         let rm = ((instruction_u32 >> 12) & 0b111) as u8;
+
+        // fmv.x.s: move FP bits to integer register (funct7=FCLASS_S_FUNCT7, funct3=000, rs2=0)
+        if funct7 == FCLASS_S_FUNCT7 && rm == FMV_X_S_FUNCT3 && dec_insn.rs2 == 0 {
+            return Some(TranspilerOutput::one_to_one(Instruction::new(
+                openvm_instructions::VmOpcode::from_usize(FpOpcode::FMV_X_S.global_opcode_usize()),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
+                F::ZERO,
+                F::from_u32(RV32_REGISTER_AS), // d: integer register AS
+                F::from_u32(self.fp_register_as), // e: FP register AS
+                F::ZERO,
+                F::ZERO,
+            )));
+        }
+
+        // fmv.s.x: move integer bits to FP register (funct7=FMV_S_X_FUNCT7, funct3=000, rs2=0)
+        if funct7 == FMV_S_X_FUNCT7 && rm == 0 && dec_insn.rs2 == 0 {
+            return Some(TranspilerOutput::one_to_one(Instruction::new(
+                openvm_instructions::VmOpcode::from_usize(FpOpcode::FMV_S_X.global_opcode_usize()),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rd),
+                F::from_usize(RV32_REGISTER_NUM_LIMBS * dec_insn.rs1),
+                F::ZERO,
+                F::from_u32(self.fp_register_as), // d: FP register AS
+                F::from_u32(RV32_REGISTER_AS),    // e: integer register AS
+                F::ZERO,
+                F::ZERO,
+            )));
+        }
 
         // Sign injection family: dispatch on funct3 (not rm), no rounding mode check
         if funct7 == FSGNJ_S_FUNCT7 {

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fdiv::*, fma::*,
-    fminmax::*, fmul::*, fsgnj::*, fsqrt::*, fsub::*,
+    fminmax::*, fmul::*, fsgnj::*, fsqrt::*, fsub::*, fxfer::*,
 };
 
 /// RISC-V F (single-precision floating-point) extension config.
@@ -74,6 +74,7 @@ pub enum Rv32FExecutor {
     Fma(Rv32FmaExecutor),
     Fdiv(Rv32FdivExecutor),
     Fsqrt(Rv32FsqrtExecutor),
+    Fxfer(Rv32FxferExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -104,6 +105,18 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
             self.fp_register_as,
         );
         inventory.add_executor(fsqrt, [FpOpcode::FSQRT_S.global_opcode()])?;
+
+        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let fxfer = Rv32FxferExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET);
+        inventory.add_executor(
+            fxfer,
+            [
+                FpOpcode::FLW.global_opcode(),
+                FpOpcode::FSW.global_opcode(),
+                FpOpcode::FMV_X_S.global_opcode(),
+                FpOpcode::FMV_S_X.global_opcode(),
+            ],
+        )?;
 
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
         let fsub = Rv32FsubExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET, self.fp_register_as);
@@ -254,6 +267,12 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         );
         inventory.add_air(fsqrt);
 
+        let fxfer = Rv32FxferAir::new(
+            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            FxferCoreAir::new(FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fxfer);
+
         let fsub = Rv32FsubAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
             FsubCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
@@ -401,6 +420,13 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fsqrt);
+
+        inventory.next_air::<Rv32FxferAir>()?;
+        let fxfer = Rv32FxferChip::new(
+            FxferFiller::new(Rv32FpAdapterFiller, FpOpcode::CLASS_OFFSET),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fxfer);
 
         inventory.next_air::<Rv32FsubAir>()?;
         let fsub = Rv32FsubChip::new(

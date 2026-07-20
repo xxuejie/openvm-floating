@@ -29,6 +29,7 @@ pub mod fmul;
 pub mod fsgnj;
 pub mod fsqrt;
 pub mod fsub;
+pub mod fxfer;
 
 pub use extension::*;
 

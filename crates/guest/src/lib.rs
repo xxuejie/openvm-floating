@@ -3,6 +3,13 @@
 /// RISC-V OPC-FP major opcode (all F arithmetic instructions).
 pub const RV32_FP_OPCODE: u8 = 0b1010011;
 
+/// RISC-V LOAD-FP opcode (flw).
+pub const RV32_LOAD_FP_OPCODE: u8 = 0b0000111;
+/// RISC-V STORE-FP opcode (fsw).
+pub const RV32_STORE_FP_OPCODE: u8 = 0b0100111;
+/// funct3 for single-precision load/store (flw/fsw).
+pub const FLW_FSW_FUNCT3: u8 = 0b010;
+
 /// funct7 field values for F arithmetic instructions.
 pub const FADD_S_FUNCT7: u8 = 0b0000000;
 pub const FSUB_S_FUNCT7: u8 = 0b0000100;
@@ -30,11 +37,17 @@ pub const FLE_FUNCT3: u8 = 0b000;
 pub const FLT_FUNCT3: u8 = 0b001;
 pub const FEQ_FUNCT3: u8 = 0b010;
 
-/// funct7 for fclass.s (funct3=001) and fmv.x.w (funct3=000, not needed for Zfinx).
+/// funct7 for fclass.s (funct3=001) and fmv.x.s (funct3=000).
 /// Single FP source operand; rd is an integer register.
 pub const FCLASS_S_FUNCT7: u8 = 0b1110000;
 /// funct3 for fclass.s.
 pub const FCLASS_FUNCT3: u8 = 0b001;
+/// funct3 for fmv.x.s (move FP bits to integer register).
+pub const FMV_X_S_FUNCT3: u8 = 0b000;
+
+/// funct7 for fmv.s.x (move integer bits to FP register).
+/// Single integer source operand; rd is an FP register.
+pub const FMV_S_X_FUNCT7: u8 = 0b1111000;
 
 /// funct7 for fsqrt.s. Single FP source operand; rs2 field must be 0.
 pub const FSQRT_S_FUNCT7: u8 = 0b0101100;
