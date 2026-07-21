@@ -9,7 +9,7 @@ use openvm_rv32f_guest::{
     FLW_FSW_FUNCT3, FMADD_S_OPCODE, FMAX_FUNCT3, FMIN_FUNCT3, FMIN_S_FUNCT7, FMSUB_S_OPCODE,
     FMUL_S_FUNCT7, FMV_S_X_FUNCT7, FMV_X_S_FUNCT3, FNMADD_S_OPCODE, FNMSUB_S_OPCODE, FSGNJN_FUNCT3,
     FSGNJX_FUNCT3, FSGNJ_FUNCT3, FSGNJ_S_FUNCT7, FSQRT_S_FUNCT7, FSUB_S_FUNCT7, RM_DYN, RM_RNE,
-    RV32_FP_OPCODE, RV32_FP_REGISTER_AS, RV32_LOAD_FP_OPCODE, RV32_STORE_FP_OPCODE,
+    RM_RTZ, RV32_FP_OPCODE, RV32_FP_REGISTER_AS, RV32_LOAD_FP_OPCODE, RV32_STORE_FP_OPCODE,
 };
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_transpiler::{TranspilerExtension, TranspilerOutput};
@@ -275,13 +275,21 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
         }
 
         // Conversion family: fcvt.w.s / fcvt.wu.s (float -> int) and
-        // fcvt.s.w / fcvt.s.wu (int -> float). The rs2 field selects the
-        // integer type. Only RNE and DYN rounding modes are supported.
+        // fcvt.s.w / fcvt.s.wu (int -> float). The rs2 field selects
+        // the integer type.
+        // - fcvt.w.s/fcvt.wu.s: C mandates truncation (RTZ), but also accept RNE/DYN for
+        //   completeness. The executor always truncates.
+        // - fcvt.s.w/fcvt.s.wu: conversion is always exact, any rm is fine.
         if funct7 == FCVT_W_S_FUNCT7 || funct7 == FCVT_S_W_FUNCT7 {
-            if rm != RM_RNE && rm != RM_DYN {
-                return Some(TranspilerOutput::one_to_one(
-                    openvm_transpiler::util::unimp(),
-                ));
+            if funct7 == FCVT_W_S_FUNCT7 {
+                // float -> int: accept RTZ (C standard), RNE, and DYN
+                if rm != RM_RNE && rm != RM_DYN && rm != RM_RTZ {
+                    return Some(TranspilerOutput::one_to_one(
+                        openvm_transpiler::util::unimp(),
+                    ));
+                }
+            } else {
+                // int -> float: always exact, accept any rm
             }
             let is_wu = match dec_insn.rs2 as u8 {
                 FCVT_RS2_W => false,

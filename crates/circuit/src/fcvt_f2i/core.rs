@@ -24,7 +24,9 @@ use openvm_stark_backend::{
 /// Warning: requires `8.div_ceil(range_max_bits) = LT_AUX_LEN`.
 pub const LT_AUX_LEN: usize = 1;
 
-/// IEEE 754 / RISC-V FCVT.W.S: convert f32 to i32 with RNE rounding.
+/// IEEE 754 / RISC-V FCVT.W.S: convert f32 to i32 with truncation (RTZ).
+/// This matches C's `(int)float` semantics. The compiler always emits RTZ
+/// for this instruction.
 /// NaN -> i32::MAX; out of range saturates to i32::MIN / i32::MAX.
 #[inline(always)]
 pub fn fcvt_w_s(bits: u32) -> u32 {
@@ -32,7 +34,7 @@ pub fn fcvt_w_s(bits: u32) -> u32 {
     if f.is_nan() {
         return i32::MAX as u32;
     }
-    let r = f.round_ties_even();
+    let r = f.trunc();
     if r >= 2147483648.0 {
         i32::MAX as u32
     } else if r < -2147483648.0 {
@@ -42,7 +44,7 @@ pub fn fcvt_w_s(bits: u32) -> u32 {
     }
 }
 
-/// IEEE 754 / RISC-V FCVT.WU.S: convert f32 to u32 with RNE rounding.
+/// IEEE 754 / RISC-V FCVT.WU.S: convert f32 to u32 with truncation (RTZ).
 /// NaN -> u32::MAX; negative -> 0; out of range saturates to u32::MAX.
 #[inline(always)]
 pub fn fcvt_wu_s(bits: u32) -> u32 {
@@ -50,7 +52,7 @@ pub fn fcvt_wu_s(bits: u32) -> u32 {
     if f.is_nan() {
         return u32::MAX;
     }
-    let r = f.round_ties_even();
+    let r = f.trunc();
     if r >= 4294967296.0 {
         u32::MAX
     } else if r <= 0.0 {

@@ -737,15 +737,15 @@ fn test_fcvt_w_s_basic() {
     let mut mem = SparseMemoryImage::new();
     write_fp_reg(&mut mem, 1, 3.7);
     write_fp_reg(&mut mem, 2, -3.7);
-    write_fp_reg(&mut mem, 3, 2.5); // ties to even -> 2
+    write_fp_reg(&mut mem, 3, 2.5); // truncation -> 2
 
     let state = run_program(
         vec![fcvt_w_s(0, 1), fcvt_w_s(4, 2), fcvt_w_s(5, 3), terminate()],
         mem,
     );
 
-    assert_eq!(read_fp_reg_bits(&state, 0), 4);
-    assert_eq!(read_fp_reg_bits(&state, 4), (-4i32) as u32);
+    assert_eq!(read_fp_reg_bits(&state, 0), 3); // truncation toward zero
+    assert_eq!(read_fp_reg_bits(&state, 4), (-3i32) as u32);
     assert_eq!(read_fp_reg_bits(&state, 5), 2);
 }
 
@@ -790,7 +790,7 @@ fn test_fcvt_wu_s() {
         mem,
     );
 
-    assert_eq!(read_fp_reg_bits(&state, 0), 4);
+    assert_eq!(read_fp_reg_bits(&state, 0), 3); // truncation toward zero
     assert_eq!(read_fp_reg_bits(&state, 5), 0); // negative -> 0
     assert_eq!(read_fp_reg_bits(&state, 6), u32::MAX); // NaN -> UINT32_MAX
     assert_eq!(read_fp_reg_bits(&state, 7), 3000000000);

@@ -8,23 +8,24 @@ const CANON: u32 = 0x7FC0_0000;
 
 #[test]
 fn test_fcvt_w_s_basic() {
-    assert_eq!(fcvt_w_s(3.7f32.to_bits()), 4);
-    assert_eq!(fcvt_w_s((-3.7f32).to_bits()), (-4i32) as u32);
+    assert_eq!(fcvt_w_s(3.7f32.to_bits()), 3); // truncation toward zero
+    assert_eq!(fcvt_w_s((-3.7f32).to_bits()), (-3i32) as u32);
     assert_eq!(fcvt_w_s(0.0f32.to_bits()), 0);
     assert_eq!(fcvt_w_s((-0.0f32).to_bits()), 0);
 }
 
 #[test]
-fn test_fcvt_w_s_rne_rounding() {
-    // ties to even: 2.5 -> 2, 3.5 -> 4, -2.5 -> -2, -3.5 -> -4
+fn test_fcvt_w_s_rtz_rounding() {
+    // truncation: 2.5 -> 2, 3.5 -> 3, -2.5 -> -2, -3.5 -> -3
     assert_eq!(fcvt_w_s(2.5f32.to_bits()), 2);
-    assert_eq!(fcvt_w_s(3.5f32.to_bits()), 4);
+    assert_eq!(fcvt_w_s(3.5f32.to_bits()), 3);
     assert_eq!(fcvt_w_s((-2.5f32).to_bits()), (-2i32) as u32);
-    assert_eq!(fcvt_w_s((-3.5f32).to_bits()), (-4i32) as u32);
-    // non-ties round to nearest
-    assert_eq!(fcvt_w_s(2.6f32.to_bits()), 3);
+    assert_eq!(fcvt_w_s((-3.5f32).to_bits()), (-3i32) as u32);
+    // non-integers truncate toward zero
+    assert_eq!(fcvt_w_s(2.6f32.to_bits()), 2);
     assert_eq!(fcvt_w_s(2.4f32.to_bits()), 2);
     assert_eq!(fcvt_w_s(0.4f32.to_bits()), 0);
+    assert_eq!(fcvt_w_s((-0.4f32).to_bits()), 0);
 }
 
 #[test]
@@ -48,7 +49,7 @@ fn test_fcvt_w_s_special() {
 
 #[test]
 fn test_fcvt_wu_s_basic() {
-    assert_eq!(fcvt_wu_s(3.7f32.to_bits()), 4);
+    assert_eq!(fcvt_wu_s(3.7f32.to_bits()), 3); // truncation toward zero
     assert_eq!(fcvt_wu_s(0.0f32.to_bits()), 0);
     assert_eq!(fcvt_wu_s(4294967040.0f32.to_bits()), 4294967040);
 }
@@ -74,7 +75,7 @@ fn test_fcvt_wu_s_special() {
 
 #[test]
 fn test_fcvt_f2i_result_dispatch() {
-    assert_eq!(fcvt_f2i_result(3.7f32.to_bits(), false), 4);
+    assert_eq!(fcvt_f2i_result(3.7f32.to_bits(), false), 3); // truncation toward zero
     assert_eq!(fcvt_f2i_result((-3.7f32).to_bits(), true), 0);
 }
 
@@ -97,10 +98,8 @@ impl XorShift64 {
     }
 }
 
-/// Property check (independent of the implementation): verifies the RISC-V
-/// fcvt.w.s contract directly — NaN -> INT32_MAX, saturation at the i32
-/// bounds, and round-to-nearest-even for in-range values, all computed in
-/// f64 (which represents both the input f32 and the result i32 exactly).
+/// Property check: verifies truncation (RTZ) semantics for fcvt.w.s.
+/// NaN -> INT32_MAX, out-of-range saturates, in-range truncates toward zero.
 fn check_fcvt_w_s(bits: u32, result: u32) {
     let f = f32::from_bits(bits);
     if f.is_nan() {
@@ -109,26 +108,22 @@ fn check_fcvt_w_s(bits: u32, result: u32) {
     }
     let fd = f as f64;
     let r = result as i32;
-    // f32 has no values in (2147483520, 2^31) or (-2^31 - 128, -2^31) gaps,
-    // so the saturation boundaries are exactly +-2^31.
     if r == i32::MAX {
         assert!(fd >= 2147483648.0, "fcvt.w.s({f}) = MAX but in range");
     } else if r == i32::MIN {
         assert!(fd <= -2147483648.0, "fcvt.w.s({f}) = MIN but in range");
     } else {
-        let diff = (fd - r as f64).abs();
-        assert!(
-            diff <= 0.5,
-            "fcvt.w.s({f}) = {r}: not nearest (diff {diff})"
+        // Truncation toward zero: |result| <= |f| and |f - result| < 1
+        let expected = fd.trunc() as i32;
+        assert_eq!(
+            r, expected,
+            "fcvt.w.s({f}) = {r}, expected trunc = {expected}"
         );
-        if diff == 0.5 {
-            assert_eq!(r % 2, 0, "fcvt.w.s({f}) = {r}: tie not to even");
-        }
     }
 }
 
-/// Same for fcvt.wu.s: NaN -> UINT32_MAX, negative rounds to 0, saturates
-/// at UINT32_MAX, RNE in range.
+/// Property check: verifies truncation (RTZ) semantics for fcvt.wu.s.
+/// NaN -> UINT32_MAX, negative -> 0, saturates at UINT32_MAX.
 fn check_fcvt_wu_s(bits: u32, result: u32) {
     let f = f32::from_bits(bits);
     if f.is_nan() {
@@ -139,14 +134,13 @@ fn check_fcvt_wu_s(bits: u32, result: u32) {
     if result == u32::MAX {
         assert!(fd >= 4294967296.0, "fcvt.wu.s({f}) = MAX but in range");
     } else if result == 0 {
-        // round(f) <= 0 iff f <= 0.5 (RNE ties 0.5 to even 0)
-        assert!(fd <= 0.5, "fcvt.wu.s({f}) = 0 but rounds positive");
+        assert!(fd < 1.0, "fcvt.wu.s({f}) = 0 but trunc >= 1");
     } else {
-        let diff = (fd - result as f64).abs();
-        assert!(diff <= 0.5, "fcvt.wu.s({f}) = {result}: not nearest");
-        if diff == 0.5 {
-            assert_eq!(result % 2, 0, "fcvt.wu.s({f}) = {result}: tie not to even");
-        }
+        let expected = fd.trunc() as u32;
+        assert_eq!(
+            result, expected,
+            "fcvt.wu.s({f}) = {result}, expected trunc = {expected}"
+        );
     }
 }
 
