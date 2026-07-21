@@ -17,6 +17,7 @@ openvm-instructions = { workspace = true }
 openvm-rv32im-circuit = { workspace = true }
 openvm-rv32f-transpiler = { path = "../transpiler" }
 openvm-rv32f-guest = { path = "../guest" }
+openvm-sha2-circuit = { workspace = true }
 derive-new = { workspace = true }
 derive_more = { workspace = true }
 serde = { workspace = true }

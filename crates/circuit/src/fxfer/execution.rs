@@ -114,11 +114,37 @@ unsafe fn execute_fxfer_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
 ) {
     let read_as = pre_compute.read_as as u32;
     let write_as = pre_compute.write_as as u32;
-    let src_ptr = pre_compute.b as u32;
-    let dst_ptr = pre_compute.a as u32;
+    let a = pre_compute.a as u32;
+    let b = pre_compute.b as u32;
+    let c = pre_compute.c as u32;
 
-    let data: [u8; 4] = exec_state.vm_read(read_as, src_ptr);
-    exec_state.vm_write(write_as, dst_ptr, &data);
+    if read_as == 2 {
+        // FLW: load from memory into FP register.
+        //   b = integer base address register offset (in AS 1)
+        //   c = immediate offset
+        //   a = FP destination register offset (in AS write_as)
+        //   read_as = 2 (memory), write_as = FP register AS
+        let base_bytes: [u8; 4] = exec_state.vm_read(1, b);
+        let base_addr = u32::from_le_bytes(base_bytes);
+        let mem_addr = base_addr.wrapping_add(c);
+        let data: [u8; 4] = exec_state.vm_read(2, mem_addr);
+        exec_state.vm_write(write_as, a, &data);
+    } else if write_as == 2 {
+        // FSW: store FP register to memory.
+        //   a = integer base address register offset (in AS 1)
+        //   c = immediate offset
+        //   b = FP source register offset (in AS read_as)
+        //   write_as = 2 (memory), read_as = FP register AS
+        let base_bytes: [u8; 4] = exec_state.vm_read(1, a);
+        let base_addr = u32::from_le_bytes(base_bytes);
+        let mem_addr = base_addr.wrapping_add(c);
+        let data: [u8; 4] = exec_state.vm_read(read_as, b);
+        exec_state.vm_write(2, mem_addr, &data);
+    } else {
+        // FMV (fmv.x.s / fmv.s.x): simple register-to-register move.
+        let data: [u8; 4] = exec_state.vm_read(read_as, b);
+        exec_state.vm_write(write_as, a, &data);
+    }
 
     let pc = exec_state.pc();
     exec_state.set_pc(pc.wrapping_add(DEFAULT_PC_STEP));

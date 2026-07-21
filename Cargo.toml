@@ -19,6 +19,7 @@ openvm-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.
 openvm-rv32im-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false }
 openvm-rv32im-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
 openvm-rv32im-guest = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+openvm-sha2-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", default-features = false }
 openvm-stark-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
 openvm-cpu-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
 openvm-stark-sdk = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }

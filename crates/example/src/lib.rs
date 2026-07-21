@@ -1803,4 +1803,153 @@ mod chip_proving_tests {
         write_fp_reg(&mut mem, 1, 3.7);
         prove_program(vec![fcvt_wu_s(0, 1), terminate()], mem);
     }
+
+    #[test]
+    fn test_prove_fadd_basic() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 1.5);
+        write_fp_reg(&mut mem, 2, 2.5);
+        prove_program(vec![fadd_s(0, 1, 2), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fadd_neg() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, -3.0);
+        write_fp_reg(&mut mem, 2, 7.0);
+        prove_program(vec![fadd_s(0, 1, 2), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fmul_basic() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 3.0);
+        write_fp_reg(&mut mem, 2, 4.0);
+        prove_program(vec![fmul_s(0, 1, 2), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fmul_edge_cases() {
+        let cases: &[(u32, f32, f32)] = &[
+            (1, 1e20, 1e-20),
+        ];
+        let mut mem = SparseMemoryImage::new();
+        for &(idx, a, b) in cases {
+            write_fp_reg(&mut mem, idx * 2, a);
+            write_fp_reg(&mut mem, idx * 2 + 1, b);
+        }
+        let mut instrs = Vec::new();
+        for &(idx, _, _) in cases {
+            instrs.push(fmul_s(0, idx * 2, idx * 2 + 1));
+        }
+        instrs.push(terminate());
+        prove_program(instrs, mem);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// F extension mode tests (separate FP register file, AS 5)
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod f_extension_tests {
+    use openvm_rv32f_circuit::Rv32FConfig;
+
+    use super::*;
+
+    const F_AS: u32 = 5; // RV32_FP_REGISTER_AS
+
+    fn write_fpreg_f(mem: &mut SparseMemoryImage, reg_idx: u32, val: f32) {
+        let offset = reg_idx * 4;
+        for (i, byte) in val.to_le_bytes().iter().enumerate() {
+            mem.insert((F_AS, offset + i as u32), *byte);
+        }
+    }
+
+    fn read_fpreg_f(state: &VmState<F>, reg_idx: u32) -> f32 {
+        let offset = reg_idx * 4;
+        let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(F_AS, offset) };
+        f32::from_le_bytes(bytes)
+    }
+
+    fn fmul_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(FpOpcode::FMUL_S.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::from_usize(4 * rs2 as usize),
+            F::from_u32(F_AS),
+            F::from_u32(F_AS),
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+
+    fn fadd_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(FpOpcode::FADD_S.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::from_usize(4 * rs2 as usize),
+            F::from_u32(F_AS),
+            F::from_u32(F_AS),
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+
+    fn run_f_program(
+        instructions: Vec<Instruction<F>>,
+        init_memory: SparseMemoryImage,
+    ) -> VmState<F> {
+        let program = Program::new_without_debug_infos(&instructions, 0);
+        let exe = VmExe::new(program).with_init_memory(init_memory);
+        let executor = VmExecutor::new(Rv32FConfig::new_f()).expect("failed to create executor");
+        let instance = executor.instance(&exe).expect("failed to create instance");
+        instance.execute(vec![], None).expect("execution failed")
+    }
+
+    #[test]
+    fn test_f_ext_fmul() {
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 3.0);
+        write_fpreg_f(&mut mem, 2, 4.0);
+
+        let state = run_f_program(vec![fmul_f(0, 1, 2), terminate()], mem);
+
+        let result = read_fpreg_f(&state, 0);
+        assert_eq!(result, 12.0, "FMUL.S in F extension mode: 3.0 * 4.0");
+    }
+
+    #[test]
+    fn test_f_ext_fadd() {
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 1.5);
+        write_fpreg_f(&mut mem, 2, 2.5);
+
+        let state = run_f_program(vec![fadd_f(0, 1, 2), terminate()], mem);
+
+        let result = read_fpreg_f(&state, 0);
+        assert_eq!(result, 4.0, "FADD.S in F extension mode: 1.5 + 2.5");
+    }
+
+    #[test]
+    fn test_f_ext_chained() {
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 3.0);
+        write_fpreg_f(&mut mem, 2, 4.0);
+        write_fpreg_f(&mut mem, 3, 5.0);
+
+        let state = run_f_program(
+            vec![
+                fmul_f(0, 1, 2), // f0 = 12.0
+                fadd_f(4, 0, 3), // f4 = 17.0
+                terminate(),
+            ],
+            mem,
+        );
+
+        assert_eq!(read_fpreg_f(&state, 0), 12.0);
+        assert_eq!(read_fpreg_f(&state, 4), 17.0);
+    }
 }

@@ -9,9 +9,11 @@ use openvm_circuit::{
 };
 use openvm_circuit_derive::VmConfig;
 use openvm_cpu_backend::{CpuBackend, CpuDevice};
+use openvm_rv32f_guest::RV32_FP_REGISTER_AS;
 use openvm_rv32im_circuit::{
     Rv32I, Rv32IExecutor, Rv32ImCpuProverExt, Rv32Io, Rv32IoExecutor, Rv32M, Rv32MExecutor,
 };
+use openvm_sha2_circuit::{Sha2, Sha2CpuProverExt, Sha2Executor};
 use openvm_stark_backend::{StarkEngine, StarkProtocolConfig, Val};
 use serde::{Deserialize, Serialize};
 
@@ -46,25 +48,48 @@ pub struct Rv32FConfig {
     pub mul: Rv32M,
     #[extension]
     pub f: Rv32F,
+    #[extension]
+    pub sha2: Sha2,
 }
 
 impl InitFileGenerator for Rv32FConfig {}
 
 impl Default for Rv32FConfig {
     fn default() -> Self {
-        let f = Rv32F::default();
-        let mut system = SystemConfig::default();
-        if f.fp_register_as != 1 {
-            use openvm_circuit::arch::MemoryCellType;
-            system.memory_config.addr_spaces[f.fp_register_as as usize].num_cells = 32 * 4;
-            system.memory_config.addr_spaces[f.fp_register_as as usize].layout = MemoryCellType::U8;
+        Self::new_zfinx()
+    }
+}
+
+impl Rv32FConfig {
+    /// Zfinx mode: floats in integer registers (AS 1). No FP register file needed.
+    pub fn new_zfinx() -> Self {
+        Self {
+            system: SystemConfig::default(),
+            base: Default::default(),
+            io: Default::default(),
+            mul: Default::default(),
+            f: Rv32F::default(),
+            sha2: Sha2,
         }
+    }
+
+    /// F extension mode: separate FP register file in AS 5.
+    pub fn new_f() -> Self {
+        use openvm_circuit::arch::MemoryCellType;
+        let mut system = SystemConfig::default();
+        // Allocate FP register file: 32 registers × 4 bytes = 128 cells
+        system.memory_config.addr_spaces[RV32_FP_REGISTER_AS as usize].num_cells = 32 * 4;
+        system.memory_config.addr_spaces[RV32_FP_REGISTER_AS as usize].layout = MemoryCellType::U8;
         Self {
             system,
             base: Default::default(),
             io: Default::default(),
             mul: Default::default(),
-            f,
+            f: Rv32F {
+                range_tuple_checker_sizes: Default::default(),
+                fp_register_as: RV32_FP_REGISTER_AS,
+            },
+            sha2: Sha2,
         }
     }
 }
@@ -104,6 +129,7 @@ where
         VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.io, inventory)?;
         VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.mul, inventory)?;
         VmProverExtension::<E, _, _>::extend_prover(&Rv32FCpuProverExt, &config.f, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(&Sha2CpuProverExt, &config.sha2, inventory)?;
         Ok(chip_complex)
     }
 }

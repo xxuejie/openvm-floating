@@ -196,8 +196,10 @@ where
 
         // ── Phase 4: Sum / difference ────────────────────────────────────
         // is_add = (a_sign == b_sign)
+        // Gate with is_valid: padding rows (is_valid=0) must not trigger this.
         let sign_xor = cols.a_sign + cols.b_sign - cols.a_sign * cols.b_sign * f2;
-        builder.assert_eq(cols.is_add, one.clone() - sign_xor.clone());
+        let expected_is_add = (one.clone() - sign_xor.clone()) * cols.is_valid.clone();
+        builder.assert_eq(cols.is_add.clone() * cols.is_valid.clone(), expected_is_add);
         // TODO: verify raw_sum is the correct sum/difference of significands
 
         // ── Phase 5: Normalization ───────────────────────────────────────
