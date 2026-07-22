@@ -28,7 +28,7 @@ default = ["parallel"]
 parallel = ["openvm-circuit/parallel"]
 
 [dev-dependencies]
-openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", features = ["cpu-backend"] }
-openvm-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false, features = ["test-utils"] }
-openvm-rv32im-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", default-features = false, features = ["test-utils"] }
+openvm-stark-sdk = { workspace = true, features = ["cpu-backend"] }
+openvm-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", default-features = false, features = ["test-utils"] }
+openvm-rv32im-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", default-features = false, features = ["test-utils"] }
 rand = "0.9"
