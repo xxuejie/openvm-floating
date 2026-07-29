@@ -20,7 +20,9 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
-use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+use crate::fp_shift::{
+    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+};
 
 pub const SIG_NUM_LIMBS: usize = 3;
 pub const EXT_SIG_LIMBS: usize = 4; // extended significand: 3 mantissa bytes + 1 guard/sticky byte
@@ -145,6 +147,18 @@ pub struct FsubCoreCols<T> {
     pub s_sub: T,      // finite AND !is_add (opposite signs) AND both-normal
     pub s_normal: T,   // s_sub AND !is_deep AND result exp field in [1, 254]
     pub s_overflow: T, // s_sub AND !is_deep AND result exp field == 255
+
+    // === Cancellation path (same-sign subtraction, 6-byte field) ===
+    pub cancel_align: ShrnCols<T, 6>,
+    pub cancel_diff: [T; 6],
+    pub cancel_borrow: [T; 5],
+    pub cancel_shln: ShlnCols<T, 6>,
+    pub cancel_lshift: T,
+    pub ediff_nz: T,
+    pub ediff_nz_inv: T,
+    pub s_fb: T,
+    pub s_cancel: T, // finite AND is_add (same sign) AND both-normal AND !is_deep AND ediff!=0
+    pub s_cancel_normal: T,
 
     // === Result ===
     pub result_sign: T,
@@ -314,6 +328,8 @@ where
         // fsub a - b with opposite signs is a magnitude addition (no cancellation),
         // structurally identical to the fadd same-sign path.
         self.eval_finite_sub(builder, cols);
+        // Cancellation (same-sign subtraction, 6-byte field).
+        self.eval_finite_cancel(builder, cols);
         // ── Output ───────────────────────────────────────────────────────
         let expected_opcode = VmCoreAir::<AB, I>::opcode_to_global_expr(self, FpOpcode::FSUB_S);
 
@@ -696,6 +712,200 @@ impl FsubCoreAir {
             .when(cols.s_overflow)
             .assert_eq(cols.result[2], f128);
     }
+
+    /// Constrain the cancellation (same-sign subtraction) result path via a 6-byte
+    /// working field. Identical to fadd's cancellation except: the selector uses
+    /// `is_add` (fsub: same-sign = subtraction) and the result sign follows the
+    /// fsub rule (`sel*a_sign + (1-sel)*(1-a_sign)`).
+    pub fn eval_finite_cancel<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FsubCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(1 << LIMB_BITS);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
+
+        // ── Sound selectors ─────────────────────────────────────────────
+        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
+        builder.assert_eq(
+            cols.s_fb,
+            s_finite.clone() * cols.a_is_normal * cols.b_is_normal,
+        );
+        builder.assert_bool(cols.s_fb);
+        let ediff_is_zero = one.clone() - cols.ediff * cols.ediff_nz_inv;
+        builder.assert_zero(cols.ediff * ediff_is_zero.clone());
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.ediff_nz, one.clone() - ediff_is_zero);
+        builder.assert_bool(cols.ediff_nz);
+        // s_cancel = s_fb AND is_add (same sign ⇒ subtraction) AND !is_deep AND ediff!=0.
+        builder.assert_eq(
+            cols.s_cancel,
+            cols.s_fb * cols.is_add * (one.clone() - cols.is_deep) * cols.ediff_nz,
+        );
+        builder.assert_bool(cols.s_cancel);
+        let s = cols.s_cancel;
+
+        // ── Alignment via ShrnGadget<6> ──────────────────────────────────
+        for i in 0..3 {
+            builder.when(s).assert_zero(cols.cancel_align.x[i]);
+        }
+        builder
+            .when(s)
+            .assert_eq(cols.cancel_align.x[3], cols.small_sig[0]);
+        builder
+            .when(s)
+            .assert_eq(cols.cancel_align.x[4], cols.small_sig[1]);
+        builder
+            .when(s)
+            .assert_eq(cols.cancel_align.x[5], cols.small_sig[2]);
+        builder
+            .when(s)
+            .assert_eq(cols.cancel_align.shift, cols.ediff);
+        builder.assert_eq(cols.cancel_align.enable, s);
+        let align_shrn = ShrnGadget::new(self.range_bus);
+        align_shrn.eval_shrn(builder, &cols.cancel_align);
+
+        // ── 6-byte borrow chain: raw_diff = large_working - aligned ──────
+        let lw = |i: usize| -> AB::Expr {
+            match i {
+                0..=2 => AB::Expr::ZERO,
+                3 => cols.large_sig[0].into(),
+                4 => cols.large_sig[1].into(),
+                5 => cols.large_sig[2].into(),
+                _ => unreachable!(),
+            }
+        };
+        for i in 0..5 {
+            builder.assert_bool(cols.cancel_borrow[i]);
+        }
+        builder.when(s).assert_eq(
+            cols.cancel_diff[0] + cols.cancel_align.y[0],
+            cols.cancel_borrow[0] * f256,
+        );
+        for i in 1..5 {
+            let bin = cols.cancel_borrow[i - 1];
+            builder.when(s).assert_eq(
+                cols.cancel_diff[i] + cols.cancel_align.y[i] + bin,
+                lw(i) + cols.cancel_borrow[i] * f256,
+            );
+        }
+        builder.when(s).assert_eq(
+            cols.cancel_diff[5] + cols.cancel_align.y[5] + cols.cancel_borrow[4],
+            lw(5),
+        );
+
+        // ── Left-shift normalize via ShlnGadget<6> ──────────────────────
+        for i in 0..6 {
+            builder
+                .when(s)
+                .assert_eq(cols.cancel_shln.x[i], cols.cancel_diff[i]);
+        }
+        builder
+            .when(s)
+            .assert_eq(cols.cancel_shln.shift, cols.cancel_lshift);
+        builder.assert_eq(cols.cancel_shln.enable, s);
+        let shln = ShlnGadget::new(self.range_bus);
+        shln.eval_shln(builder, &cols.cancel_shln);
+        for i in 0..6 {
+            self.range_bus
+                .range_check(cols.cancel_shln.y[i].into(), LIMB_BITS)
+                .eval(builder, s.into());
+        }
+
+        // ── RNE rounding ────────────────────────────────────────────────
+        let norm = &cols.cancel_shln.y;
+        builder
+            .when(s)
+            .assert_eq(norm[2], cols.ns0_lo + cols.guard * f128);
+        builder.assert_bool(cols.guard);
+        self.range_bus
+            .range_check(cols.ns0_lo.into(), 7)
+            .eval(builder, s.into());
+        builder
+            .when(s)
+            .assert_eq(norm[3], cols.mant_lsb + cols.ns1_high * f2);
+        builder.assert_bool(cols.mant_lsb);
+        self.range_bus
+            .range_check(cols.ns1_high.into(), 7)
+            .eval(builder, s.into());
+        builder
+            .when(s)
+            .assert_eq(cols.below_guard, cols.ns0_lo + norm[0] + norm[1]);
+        let bgz = one.clone() - cols.below_guard * cols.below_guard_inv;
+        builder.assert_zero(cols.below_guard * bgz.clone());
+        builder.when(s).assert_eq(cols.sticky, one.clone() - bgz);
+        builder.assert_bool(cols.sticky);
+        let sticky_or_lsb = cols.sticky + cols.mant_lsb - cols.sticky * cols.mant_lsb;
+        builder
+            .when(s)
+            .assert_eq(cols.round_up, cols.guard * sticky_or_lsb);
+        builder.assert_bool(cols.round_up);
+
+        // ── Output reconstruction ───────────────────────────────────────
+        let large_exp =
+            cols.a_is_larger * a_exp.clone() + (one.clone() - cols.a_is_larger) * b_exp.clone();
+        // fsub result sign for same-sign subtraction:
+        //   a_is_larger: result_sign = a_sign; b_is_larger: result_sign = 1 - a_sign.
+        let cancel_sign = cols.a_is_larger * cols.a_sign
+            + (one.clone() - cols.a_is_larger) * (one.clone() - cols.a_sign);
+        builder
+            .when(s)
+            .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
+        builder.when(s).assert_eq(
+            cols.r_exp_lo + cols.r_exp_hi * f2,
+            large_exp.clone() - cols.cancel_lshift + cols.rc2,
+        );
+        builder.when(s).assert_eq(cols.result_sign, cancel_sign);
+        builder
+            .when(s)
+            .assert_eq(cols.result[0] + cols.rc0 * f256, norm[3] + cols.round_up);
+        builder
+            .when(s)
+            .assert_eq(cols.result[1] + cols.rc1 * f256, norm[4] + cols.rc0);
+        builder
+            .when(s)
+            .assert_eq((norm[5] - f128) + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s.into());
+        builder
+            .when(s)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder
+            .when(s)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
+
+        // ── Normal-result selector ──────────────────────────────────────
+        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
+        builder.when(s).assert_zero(cols.r_exp_hi * he0.clone());
+        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
+        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
+        builder.when(s).assert_zero(delta127 * he127.clone());
+        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
+        let exp_field_max = cols.r_exp_lo * he127;
+        builder.assert_eq(
+            cols.s_cancel_normal,
+            s * (one.clone() - exp_field_zero.clone() - exp_field_max.clone()),
+        );
+        builder.assert_bool(cols.s_cancel_normal);
+        let scn = cols.s_cancel_normal;
+        builder
+            .when(scn)
+            .assert_eq(cols.result[0] + cols.rc0 * f256, norm[3] + cols.round_up);
+        builder
+            .when(scn)
+            .assert_eq(cols.result[1] + cols.rc1 * f256, norm[4] + cols.rc0);
+        builder
+            .when(scn)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+    }
 }
 
 // === Record ===
@@ -974,10 +1184,10 @@ fn fill_fsub_witness<F: PrimeField32>(
     } else {
         b_mant
     };
-    let (large_sig, small_sig, large_exp) = if a_is_larger {
-        (a_sig, b_sig, a_exp)
+    let (large_sig, small_sig, large_exp, _large_sign) = if a_is_larger {
+        (a_sig, b_sig, a_exp, a_sign)
     } else {
-        (b_sig, a_sig, b_exp)
+        (b_sig, a_sig, b_exp, b_sign)
     };
     for i in 0..SIG_NUM_LIMBS {
         row.large_sig[i] = F::from_u32((large_sig >> (i * LIMB_BITS)) & 0xFF);
@@ -995,6 +1205,20 @@ fn fill_fsub_witness<F: PrimeField32>(
 
     let s_shallow = s_sub && !is_deep;
     row.align_enable = F::from_bool(s_shallow);
+
+    // Cancellation selectors (fsub: same-sign = subtraction).
+    let s_finite_bool = !is_nan_res && !inf_in && !s_zero_both;
+    row.ediff_nz = F::from_bool(ediff != 0);
+    row.ediff_nz_inv = if ediff != 0 {
+        F::from_u32(ediff).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let s_cancel =
+        s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep && ediff != 0;
+    row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_cancel = F::from_bool(s_cancel);
+    row.s_cancel_normal = F::ZERO;
 
     // ── Alignment via ShrnGadget (shallow), else disabled ───────────────
     let x: [u32; WORK_LIMBS] = [
@@ -1019,11 +1243,48 @@ fn fill_fsub_witness<F: PrimeField32>(
     }
 
     if !s_shallow {
+        if s_cancel {
+            fill_cancel_fsub(
+                row,
+                large_sig,
+                small_sig,
+                large_exp,
+                a_sign,
+                a_is_larger,
+                r_exp,
+                result_bits,
+                a_bits,
+                b_bits,
+                ediff,
+                range_checker,
+            );
+            row.is_valid = F::ONE;
+            return;
+        }
         zero_finite_columns(row);
-        row.result_exp = F::from_u32(if s_sub && is_deep { large_exp } else { r_exp });
+        row.cancel_align = ShrnCols::<F, 6>::default();
+        for i in 0..6 {
+            row.cancel_diff[i] = F::ZERO;
+        }
+        for i in 0..5 {
+            row.cancel_borrow[i] = F::ZERO;
+        }
+        row.cancel_shln = ShlnCols::<F, 6>::default();
+        row.cancel_lshift = F::ZERO;
+        row.result_exp = F::from_u32(r_exp);
         row.is_valid = F::ONE;
         return;
     }
+    // Shallow path: zero cancellation columns.
+    row.cancel_align = ShrnCols::<F, 6>::default();
+    for i in 0..6 {
+        row.cancel_diff[i] = F::ZERO;
+    }
+    for i in 0..5 {
+        row.cancel_borrow[i] = F::ZERO;
+    }
+    row.cancel_shln = ShlnCols::<F, 6>::default();
+    row.cancel_lshift = F::ZERO;
 
     // ── Sum: raw_sum = (large_sig << 8) + aligned (magnitude addition) ──
     let large_working = (large_sig as u64) << 8;
@@ -1237,6 +1498,271 @@ fn make_shrn_cols<F: PrimeField32>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fill_cancel_fsub<F: PrimeField32>(
+    row: &mut FsubCoreCols<F>,
+    large_sig: u32,
+    small_sig: u32,
+    large_exp: u32,
+    a_sign: u32,
+    a_is_larger: bool,
+    r_exp: u32,
+    result_bits: u32,
+    a_bits: u32,
+    b_bits: u32,
+    ediff: u32,
+    range_checker: &SharedVariableRangeCheckerChip,
+) {
+    let x: [u32; 6] = [
+        0,
+        0,
+        0,
+        small_sig & 0xFF,
+        (small_sig >> 8) & 0xFF,
+        (small_sig >> 16) & 0xFF,
+    ];
+    row.cancel_align = make_shrn_cols6::<F>(x, ediff as usize, range_checker);
+
+    let aligned: u64 = (0..6).fold(0u64, |acc, i| {
+        acc | ((row.cancel_align.y[i].as_canonical_u32() as u64) << (i * 8))
+    });
+    let large_working6: u64 = (large_sig as u64) << 24;
+    let raw_diff = large_working6.wrapping_sub(aligned);
+    debug_assert!(
+        raw_diff < (1u64 << 48),
+        "fsub cancel raw_diff overflow: a={:08x} b={:08x}",
+        a_bits,
+        b_bits
+    );
+
+    let lw_bytes: [u32; 6] = [
+        (large_working6 & 0xFF) as u32,
+        ((large_working6 >> 8) & 0xFF) as u32,
+        ((large_working6 >> 16) & 0xFF) as u32,
+        ((large_working6 >> 24) & 0xFF) as u32,
+        ((large_working6 >> 32) & 0xFF) as u32,
+        ((large_working6 >> 40) & 0xFF) as u32,
+    ];
+    let al_bytes: [u32; 6] = [
+        (aligned & 0xFF) as u32,
+        ((aligned >> 8) & 0xFF) as u32,
+        ((aligned >> 16) & 0xFF) as u32,
+        ((aligned >> 24) & 0xFF) as u32,
+        ((aligned >> 32) & 0xFF) as u32,
+        ((aligned >> 40) & 0xFF) as u32,
+    ];
+    let mut borrow = 0i32;
+    for i in 0..6 {
+        let d = lw_bytes[i] as i32 - al_bytes[i] as i32 - borrow;
+        if d < 0 {
+            row.cancel_diff[i] = F::from_u32((d + 256) as u32);
+            borrow = 1;
+        } else {
+            row.cancel_diff[i] = F::from_u32(d as u32);
+            borrow = 0;
+        }
+        if i < 5 {
+            row.cancel_borrow[i] = F::from_u32(borrow as u32);
+        }
+    }
+    debug_assert_eq!(borrow, 0, "fsub cancel final borrow != 0");
+
+    let raw_diff_val: u64 = (0..6).fold(0u64, |acc, i| {
+        acc | ((row.cancel_diff[i].as_canonical_u32() as u64) << (i * 8))
+    });
+    let lshift = if raw_diff_val == 0 {
+        0
+    } else {
+        raw_diff_val.leading_zeros() - 16
+    };
+    row.cancel_lshift = F::from_u32(lshift);
+    let raw_bytes6: [u32; 6] = core::array::from_fn(|i| ((raw_diff_val >> (i * 8)) & 0xFF) as u32);
+    row.cancel_shln = make_shln_cols6::<F>(raw_bytes6, lshift as usize, range_checker);
+
+    let norm = raw_diff_val << lshift;
+    let ns0 = ((norm >> 16) & 0xFF) as u32;
+    let ns3 = ((norm >> 24) & 0xFF) as u32;
+    let guard = (ns0 >> 7) & 1;
+    let ns0_lo = ns0 & 0x7F;
+    let mant_lsb = ns3 & 1;
+    let ns1_high = ns3 >> 1;
+    let below_guard = ns0_lo + (norm & 0xFF) as u32 + ((norm >> 8) & 0xFF) as u32;
+    let sticky = below_guard != 0;
+    let round_up = guard == 1 && (sticky || mant_lsb == 1);
+
+    row.guard = F::from_u32(guard);
+    row.ns0_lo = F::from_u32(ns0_lo);
+    row.ns1_high = F::from_u32(ns1_high);
+    row.mant_lsb = F::from_u32(mant_lsb);
+    row.below_guard = F::from_u32(below_guard);
+    row.below_guard_inv = if below_guard != 0 {
+        F::from_u32(below_guard).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.sticky = F::from_bool(sticky);
+    row.round_up = F::from_bool(round_up);
+    range_checker.add_count(ns0_lo, 7);
+    range_checker.add_count(ns1_high, 7);
+    for i in 0..6 {
+        range_checker.add_count(((norm >> (i * 8)) & 0xFF) as u32, 8);
+    }
+
+    let nb3 = ((norm >> 24) & 0xFF) as u32;
+    let nb4 = ((norm >> 32) & 0xFF) as u32;
+    let nb5 = ((norm >> 40) & 0xFF) as u32;
+    let s0 = nb3 + round_up as u32;
+    let rc0 = s0 >> 8;
+    let s1 = nb4 + rc0;
+    let rc1 = s1 >> 8;
+    let top7c = (nb5 - 128) + rc1;
+    let rc2 = top7c >> 7;
+    let rc2_rem = top7c & 0x7F;
+    let result_exp_calc = large_exp.wrapping_sub(lshift).wrapping_add(rc2);
+
+    // fsub result sign: a_is_larger ? a_sign : (1 - a_sign).
+    let cancel_r_sign = if a_is_larger { a_sign } else { 1 - a_sign };
+
+    row.carry_out = F::ZERO;
+    row.sum_c1 = F::ZERO;
+    row.sum_c2 = F::ZERO;
+    for i in 0..WORK_LIMBS {
+        row.raw_sum[i] = F::ZERO;
+        row.rs_high7[i] = F::ZERO;
+        row.rs_lowbit[i] = F::ZERO;
+    }
+    row.rc0 = F::from_u32(rc0);
+    row.rc1 = F::from_u32(rc1);
+    row.rc2 = F::from_u32(rc2);
+    row.rc2_rem = F::from_u32(rc2_rem);
+    row.r_exp_lo = F::from_u32(r_exp & 1);
+    row.r_exp_hi = F::from_u32(r_exp >> 1);
+    row.r_exp_hi_zero_inv = if r_exp >> 1 != 0 {
+        F::from_u32(r_exp >> 1).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.r_exp_hi_max_inv = if r_exp >> 1 != 127 {
+        (F::from_u32(127) - F::from_u32(r_exp >> 1))
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.result_exp = F::from_u32(r_exp);
+    row.result_sign = F::from_u32(cancel_r_sign);
+    range_checker.add_count(rc2_rem, 7);
+    row.s_cancel_normal = F::from_bool((1u32..=254).contains(&r_exp));
+
+    if (1u32..=254).contains(&r_exp) {
+        debug_assert_eq!(
+            result_exp_calc, r_exp,
+            "fsub cancel exp: a={:08x} b={:08x}",
+            a_bits, b_bits
+        );
+        debug_assert_eq!(
+            (nb3 + round_up as u32) & 0xFF,
+            result_bits & 0xFF,
+            "fsub cancel byte0"
+        );
+        debug_assert_eq!((nb4 + rc0) & 0xFF, (result_bits >> 8) & 0xFF);
+        debug_assert_eq!(rc2_rem + (r_exp & 1) * 128, (result_bits >> 16) & 0xFF);
+    }
+}
+
+fn make_shrn_cols6<F: PrimeField32>(
+    x: [u32; 6],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 6> {
+    const N: usize = 6;
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    for i in 0..N {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
+    }
+}
+
+fn make_shln_cols6<F: PrimeField32>(
+    x: [u32; 6],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShlnCols<F, 6> {
+    const N: usize = 6;
+    let shift = shift.min(N * SHLIMB_BITS);
+    let (y, q, r) = run_shln(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+    let carry_val = |v: u32| if r == 0 { 0 } else { v >> (SHLIMB_BITS - r) };
+    for i in 0..N {
+        range_checker.add_count(carry_val(x[i]), r);
+        range_checker.add_count(y[i], 8);
+    }
+    ShlnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(carry_val(x[i]))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+    }
+}
+
 #[cfg(test)]
 mod special_tests {
     use super::*;
@@ -1386,6 +1912,7 @@ mod finite_sub_tests {
         fill_fsub_witness(&mut row, a, b, result, chip);
         let mut builder = NumericBuilder::new(vec![]);
         air().eval_finite_sub(&mut builder, &row);
+        air().eval_finite_cancel(&mut builder, &row);
         (builder, row)
     }
 

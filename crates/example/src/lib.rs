@@ -1629,7 +1629,7 @@ mod fuzz_tests {
             let ea = (rng.next_u32() % 254) + 1;
             let eb = (rng.next_u32() % 254) + 1;
             cases.push((
-                (0 << 31) | (ea << 23) | (rng.next_u32() & 0x7FFFFF),
+                (ea << 23) | (rng.next_u32() & 0x7FFFFF),
                 (1 << 31) | (eb << 23) | (rng.next_u32() & 0x7FFFFF),
             ));
         }
@@ -1643,11 +1643,11 @@ mod fuzz_tests {
     #[test]
     fn fuzz_prove_fsub() {
         let mut rng = XorShift64::new(0xB0B0_000A);
-        let mut cases: Vec<(u32, u32)> = (0..10)
+        let mut cases: Vec<(u32, u32)> = (0..6)
             .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
             .collect();
-        // Opposite-sign both-normal inputs exercise the constrained magnitude-add path.
-        for _ in 0..5 {
+        // Opposite-sign both-normal (magnitude add, no-cancellation path).
+        for _ in 0..3 {
             let sa = (rng.next_u32()) & 1;
             let sb = 1 - sa;
             let ea = (rng.next_u32() % 254) + 1;
@@ -1657,6 +1657,18 @@ mod fuzz_tests {
                 (sb << 31) | (eb << 23) | (rng.next_u32() & 0x7FFFFF),
             ));
         }
+        // Same-sign both-normal (cancellation path): various ediffs.
+        for _ in 0..3 {
+            let sign = (rng.next_u32() & 1) << 31;
+            let ea = (rng.next_u32() % 254) + 1;
+            let eb = (rng.next_u32() % 254) + 1;
+            cases.push((
+                sign | (ea << 23) | (rng.next_u32() & 0x7FFFFF),
+                sign | (eb << 23) | (rng.next_u32() & 0x7FFFFF),
+            ));
+        }
+        // Heavy cancellation (close magnitudes).
+        cases.push((0x3f800000, 0x3f800001)); // 1.0 - (1.0+tiny)
         let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fsub_s(rd, rs1, rs2));
         prove_chunk(instrs, mem);
     }
