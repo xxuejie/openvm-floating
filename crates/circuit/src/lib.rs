@@ -33,6 +33,9 @@ pub mod fsqrt;
 pub mod fsub;
 pub mod fxfer;
 
+#[cfg(test)]
+mod test_utils;
+
 pub use extension::*;
 
 /// VM config for rv32imf (base + mul + io + F extension).

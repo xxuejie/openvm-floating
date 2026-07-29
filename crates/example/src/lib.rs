@@ -1830,9 +1830,7 @@ mod chip_proving_tests {
 
     #[test]
     fn test_prove_fmul_edge_cases() {
-        let cases: &[(u32, f32, f32)] = &[
-            (1, 1e20, 1e-20),
-        ];
+        let cases: &[(u32, f32, f32)] = &[(1, 1e20, 1e-20)];
         let mut mem = SparseMemoryImage::new();
         for &(idx, a, b) in cases {
             write_fp_reg(&mut mem, idx * 2, a);

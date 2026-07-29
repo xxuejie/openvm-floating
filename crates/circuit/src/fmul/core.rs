@@ -38,7 +38,7 @@ pub fn fmul_s(a: u32, b: u32) -> u32 {
 }
 
 #[repr(C)]
-#[derive(AlignedBorrow, StructReflection, Debug)]
+#[derive(AlignedBorrow, StructReflection, Debug, Default)]
 pub struct FmulCoreCols<T> {
     // Decomposition of input a
     pub a_sign: T,
@@ -63,6 +63,21 @@ pub struct FmulCoreCols<T> {
     pub b_exp_zero_inv: T,
     pub b_exp_max_inv: T,
     pub b_mant_sum_inv: T,
+
+    // Classification flags (stored as columns so downstream result-flag and
+    // output constraints stay low degree; mirrors the fdiv/fma pattern).
+    pub a_exp_is_zero: T,
+    pub a_exp_is_max: T,
+    pub a_mant_is_zero: T,
+    pub b_exp_is_zero: T,
+    pub b_exp_is_max: T,
+    pub b_mant_is_zero: T,
+    pub a_is_nan: T,
+    pub a_is_inf: T,
+    pub a_is_zero: T,
+    pub b_is_nan: T,
+    pub b_is_inf: T,
+    pub b_is_zero: T,
 
     // Significand construction (stored as columns to keep carry chain degree low)
     pub a_sig: [T; SIG_NUM_LIMBS],
@@ -91,6 +106,13 @@ pub struct FmulCoreCols<T> {
     pub is_nan_result: T,
     pub is_inf_result: T,
     pub is_zero_result: T,
+
+    // Special-case selectors (input-derived; see eval_special_cases).
+    pub inf_in: T,  // a_is_inf | b_is_inf
+    pub zero_in: T, // a_is_zero | b_is_zero
+    pub s_nan: T,   // result is canonical NaN (NaN input or 0*inf)
+    pub s_inf: T,   // result is +-inf due to an infinite input
+    pub s_zero: T,  // result is +-0 due to a zero input
 
     pub is_valid: T,
 }
@@ -144,35 +166,63 @@ where
         builder.assert_bool(cols.b_sign);
         builder.assert_bool(cols.b_exp_lo);
 
-        // ── Phase 2: Classification ──────────────────────────────────────
+        // ── Phase 2: Classification (stored as columns, fdiv-style) ──────────
+        // The exp_is_zero / exp_is_max / mant_is_zero columns are constrained only
+        // on valid rows. On padding rows (is_valid = 0) they are left zero-filled,
+        // which makes the unconditional nan/inf/zero products below vanish, so no
+        // separate gating is needed there. This keeps every constraint degree <= 3.
         let one = AB::Expr::ONE;
-        let a_exp_is_zero = one.clone() - a_exp.clone() * cols.a_exp_zero_inv;
-        builder.assert_bool(a_exp_is_zero.clone());
-        let a_exp_is_max =
-            one.clone() - (AB::Expr::from(f255) - a_exp.clone()) * cols.a_exp_max_inv;
-        builder.assert_bool(a_exp_is_max.clone());
-        let a_mant_is_zero = one.clone() - a_mant_sum.clone() * cols.a_mant_sum_inv;
-        builder.assert_bool(a_mant_is_zero.clone());
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_exp_is_zero,
+            one.clone() - a_exp.clone() * cols.a_exp_zero_inv,
+        );
+        builder.assert_zero(a_exp.clone() * cols.a_exp_is_zero);
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_exp_is_max,
+            one.clone() - (AB::Expr::from(f255) - a_exp.clone()) * cols.a_exp_max_inv,
+        );
+        builder.assert_zero((AB::Expr::from(f255) - a_exp.clone()) * cols.a_exp_is_max);
+        builder.assert_zero(cols.a_exp_is_zero * cols.a_exp_is_max);
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_mant_is_zero,
+            one.clone() - a_mant_sum.clone() * cols.a_mant_sum_inv,
+        );
+        builder.assert_zero(a_mant_sum.clone() * cols.a_mant_is_zero);
 
-        let b_exp_is_zero = one.clone() - b_exp.clone() * cols.b_exp_zero_inv;
-        builder.assert_bool(b_exp_is_zero.clone());
-        let b_exp_is_max =
-            one.clone() - (AB::Expr::from(f255) - b_exp.clone()) * cols.b_exp_max_inv;
-        builder.assert_bool(b_exp_is_max.clone());
-        let b_mant_is_zero = one.clone() - b_mant_sum.clone() * cols.b_mant_sum_inv;
-        builder.assert_bool(b_mant_is_zero.clone());
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_exp_is_zero,
+            one.clone() - b_exp.clone() * cols.b_exp_zero_inv,
+        );
+        builder.assert_zero(b_exp.clone() * cols.b_exp_is_zero);
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_exp_is_max,
+            one.clone() - (AB::Expr::from(f255) - b_exp.clone()) * cols.b_exp_max_inv,
+        );
+        builder.assert_zero((AB::Expr::from(f255) - b_exp.clone()) * cols.b_exp_is_max);
+        builder.assert_zero(cols.b_exp_is_zero * cols.b_exp_is_max);
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_mant_is_zero,
+            one.clone() - b_mant_sum.clone() * cols.b_mant_sum_inv,
+        );
+        builder.assert_zero(b_mant_sum.clone() * cols.b_mant_is_zero);
 
-        let _a_is_nan = a_exp_is_max.clone() * (one.clone() - a_mant_is_zero.clone());
-        let _a_is_inf = a_exp_is_max.clone() * a_mant_is_zero.clone();
-        let _a_is_zero_f = a_exp_is_zero.clone() * a_mant_is_zero.clone();
-        let a_is_normal =
-            (one.clone() - a_exp_is_zero.clone()) * (one.clone() - a_exp_is_max.clone());
+        // nan / inf / zero derived from the classification columns (unconditional;
+        // vanish on padding rows because all factor columns are zero there).
+        builder.assert_eq(
+            cols.a_is_nan,
+            cols.a_exp_is_max * (one.clone() - cols.a_mant_is_zero),
+        );
+        builder.assert_eq(cols.a_is_inf, cols.a_exp_is_max * cols.a_mant_is_zero);
+        builder.assert_eq(cols.a_is_zero, cols.a_exp_is_zero * cols.a_mant_is_zero);
+        builder.assert_eq(
+            cols.b_is_nan,
+            cols.b_exp_is_max * (one.clone() - cols.b_mant_is_zero),
+        );
+        builder.assert_eq(cols.b_is_inf, cols.b_exp_is_max * cols.b_mant_is_zero);
+        builder.assert_eq(cols.b_is_zero, cols.b_exp_is_zero * cols.b_mant_is_zero);
 
-        let _b_is_nan = b_exp_is_max.clone() * (one.clone() - b_mant_is_zero.clone());
-        let _b_is_inf = b_exp_is_max.clone() * b_mant_is_zero.clone();
-        let _b_is_zero_f = b_exp_is_zero.clone() * b_mant_is_zero.clone();
-        let b_is_normal =
-            (one.clone() - b_exp_is_zero.clone()) * (one.clone() - b_exp_is_max.clone());
+        let a_is_normal = (one.clone() - cols.a_exp_is_zero) * (one.clone() - cols.a_exp_is_max);
+        let b_is_normal = (one.clone() - cols.b_exp_is_zero) * (one.clone() - cols.b_exp_is_max);
 
         // Verify result classification flags
         builder.assert_bool(cols.is_nan_result);
@@ -186,13 +236,19 @@ where
 
         // ── Phase 3: Significand construction ────────────────────────────
         // Significands are stored as columns (degree 1) to keep the carry chain
-        // at degree 2. Verify: a_sig[2] = a_mant2 + is_normal * 128
+        // at degree 2. Verify: a_sig[2] = a_mant2 + is_normal * 128.
+        // Gated on is_valid: on padding rows a/b_is_normal evaluate to 1 (all
+        // classification columns are zero), so the implicit-bit term must not fire.
         builder.assert_eq(cols.a_sig[0], cols.a_mant0);
         builder.assert_eq(cols.a_sig[1], cols.a_mant1);
-        builder.assert_eq(cols.a_sig[2], cols.a_mant2 + a_is_normal.clone() * f128);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.a_sig[2], cols.a_mant2 + a_is_normal.clone() * f128);
         builder.assert_eq(cols.b_sig[0], cols.b_mant0);
         builder.assert_eq(cols.b_sig[1], cols.b_mant1);
-        builder.assert_eq(cols.b_sig[2], cols.b_mant2 + b_is_normal.clone() * f128);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.b_sig[2], cols.b_mant2 + b_is_normal.clone() * f128);
 
         let a_sig: [AB::Var; SIG_NUM_LIMBS] = [cols.a_sig[0], cols.a_sig[1], cols.a_sig[2]];
         let b_sig: [AB::Var; SIG_NUM_LIMBS] = [cols.b_sig[0], cols.b_sig[1], cols.b_sig[2]];
@@ -305,11 +361,8 @@ where
             .when(not(cols.round_up))
             .assert_eq(cols.result_exp, exp_normal);
 
-        // ── Phase 8: Special-case flags ─────────────────────────────────
-        // TODO: Verify NaN/inf/zero result flags from input classification.
-        // This requires storing classification flags (is_nan, is_inf, is_zero) as
-        // columns to keep constraint degree ≤ 4. Currently degree-4 classification
-        // expressions cannot be multiplied without exceeding the limit.
+        // ── Phase 8: Special-case selectors + result constraints ─────────
+        self.eval_special_cases(builder, cols);
 
         // ── Output ───────────────────────────────────────────────────────
         let expected_opcode = VmCoreAir::<AB, I>::opcode_to_global_expr(self, FpOpcode::FMUL_S);
@@ -342,6 +395,79 @@ where
 
     fn start_offset(&self) -> usize {
         self.offset
+    }
+}
+
+// === Special-case constraints (testable standalone) ===
+
+impl FmulCoreAir {
+    /// Constrain the input-derived special-case selectors and the result bytes
+    /// for NaN / +-inf / +-0 results. Fully determined by the inputs,
+    /// independent of the finite-result (product/rounding) path.
+    pub fn eval_special_cases<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FmulCoreCols<AB::Var>,
+    ) {
+        let one = AB::Expr::ONE;
+        let f128: AB::F = AB::F::from_u32(128);
+        let f127: AB::F = AB::F::from_u32(127);
+
+        // inf_in = a_is_inf | b_is_inf ; zero_in = a_is_zero | b_is_zero
+        builder.assert_eq(
+            cols.inf_in,
+            cols.a_is_inf + cols.b_is_inf - cols.a_is_inf * cols.b_is_inf,
+        );
+        builder.assert_eq(
+            cols.zero_in,
+            cols.a_is_zero + cols.b_is_zero - cols.a_is_zero * cols.b_is_zero,
+        );
+
+        // s_nan: any NaN input, or invalid inf*0 / 0*inf. The inf*0 terms are
+        // only nonzero when the NaN-input terms are zero (an operand cannot be
+        // NaN and inf/zero simultaneously), so the plain sum is a clean OR.
+        builder.assert_eq(
+            cols.s_nan,
+            cols.a_is_nan + cols.b_is_nan - cols.a_is_nan * cols.b_is_nan
+                + cols.a_is_inf * cols.b_is_zero
+                + cols.a_is_zero * cols.b_is_inf,
+        );
+        builder.assert_bool(cols.s_nan);
+
+        // s_inf = !s_nan & inf_in ; s_zero = !s_nan & !inf_in & zero_in
+        builder.assert_eq(cols.s_inf, (one.clone() - cols.s_nan) * cols.inf_in);
+        builder.assert_eq(
+            cols.s_zero,
+            (one.clone() - cols.s_nan) * (one.clone() - cols.inf_in) * cols.zero_in,
+        );
+        builder.assert_bool(cols.s_inf);
+        builder.assert_bool(cols.s_zero);
+
+        // is_nan_result must equal s_nan (canonical NaN iff the op is invalid).
+        builder.assert_eq(cols.is_nan_result, cols.s_nan);
+
+        // Result bytes per case (gated; result_sign = a ^ b is constrained in eval).
+        let canon = CANONICAL_NAN.to_le_bytes();
+        for (i, &cb) in canon.iter().enumerate() {
+            builder
+                .when(cols.s_nan)
+                .assert_eq(cols.result[i], AB::F::from_u32(cb as u32));
+        }
+        // +-inf: exponent field 255, sign = result_sign.
+        builder.when(cols.s_inf).assert_zero(cols.result[0]);
+        builder.when(cols.s_inf).assert_zero(cols.result[1]);
+        builder.when(cols.s_inf).assert_eq(cols.result[2], f128);
+        builder.when(cols.s_inf).assert_eq(
+            cols.result[3],
+            AB::Expr::from(f127) + cols.result_sign * f128,
+        );
+        // +-0: exponent field 0, sign = result_sign.
+        builder.when(cols.s_zero).assert_zero(cols.result[0]);
+        builder.when(cols.s_zero).assert_zero(cols.result[1]);
+        builder.when(cols.s_zero).assert_zero(cols.result[2]);
+        builder
+            .when(cols.s_zero)
+            .assert_eq(cols.result[3], cols.result_sign * f128);
     }
 }
 
@@ -550,6 +676,20 @@ fn fill_fmul_witness<F: PrimeField32>(
     let b_is_zero = b_exp == 0 && (b_mant0 + b_mant1 + b_mant2) == 0;
     let b_is_normal = (1..=254).contains(&b_exp);
 
+    // Classification columns (constrained in eval; witness-provided).
+    row.a_exp_is_zero = F::from_bool(a_exp == 0);
+    row.a_exp_is_max = F::from_bool(a_exp == 255);
+    row.a_mant_is_zero = F::from_bool(a_mant0 + a_mant1 + a_mant2 == 0);
+    row.b_exp_is_zero = F::from_bool(b_exp == 0);
+    row.b_exp_is_max = F::from_bool(b_exp == 255);
+    row.b_mant_is_zero = F::from_bool(b_mant0 + b_mant1 + b_mant2 == 0);
+    row.a_is_nan = F::from_bool(a_is_nan);
+    row.a_is_inf = F::from_bool(a_is_inf);
+    row.a_is_zero = F::from_bool(a_is_zero);
+    row.b_is_nan = F::from_bool(b_is_nan);
+    row.b_is_inf = F::from_bool(b_is_inf);
+    row.b_is_zero = F::from_bool(b_is_zero);
+
     // Product computation
     let a_sig = if a_is_normal {
         a_mant0 | (a_mant1 << 8) | ((a_mant2 | 0x80) << 16)
@@ -652,7 +792,147 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.is_zero_result = F::from_bool(is_zero_res);
     row.is_special = F::from_bool(is_nan_res || is_inf_res || is_zero_res);
 
+    // Input-derived special-case selectors (constrained in eval_special_cases).
+    let inf_in = a_is_inf || b_is_inf;
+    let zero_in = a_is_zero || b_is_zero;
+    let s_inf = !is_nan_res && inf_in;
+    let s_zero = !is_nan_res && !inf_in && zero_in;
+    row.inf_in = F::from_bool(inf_in);
+    row.zero_in = F::from_bool(zero_in);
+    row.s_nan = F::from_bool(is_nan_res);
+    row.s_inf = F::from_bool(s_inf);
+    row.s_zero = F::from_bool(s_zero);
+
     row.is_valid = F::ONE;
 
     let _ = (r_mant, p5_lo);
+}
+
+#[cfg(test)]
+mod special_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+
+    type F = BabyBear;
+
+    fn classify(bits: u32) -> (bool, bool, bool) {
+        let exp = (bits >> 23) & 0xFF;
+        let mant = bits & 0x7FFFFF;
+        (
+            exp == 255 && mant != 0,
+            exp == 255 && mant == 0,
+            exp == 0 && mant == 0,
+        )
+    }
+
+    /// Build a column row whose classification / selector / result fields are
+    /// consistent with fmul_s(a, b). All other columns are left zero.
+    fn make_cols(a: u32, b: u32) -> FmulCoreCols<F> {
+        let (a_nan, a_inf, a_zero) = classify(a);
+        let (b_nan, b_inf, b_zero) = classify(b);
+        let result = fmul_s(a, b);
+        let is_nan_res = a_nan || b_nan || (a_inf && b_zero) || (a_zero && b_inf);
+        let inf_in = a_inf || b_inf;
+        let zero_in = a_zero || b_zero;
+        let s_inf = !is_nan_res && inf_in;
+        let s_zero = !is_nan_res && !inf_in && zero_in;
+        let r_sign = ((a >> 31) & 1) ^ ((b >> 31) & 1);
+
+        let mut c = FmulCoreCols::<F> {
+            a_is_nan: F::from_bool(a_nan),
+            b_is_nan: F::from_bool(b_nan),
+            a_is_inf: F::from_bool(a_inf),
+            b_is_inf: F::from_bool(b_inf),
+            a_is_zero: F::from_bool(a_zero),
+            b_is_zero: F::from_bool(b_zero),
+            inf_in: F::from_bool(inf_in),
+            zero_in: F::from_bool(zero_in),
+            s_nan: F::from_bool(is_nan_res),
+            s_inf: F::from_bool(s_inf),
+            s_zero: F::from_bool(s_zero),
+            is_nan_result: F::from_bool(is_nan_res),
+            result_sign: F::from_u32(r_sign),
+            ..Default::default()
+        };
+        for i in 0..4 {
+            c.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        }
+        c
+    }
+
+    fn run(c: &FmulCoreCols<F>) -> NumericBuilder<F> {
+        let mut b = NumericBuilder::new(vec![]);
+        FmulCoreAir::new(
+            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            0,
+        )
+        .eval_special_cases(&mut b, c);
+        b
+    }
+
+    #[test]
+    fn special_cases_honest_witness_passes() {
+        let inputs: &[u32] = &[
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            0.0f32.to_bits(),
+            (-0.0f32).to_bits(),
+            1.0f32.to_bits(),
+            1e38f32.to_bits(),
+            1e-38f32.to_bits(),
+        ];
+        for &a in inputs {
+            for &bb in inputs {
+                let c = make_cols(a, bb);
+                let b = run(&c);
+                assert!(
+                    b.ok(),
+                    "honest special-case witness failed: {:?} {:?}",
+                    b.failures,
+                    a
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn special_case_corrupt_nan_result_rejected() {
+        // NaN input must yield canonical NaN; corrupting a byte must fail.
+        let mut c = make_cols(f32::NAN.to_bits(), 1.0f32.to_bits());
+        c.result[0] = F::from_u32(0xFF); // canonical NaN low byte is 0x00
+        let b = run(&c);
+        assert!(!b.ok(), "corrupt NaN result must be rejected");
+    }
+
+    #[test]
+    fn special_case_corrupt_inf_result_rejected() {
+        // inf * finite must yield +-inf; corrupting the exponent byte must fail.
+        let mut c = make_cols(f32::INFINITY.to_bits(), 3.0f32.to_bits());
+        c.result[2] = F::ZERO; // inf has result[2] = 128
+        let b = run(&c);
+        assert!(!b.ok(), "corrupt inf result must be rejected");
+    }
+
+    #[test]
+    fn special_case_corrupt_zero_result_rejected() {
+        // finite * 0 must yield +-0; setting a nonzero byte must fail.
+        let mut c = make_cols(5.0f32.to_bits(), 0.0f32.to_bits());
+        c.result[0] = F::ONE; // +-0 has all low bytes zero
+        let b = run(&c);
+        assert!(!b.ok(), "corrupt zero result must be rejected");
+    }
+
+    #[test]
+    fn finite_case_leaves_result_unconstrained() {
+        // Both operands normal: no special gate fires, so any result passes.
+        let mut c = make_cols(3.0f32.to_bits(), 4.0f32.to_bits());
+        c.result[0] = F::from_u32(0xAB);
+        let b = run(&c);
+        assert!(
+            b.ok(),
+            "finite case must not be constrained by special-case gates"
+        );
+    }
 }
