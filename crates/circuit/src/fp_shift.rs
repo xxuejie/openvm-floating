@@ -19,6 +19,29 @@ use openvm_stark_backend::{
 /// Bits per limb (bytes).
 pub const SHLIMB_BITS: usize = 8;
 
+impl<T: Default, const N: usize> Default for ShrnCols<T, N> {
+    fn default() -> Self {
+        Self {
+            x: core::array::from_fn(|_| T::default()),
+            shift: T::default(),
+            enable: T::default(),
+            limb_shift_marker: core::array::from_fn(|_| T::default()),
+            bit_shift_marker: core::array::from_fn(|_| T::default()),
+            bit_mult: T::default(),
+            bit_shift_carry: core::array::from_fn(|_| T::default()),
+            y: core::array::from_fn(|_| T::default()),
+            guard: T::default(),
+            sticky: T::default(),
+            pmsb: T::default(),
+            prest: T::default(),
+            hmsb: T::default(),
+            hrest: T::default(),
+            lost_combined: T::default(),
+            combined_inv: T::default(),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(AlignedBorrow, StructReflection, Debug)]
 pub struct ShrnCols<T, const N: usize> {

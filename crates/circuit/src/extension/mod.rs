@@ -246,7 +246,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
 
         let fadd = Rv32FaddAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
-            FaddCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
+            FaddCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fadd);
 
@@ -275,7 +275,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
 
         let fsub = Rv32FsubAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
-            FsubCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
+            FsubCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fsub);
 
@@ -392,7 +392,7 @@ where
         let fadd = Rv32FaddChip::new(
             FaddFiller::new(
                 Rv32FpAdapterFiller,
-                range_tuple_checker.clone(),
+                range_checker.clone(),
                 FpOpcode::CLASS_OFFSET,
             ),
             mem_helper.clone(),
@@ -432,7 +432,7 @@ where
         let fsub = Rv32FsubChip::new(
             FsubFiller::new(
                 Rv32FpAdapterFiller,
-                range_tuple_checker.clone(),
+                range_checker.clone(),
                 FpOpcode::CLASS_OFFSET,
             ),
             mem_helper.clone(),

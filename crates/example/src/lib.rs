@@ -1549,6 +1549,50 @@ mod fuzz_tests {
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fsqrt_s(rd, rs1));
         prove_chunk(instrs, mem);
     }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fadd() {
+        let mut rng = XorShift64::new(0xB0B0_0009);
+        // Mix random bits (special/subnormal/subtraction) with same-sign both-normal
+        // inputs that exercise the constrained finite-add path.
+        let mut cases: Vec<(u32, u32)> = (0..10)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        for _ in 0..5 {
+            let sign = ((rng.next_u32()) & 1) << 31;
+            let ea = (rng.next_u32() % 254) + 1;
+            let eb = (rng.next_u32() % 254) + 1;
+            cases.push((
+                sign | (ea << 23) | (rng.next_u32() & 0x7FFFFF),
+                sign | (eb << 23) | (rng.next_u32() & 0x7FFFFF),
+            ));
+        }
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fadd_s(rd, rs1, rs2));
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fsub() {
+        let mut rng = XorShift64::new(0xB0B0_000A);
+        let mut cases: Vec<(u32, u32)> = (0..10)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        // Opposite-sign both-normal inputs exercise the constrained magnitude-add path.
+        for _ in 0..5 {
+            let sa = (rng.next_u32()) & 1;
+            let sb = 1 - sa;
+            let ea = (rng.next_u32() % 254) + 1;
+            let eb = (rng.next_u32() % 254) + 1;
+            cases.push((
+                (sa << 31) | (ea << 23) | (rng.next_u32() & 0x7FFFFF),
+                (sb << 31) | (eb << 23) | (rng.next_u32() & 0x7FFFFF),
+            ));
+        }
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fsub_s(rd, rs1, rs2));
+        prove_chunk(instrs, mem);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

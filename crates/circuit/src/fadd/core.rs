@@ -5,7 +5,8 @@ use openvm_circuit::{
     system::memory::{online::TracingMemory, MemoryAuxColsFactory},
 };
 use openvm_circuit_primitives::{
-    range_tuple::{RangeTupleCheckerBus, SharedRangeTupleCheckerChip},
+    utils::not,
+    var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
     AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
@@ -19,9 +20,16 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
+use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+
 pub const SIG_NUM_LIMBS: usize = 3;
 pub const EXT_SIG_LIMBS: usize = 4; // extended significand: 3 mantissa bytes + 1 guard/sticky byte
 pub const LIMB_BITS: usize = 8;
+/// Working significand width in bytes: 3 significand bytes + 1 guard/sticky byte.
+pub const WORK_LIMBS: usize = 4;
+/// ediff >= 25 ⇒ the smaller operand is strictly below 0.5 ULP of the larger, so the
+/// result equals the larger operand (no rounding). Below this, align exactly.
+pub const DEEP_EDIFF: u32 = 25;
 
 /// IEEE 754 / RISC-V FADD.S: correctly-rounded (RNE) addition.
 /// Returns the canonical NaN whenever the result is any NaN (NaN inputs, or
@@ -85,23 +93,58 @@ pub struct FaddCoreCols<T> {
 
     // === Alignment ===
     pub a_is_larger: T, // bool: a_exp >= b_exp
-    pub ediff: T,       // |a_exp - b_exp|, capped at 255
-    pub aligned_sig: [T; EXT_SIG_LIMBS], /* smaller operand's significand after right shift +
-                         * guard bits */
-    pub sticky: T, // bool: any bits lost during alignment shift
+    pub ediff: T,       // |a_exp - b_exp|, in [0, 255]
+
+    // Both-normal indicator columns (degree-1 witnesses, used by selectors).
+    pub a_is_normal: T,
+    pub b_is_normal: T,
+    // Selected significands (3 bytes each). large = the operand with the larger exp.
+    pub large_sig: [T; SIG_NUM_LIMBS],
+    pub small_sig: [T; SIG_NUM_LIMBS],
+
+    // Variable right-shift gadget for alignment of the smaller significand. Its `x`
+    // input is `small_sig << 8` (4 bytes), `shift` = ediff, `y` = aligned significand.
+    pub align: ShrnCols<T, WORK_LIMBS>,
+    pub is_deep: T, // bool: ediff >= 25 (smaller operand < 0.5 ULP ⇒ result = larger)
+    pub deep_delta: T, // byte witness used to soundly derive is_deep
+    pub lost_sticky: T, // OR of align.guard / align.sticky (bits lost during alignment)
+    pub align_enable: T, // bool: s_add AND !is_deep (gates the ShrnGadget)
 
     // === Sum / difference ===
-    pub is_add: T,                   // bool: same sign → add, different sign → subtract
-    pub raw_sum: [T; EXT_SIG_LIMBS], // significand sum/difference (before normalization)
+    pub is_add: T,                // bool: same sign → add, different sign → subtract
+    pub raw_sum: [T; WORK_LIMBS], // significand sum (before normalization)
+    pub sum_c1: T,                // carry out of raw_sum byte 1
+    pub sum_c2: T,                // carry out of raw_sum byte 2
+    pub carry_out: T,             // carry out of raw_sum byte 3 (= bit 32 of the sum)
 
     // === Normalization ===
-    pub norm_sig: [T; EXT_SIG_LIMBS], // normalized significand
-    pub result_exp: T,                // final exponent after normalization
+    pub norm_sig: [T; WORK_LIMBS], // normalized significand
+    pub rs_high7: [T; WORK_LIMBS], // raw_sum[i] = rs_high7[i]*2 + rs_lowbit[i]
+    pub rs_lowbit: [T; WORK_LIMBS],
+    pub result_exp: T, // final exponent after normalization
 
     // === Rounding ===
-    pub guard: T,        // bool: guard bit
-    pub norm3_lo_inv: T, // inverse for extracting low bits of norm_sig[3] for sticky
-    pub round_up: T,     // bool: RNE round-up decision
+    pub guard: T,           // bool: guard bit (bit 7 of norm_sig[0])
+    pub ns0_lo: T,          // norm_sig[0] & 0x7F
+    pub ns1_high: T,        // (norm_sig[1] - mant_lsb) / 2
+    pub mant_lsb: T,        // bit 0 of norm_sig[1]
+    pub below_guard: T,     // ns0_lo + dropped + lost_sticky (nonzero ⇒ sticky)
+    pub below_guard_inv: T, // inverse for the sticky nonzero check
+    pub sticky: T,          // bool: RNE sticky
+    pub round_up: T,        // bool: RNE round-up decision
+
+    // === Output reconstruction ===
+    pub rc0: T,      // rounding carry out of mantissa byte 0
+    pub rc1: T,      // rounding carry out of mantissa byte 1
+    pub rc2: T,      // rounding carry out of mantissa top 7 bits (into exponent)
+    pub rc2_rem: T,  // (norm_sig[3]-128 + rc1) mod 128
+    pub r_exp_lo: T, // bit 0 of result exponent field
+    pub r_exp_hi: T, // bits [7:1] of result exponent field
+    pub r_exp_hi_zero_inv: T,
+    pub r_exp_hi_max_inv: T,
+    pub s_add: T,    // finite AND is_add AND both-normal (sound selector for this path)
+    pub s_normal: T, // s_add AND !is_deep AND result exp field in [1, 254]
+    pub s_overflow: T, // s_add AND !is_deep AND result exp field == 255
 
     // === Result ===
     pub result_sign: T,
@@ -117,7 +160,7 @@ pub struct FaddCoreCols<T> {
 #[derive(Copy, Clone, Debug, derive_new::new, ColumnsAir)]
 #[columns_via(FaddCoreCols<u8>)]
 pub struct FaddCoreAir {
-    pub range_tuple_bus: RangeTupleCheckerBus<2>,
+    pub range_bus: VariableRangeCheckerBus,
     pub offset: usize,
 }
 
@@ -153,14 +196,32 @@ where
 
         // ── Phase 1: Decomposition ──────────────────────────────────────
         let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
-        let a_mant_sum = cols.a_mant0 + cols.a_mant1 + cols.a_mant2;
         let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
+        let a_mant_sum = cols.a_mant0 + cols.a_mant1 + cols.a_mant2;
         let b_mant_sum = cols.b_mant0 + cols.b_mant1 + cols.b_mant2;
 
         builder.assert_bool(cols.a_sign);
         builder.assert_bool(cols.a_exp_lo);
         builder.assert_bool(cols.b_sign);
         builder.assert_bool(cols.b_exp_lo);
+        builder.assert_bool(cols.result_sign);
+
+        // Range-check input mantissa/exponent bytes and the result bytes.
+        for b in [cols.a_mant0, cols.a_mant1, cols.b_mant0, cols.b_mant1] {
+            self.range_bus
+                .range_check(b.into(), LIMB_BITS)
+                .eval(builder, cols.is_valid.into());
+        }
+        for b in [cols.a_mant2, cols.b_mant2, cols.a_exp_hi, cols.b_exp_hi] {
+            self.range_bus
+                .range_check(b.into(), 7)
+                .eval(builder, cols.is_valid.into());
+        }
+        for i in 0..4 {
+            self.range_bus
+                .range_check(cols.result[i].into(), LIMB_BITS)
+                .eval(builder, cols.is_valid.into());
+        }
 
         // ── Phase 2: Classification (stored as columns, fdiv-style) ──────────
         // exp_is_zero / exp_is_max / mant_is_zero are constrained only on valid
@@ -222,46 +283,42 @@ where
         builder.assert_bool(cols.is_special);
         builder.assert_bool(cols.is_add);
         builder.assert_bool(cols.a_is_larger);
-        builder.assert_bool(cols.sticky);
-        builder.assert_bool(cols.guard);
-        builder.assert_bool(cols.round_up);
+        builder.assert_bool(cols.carry_out);
+        builder.assert_bool(cols.sum_c1);
+        builder.assert_bool(cols.sum_c2);
+        builder.assert_bool(cols.rc0);
+        builder.assert_bool(cols.rc1);
+        builder.assert_bool(cols.rc2);
+        builder.assert_bool(cols.is_deep);
+        for i in 0..WORK_LIMBS {
+            builder.assert_bool(cols.rs_lowbit[i]);
+        }
 
         // ── Special-case selectors + result constraints ──────────────────
         self.eval_special_cases(builder, cols);
 
-        // ── Phase 3: Alignment verification ──────────────────────────────
-        // Verify ediff == |a_exp - b_exp| and a_is_larger == (a_exp >= b_exp)
+        // ── Phase 3: Alignment selection (ediff / a_is_larger) ───────────
+        // ediff = |a_exp - b_exp|. Range-checking ediff to a byte forces a_is_larger
+        // to be consistent with the true comparison (a wrong choice makes ediff wrap
+        // to a huge field value, failing the range check).
+        self.range_bus
+            .range_check(cols.ediff.into(), LIMB_BITS)
+            .eval(builder, cols.is_valid.into());
         let diff = a_exp.clone() - b_exp.clone();
         let expected_ediff =
             cols.a_is_larger * diff.clone() + (one.clone() - cols.a_is_larger) * (-diff.clone());
         builder.assert_eq(cols.ediff, expected_ediff);
-        // When a_is_larger: a_exp >= b_exp (i.e., diff >= 0 in BabyBear)
-        // When !a_is_larger: b_exp > a_exp (i.e., diff < 0, or diff is p - |diff|)
-        // The ediff constraint above implicitly verifies a_is_larger consistency.
 
-        // TODO: verify aligned_sig is the correct right-shift of the smaller significand
-        // TODO: verify sticky is correct
-
-        // ── Phase 4: Sum / difference ────────────────────────────────────
-        // is_add = (a_sign == b_sign)
-        // Gate with is_valid: padding rows (is_valid=0) must not trigger this.
+        // is_add = (a_sign == b_sign) on valid rows.
         let sign_xor = cols.a_sign + cols.b_sign - cols.a_sign * cols.b_sign * f2;
-        let expected_is_add = (one.clone() - sign_xor) * cols.is_valid;
-        builder.assert_eq(cols.is_add * cols.is_valid, expected_is_add);
-        // TODO: verify raw_sum is the correct sum/difference of significands
+        builder.assert_eq(
+            cols.is_add * cols.is_valid,
+            (one.clone() - sign_xor) * cols.is_valid,
+        );
 
-        // ── Phase 5: Normalization ───────────────────────────────────────
-        // TODO: verify norm_sig is the correct normalized result
-        // TODO: verify result_exp accounts for normalization shifts
+        // ── Phase 4..7: finite same-sign (both-normal) result ─────────────
+        self.eval_finite_add(builder, cols);
 
-        // ── Phase 6: RNE rounding ────────────────────────────────────────
-        // guard extraction from norm_sig[3]
-        let _norm3_low = cols.norm_sig[3] - cols.guard * f128;
-        builder.assert_eq(cols.norm_sig[3], _norm3_low.clone() + cols.guard * f128);
-        // TODO: verify round_up
-        // ── Phase 7: Special-case flags ─────────────────────────────────
-        // TODO: Verify NaN/inf/zero result flags from input classification.
-        // Requires storing classification flags as columns to keep degree ≤ 4.
         // ── Output ───────────────────────────────────────────────────────
         let expected_opcode = VmCoreAir::<AB, I>::opcode_to_global_expr(self, FpOpcode::FADD_S);
 
@@ -369,6 +426,313 @@ impl FaddCoreAir {
             .when(cols.s_zero_both)
             .assert_eq(cols.result[3], zero_sign * f128);
     }
+
+    /// Constrain the finite, same-sign, both-normal result path.
+    ///
+    /// Selector `s_add = s_finite AND is_add AND a_is_normal AND b_is_normal`
+    /// (both operands normal, same sign). The result is then either a normal
+    /// float (exp field in [1, 254]) or +-inf (overflow, exp field 255).
+    ///
+    /// Layout (working significand, 4 little-endian bytes): the significand
+    /// `1.mantissa` occupies bits [31..8] (implicit bit at bit 31), bit 7 is the
+    /// guard bit, bits [6..0] are the sticky region, and `large_working =
+    /// large_sig << 8`.
+    pub fn eval_finite_add<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FaddCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f24: AB::F = AB::F::from_u32(DEEP_EDIFF - 1);
+        let f25: AB::F = AB::F::from_u32(DEEP_EDIFF);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(1 << LIMB_BITS);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
+
+        // ── Significand construction ────────────────────────────────────
+        // Gated on is_valid: on padding rows the classification columns are all
+        // zero, which would make the RHS evaluate to 1.
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_is_normal,
+            (one.clone() - cols.a_exp_is_zero) * (one.clone() - cols.a_exp_is_max),
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_is_normal,
+            (one.clone() - cols.b_exp_is_zero) * (one.clone() - cols.b_exp_is_max),
+        );
+        let a_sig2 = cols.a_mant2 + cols.a_is_normal * f128;
+        let b_sig2 = cols.b_mant2 + cols.b_is_normal * f128;
+        let sel = cols.a_is_larger.into();
+        let notsel = one.clone() - sel.clone();
+        // large/small significand selection (gated on is_valid; padding stays 0).
+        builder.when(cols.is_valid).assert_eq(
+            cols.large_sig[0],
+            sel.clone() * cols.a_mant0 + notsel.clone() * cols.b_mant0,
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.large_sig[1],
+            sel.clone() * cols.a_mant1 + notsel.clone() * cols.b_mant1,
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.large_sig[2],
+            sel.clone() * a_sig2.clone() + notsel.clone() * b_sig2.clone(),
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.small_sig[0],
+            sel.clone() * cols.b_mant0 + notsel.clone() * cols.a_mant0,
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.small_sig[1],
+            sel.clone() * cols.b_mant1 + notsel.clone() * cols.a_mant1,
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.small_sig[2],
+            sel.clone() * b_sig2.clone() + notsel.clone() * a_sig2.clone(),
+        );
+        let large_exp = sel.clone() * a_exp.clone() + notsel.clone() * b_exp.clone();
+
+        // ── Sound selector s_add ────────────────────────────────────────
+        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
+        builder.assert_eq(
+            cols.s_add,
+            s_finite.clone() * cols.is_add * cols.a_is_normal * cols.b_is_normal,
+        );
+        builder.assert_bool(cols.s_add);
+
+        // ── Deep clamp: is_deep = (ediff >= 25) ─────────────────────────
+        //   !is_deep: ediff + deep_delta == 24   (deep_delta = 24 - ediff ∈ [0, 24])
+        //   is_deep:  ediff - deep_delta == 25   (deep_delta = ediff - 25 ∈ [0, 230])
+        // Both branches range-check deep_delta to a byte, which forces is_deep to
+        // correctly indicate ediff >= 25.
+        self.range_bus
+            .range_check(cols.deep_delta.into(), LIMB_BITS)
+            .eval(builder, cols.is_valid.into());
+        builder
+            .when(cols.is_valid)
+            .when(cols.is_deep)
+            .assert_eq(cols.ediff - cols.deep_delta, AB::Expr::from(f25));
+        builder
+            .when(cols.is_valid)
+            .when(not(cols.is_deep))
+            .assert_eq(cols.ediff + cols.deep_delta, AB::Expr::from(f24));
+
+        // Alignment gadget enable = s_add AND !is_deep (stored as a degree-1 column
+        // so it can be used as a low-degree `when` filter).
+        builder.assert_eq(cols.align_enable, cols.s_add * (one.clone() - cols.is_deep));
+        builder.assert_bool(cols.align_enable);
+        let s_shallow = cols.align_enable;
+        let s_deep = cols.s_add * cols.is_deep;
+
+        // ── Alignment via ShrnGadget (shallow path) ─────────────────────
+        // x = small_sig << 8 = [0, small_sig[0], small_sig[1], small_sig[2]].
+        builder.when(cols.is_valid).assert_zero(cols.align.x[0]);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.align.x[1], cols.small_sig[0]);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.align.x[2], cols.small_sig[1]);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.align.x[3], cols.small_sig[2]);
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.align);
+        builder
+            .when(cols.align_enable)
+            .assert_eq(cols.align.shift, cols.ediff);
+        // Alignment sticky = bits of the smaller operand lost below the field
+        // (only meaningful when the shift gadget is enabled).
+        builder.when(cols.align_enable).assert_eq(
+            cols.lost_sticky,
+            cols.align.guard + cols.align.sticky - cols.align.guard * cols.align.sticky,
+        );
+        builder.assert_bool(cols.lost_sticky);
+
+        // ── Deep path: result = larger operand (no rounding) ────────────
+        let large_b0 = sel.clone() * cols.a_mant0 + notsel.clone() * cols.b_mant0;
+        let large_b1 = sel.clone() * cols.a_mant1 + notsel.clone() * cols.b_mant1;
+        let large_b2 = sel.clone() * (cols.a_mant2 + cols.a_exp_lo * f128)
+            + notsel.clone() * (cols.b_mant2 + cols.b_exp_lo * f128);
+        let large_b3 = sel.clone() * (cols.a_exp_hi + cols.a_sign * f128)
+            + notsel.clone() * (cols.b_exp_hi + cols.b_sign * f128);
+        builder
+            .when(s_deep.clone())
+            .assert_eq(cols.result[0], large_b0.clone());
+        builder
+            .when(s_deep.clone())
+            .assert_eq(cols.result[1], large_b1.clone());
+        builder
+            .when(s_deep.clone())
+            .assert_eq(cols.result[2], large_b2.clone());
+        builder
+            .when(s_deep.clone())
+            .assert_eq(cols.result[3], large_b3.clone());
+        builder
+            .when(s_deep.clone())
+            .assert_eq(cols.result_sign, cols.a_sign);
+        builder
+            .when(s_deep.clone())
+            .assert_eq(cols.result_exp, large_exp.clone());
+
+        // ── Sum (shallow): raw_sum = (large_sig << 8) + aligned ─────────
+        // large_working = [0, large_sig[0], large_sig[1], large_sig[2]].
+        // byte 0: raw_sum[0] = aligned[0] (no carry in, large_working[0] = 0).
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.raw_sum[0], cols.align.y[0]);
+        builder.when(s_shallow).assert_eq(
+            cols.raw_sum[1] + cols.sum_c1 * f256,
+            cols.large_sig[0] + cols.align.y[1],
+        );
+        builder.when(s_shallow).assert_eq(
+            cols.raw_sum[2] + cols.sum_c2 * f256,
+            cols.large_sig[1] + cols.align.y[2] + cols.sum_c1,
+        );
+        builder.when(s_shallow).assert_eq(
+            cols.raw_sum[3] + cols.carry_out * f256,
+            cols.large_sig[2] + cols.align.y[3] + cols.sum_c2,
+        );
+
+        // ── Normalize: norm_sig = raw_sum >> carry_out ──────────────────
+        for i in 0..WORK_LIMBS {
+            builder
+                .when(s_shallow)
+                .assert_eq(cols.raw_sum[i], cols.rs_high7[i] * f2 + cols.rs_lowbit[i]);
+            self.range_bus
+                .range_check(cols.rs_high7[i].into(), 7)
+                .eval(builder, s_shallow);
+            // no carry out: norm_sig = raw_sum
+            builder
+                .when(s_shallow)
+                .when(not(cols.carry_out))
+                .assert_eq(cols.norm_sig[i], cols.raw_sum[i]);
+            self.range_bus
+                .range_check(cols.norm_sig[i].into(), LIMB_BITS)
+                .eval(builder, s_shallow);
+        }
+        // carry out: norm_sig[i] = rs_high7[i] + rs_lowbit[i+1]*128 (i<3);
+        // norm_sig[3] = rs_high7[3] + 128 (carry_out bit becomes the new implicit 1).
+        for i in 0..(WORK_LIMBS - 1) {
+            builder.when(s_shallow).when(cols.carry_out).assert_eq(
+                cols.norm_sig[i],
+                cols.rs_high7[i] + cols.rs_lowbit[i + 1] * f128,
+            );
+        }
+        builder
+            .when(s_shallow)
+            .when(cols.carry_out)
+            .assert_eq(cols.norm_sig[3], cols.rs_high7[3] + f128);
+        // Exponent gains the carry.
+        // (result_exp relation is constrained together with output reconstruction below.)
+
+        // ── RNE rounding ────────────────────────────────────────────────
+        // guard = bit 7 of norm_sig[0]; mant_lsb = bit 0 of norm_sig[1].
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.norm_sig[0], cols.ns0_lo + cols.guard * f128);
+        builder.assert_bool(cols.guard);
+        self.range_bus
+            .range_check(cols.ns0_lo.into(), 7)
+            .eval(builder, s_shallow);
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.norm_sig[1], cols.mant_lsb + cols.ns1_high * f2);
+        builder.assert_bool(cols.mant_lsb);
+        self.range_bus
+            .range_check(cols.ns1_high.into(), 7)
+            .eval(builder, s_shallow);
+        // below_guard = ns0_lo + dropped + lost_sticky; dropped = carry_out * rs_lowbit[0].
+        let dropped = cols.carry_out * cols.rs_lowbit[0];
+        builder.when(s_shallow).assert_eq(
+            cols.below_guard,
+            cols.ns0_lo + dropped.clone() + cols.lost_sticky,
+        );
+        let bgz = one.clone() - cols.below_guard * cols.below_guard_inv;
+        builder.assert_zero(cols.below_guard * bgz.clone());
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.sticky, one.clone() - bgz);
+        builder.assert_bool(cols.sticky);
+        let sticky_or_lsb = cols.sticky + cols.mant_lsb - cols.sticky * cols.mant_lsb;
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.round_up, cols.guard * sticky_or_lsb);
+        builder.assert_bool(cols.round_up);
+
+        // ── Output reconstruction ───────────────────────────────────────
+        // result_exp = r_exp_lo + r_exp_hi*2 = large_exp + carry_out + rc2.
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
+        builder.when(s_shallow).assert_eq(
+            cols.r_exp_lo + cols.r_exp_hi * f2,
+            large_exp + cols.carry_out + cols.rc2,
+        );
+        // result_sign = a_sign (same sign on this path).
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.result_sign, cols.a_sign);
+        // Rounding carry chain over the 23-bit mantissa. rc0/rc1 are tied to the
+        // result bytes on the normal-result path (s_normal) below; rc2 (and the
+        // exponent) are tied here on the whole shallow path.
+        builder.when(s_shallow).assert_eq(
+            (cols.norm_sig[3] - f128) + cols.rc1,
+            cols.rc2_rem + cols.rc2 * f128,
+        );
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s_shallow);
+        // result[3] = r_exp_hi + result_sign*128 (shared by normal and overflow).
+        builder
+            .when(s_shallow)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
+
+        // Sound "(r_exp_hi == 0)" / "(r_exp_hi == 127)" indicators (only needed on
+        // the shallow path; their inverse witnesses are don't-care elsewhere).
+        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
+        builder
+            .when(s_shallow)
+            .assert_zero(cols.r_exp_hi * he0.clone());
+        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
+        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
+        builder
+            .when(s_shallow)
+            .assert_zero(delta127 * he127.clone());
+        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
+        let exp_field_max = cols.r_exp_lo * he127;
+        // s_normal / s_overflow stored as columns (degree 1) so they can gate the
+        // result-byte constraints without exceeding the max constraint degree.
+        builder.assert_eq(
+            cols.s_normal,
+            s_shallow * (one.clone() - exp_field_zero.clone() - exp_field_max.clone()),
+        );
+        builder.assert_eq(cols.s_overflow, s_shallow * exp_field_max.clone());
+        builder.assert_bool(cols.s_normal);
+        builder.assert_bool(cols.s_overflow);
+
+        // Normal result: tie mantissa bytes to the rounded significand.
+        builder.when(cols.s_normal).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            cols.norm_sig[1] + cols.round_up,
+        );
+        builder.when(cols.s_normal).assert_eq(
+            cols.result[1] + cols.rc1 * f256,
+            cols.norm_sig[2] + cols.rc0,
+        );
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        // Overflow result: +-inf (exp 255, mantissa 0).
+        builder.when(cols.s_overflow).assert_zero(cols.result[0]);
+        builder.when(cols.s_overflow).assert_zero(cols.result[1]);
+        builder
+            .when(cols.s_overflow)
+            .assert_eq(cols.result[2], f128);
+    }
 }
 
 // === Record ===
@@ -446,19 +810,15 @@ where
 pub struct FaddFiller<A> {
     adapter: A,
     pub offset: usize,
-    pub range_tuple_chip: SharedRangeTupleCheckerChip<2>,
+    pub range_checker: SharedVariableRangeCheckerChip,
 }
 
 impl<A> FaddFiller<A> {
-    pub fn new(
-        adapter: A,
-        range_tuple_chip: SharedRangeTupleCheckerChip<2>,
-        offset: usize,
-    ) -> Self {
+    pub fn new(adapter: A, range_checker: SharedVariableRangeCheckerChip, offset: usize) -> Self {
         Self {
             adapter,
             offset,
-            range_tuple_chip,
+            range_checker,
         }
     }
 }
@@ -479,7 +839,7 @@ where
         let b_bits = u32::from_le_bytes(record.b);
         let result_bits = fadd_s(a_bits, b_bits);
 
-        fill_fadd_witness(core_row, a_bits, b_bits, result_bits);
+        fill_fadd_witness(core_row, a_bits, b_bits, result_bits, &self.range_checker);
     }
 }
 
@@ -501,6 +861,7 @@ fn fill_fadd_witness<F: PrimeField32>(
     a_bits: u32,
     b_bits: u32,
     result_bits: u32,
+    range_checker: &SharedVariableRangeCheckerChip,
 ) {
     let (a_sign, a_exp, a_mant) = decompose(a_bits);
     let (b_sign, b_exp, b_mant) = decompose(b_bits);
@@ -522,6 +883,16 @@ fn fill_fadd_witness<F: PrimeField32>(
     row.b_mant0 = F::from_u32(b_ml[0]);
     row.b_mant1 = F::from_u32(b_ml[1]);
     row.b_mant2 = F::from_u32(b_ml[2]);
+
+    // Balance the input-byte range checks emitted in eval (gated on is_valid).
+    range_checker.add_count(a_ml[0], LIMB_BITS);
+    range_checker.add_count(a_ml[1], LIMB_BITS);
+    range_checker.add_count(b_ml[0], LIMB_BITS);
+    range_checker.add_count(b_ml[1], LIMB_BITS);
+    range_checker.add_count(a_ml[2], 7);
+    range_checker.add_count(b_ml[2], 7);
+    range_checker.add_count(a_exp >> 1, 7);
+    range_checker.add_count(b_exp >> 1, 7);
 
     // Classification inverse witnesses
     let a_ef = F::from_u32(a_exp);
@@ -582,145 +953,20 @@ fn fill_fadd_witness<F: PrimeField32>(
     row.b_is_nan = F::from_bool(b_is_nan);
     row.b_is_inf = F::from_bool(b_is_inf);
     row.b_is_zero = F::from_bool(b_is_zero);
-
-    // Alignment
-    let a_is_larger = a_exp >= b_exp;
-    let ediff = if a_is_larger {
-        a_exp - b_exp
-    } else {
-        b_exp - a_exp
-    };
-    let (large_sig, small_sig) = if a_is_larger {
-        (
-            if a_is_normal {
-                a_mant | 0x800000
-            } else {
-                a_mant
-            },
-            if b_is_normal {
-                b_mant | 0x800000
-            } else {
-                b_mant
-            },
-        )
-    } else {
-        (
-            if b_is_normal {
-                b_mant | 0x800000
-            } else {
-                b_mant
-            },
-            if a_is_normal {
-                a_mant | 0x800000
-            } else {
-                a_mant
-            },
-        )
-    };
-
-    row.a_is_larger = F::from_bool(a_is_larger);
-    row.ediff = F::from_u32(ediff);
-
-    // Align: shift small_sig right by ediff with sticky
-    let (aligned, guard_bit, sticky) = if ediff >= 28 {
-        (0u64, 0u32, small_sig != 0)
-    } else {
-        let shifted = (small_sig as u64) << 8; // put in 32-bit field (24 sig + 8 guard)
-        let shifted = shifted >> ediff;
-        let lost = shifted & 0xFF; // low byte = guard/sticky region
-        let _aligned_top = (shifted >> 8) as u32; // top 24 bits = aligned significand
-        let guard = ((lost >> 7) & 1) as u32;
-        let sticky = (lost & 0x7F) != 0
-            || (ediff > 0 && (small_sig & ((1u32 << ediff) - 1)) != 0 && ediff < 24);
-        (shifted, guard, sticky)
-    };
-
-    // aligned_sig: 4 limbs [byte0, byte1, byte2, guard_byte]
-    row.aligned_sig[0] = F::from_u32((aligned & 0xFF) as u32);
-    row.aligned_sig[1] = F::from_u32(((aligned >> 8) & 0xFF) as u32);
-    row.aligned_sig[2] = F::from_u32(((aligned >> 16) & 0xFF) as u32);
-    row.aligned_sig[3] = F::from_u32(((aligned >> 24) & 0xFF) as u32);
-    row.sticky = F::from_bool(sticky);
-
-    // Sum / difference
-    let same_sign = a_sign == b_sign;
-    row.is_add = F::from_bool(same_sign);
-
-    let large_ext = (large_sig as u64) << 8; // extend to 32 bits
-    let raw_result = if same_sign {
-        large_ext + aligned
-    } else {
-        large_ext - aligned
-    };
-    row.raw_sum[0] = F::from_u32((raw_result & 0xFF) as u32);
-    row.raw_sum[1] = F::from_u32(((raw_result >> 8) & 0xFF) as u32);
-    row.raw_sum[2] = F::from_u32(((raw_result >> 16) & 0xFF) as u32);
-    row.raw_sum[3] = F::from_u32(((raw_result >> 24) & 0xFF) as u32);
-
-    // Normalization (simplified: prover provides, TODO full verification)
-    let large_exp = if a_is_larger { a_exp } else { b_exp };
-
-    // Compute normalization: determine how many bits to shift
-    let raw_top = raw_result >> 8; // top 24 bits
-    let norm_result = if same_sign && raw_top >= (1 << 24) {
-        // Carry: shift right by 1
-        let sticky_from_carry = (raw_result & 1) != 0 || sticky;
-        let norm = raw_result >> 1;
-        (norm, large_exp + 1, sticky_from_carry)
-    } else if raw_top == 0 && (raw_result & 0xFF) == 0 {
-        // Result is zero
-        (0u64, 0, false)
-    } else if !same_sign && raw_top < (1 << 23) && raw_top > 0 {
-        // Cancellation: count leading zeros
-        let mut shift = 0u32;
-        let mut v = raw_top;
-        while v < (1 << 23) && v > 0 {
-            v <<= 1;
-            shift += 1;
-        }
-        let norm = if shift <= 8 {
-            raw_result << shift
-        } else {
-            (raw_result >> (shift - 8)) << 8
-        };
-        let adj_exp = large_exp.saturating_sub(shift);
-        (norm, adj_exp, sticky)
-    } else {
-        (raw_result, large_exp, sticky)
-    };
-
-    let (norm_val, result_exp_val, combined_sticky) = norm_result;
-    row.norm_sig[0] = F::from_u32((norm_val & 0xFF) as u32);
-    row.norm_sig[1] = F::from_u32(((norm_val >> 8) & 0xFF) as u32);
-    row.norm_sig[2] = F::from_u32(((norm_val >> 16) & 0xFF) as u32);
-    row.norm_sig[3] = F::from_u32(((norm_val >> 24) & 0xFF) as u32);
-    row.result_exp = F::from_u32(result_exp_val);
-
-    // Rounding
-    let actual_guard = ((norm_val >> 7) & 1) as u32; // bit 7 of low byte = guard bit
-    let actual_sticky = (norm_val & 0x7F) != 0 || combined_sticky;
-    let mant_lsb = (norm_val >> 8) & 1;
-    let round_up = actual_guard == 1 && (actual_sticky || mant_lsb == 1);
-
-    row.guard = F::from_u32(actual_guard);
-    let norm3_lo = F::from_u32((norm_val & 0x7F) as u32);
-    row.norm3_lo_inv = if norm_val & 0x7F != 0 {
-        norm3_lo.try_inverse().unwrap_or(F::ZERO)
-    } else {
-        F::ZERO
-    };
-    row.round_up = F::from_bool(round_up);
+    row.a_is_normal = F::from_bool(a_is_normal);
+    row.b_is_normal = F::from_bool(b_is_normal);
 
     // Result
-    let (r_sign, r_exp, r_mant) = decompose(result_bits);
+    let (r_sign, r_exp, _r_mant) = decompose(result_bits);
     row.result_sign = F::from_u32(r_sign);
     row.result_exp = F::from_u32(r_exp);
     row.result[0] = F::from_u32(result_bits & 0xFF);
     row.result[1] = F::from_u32((result_bits >> 8) & 0xFF);
     row.result[2] = F::from_u32((result_bits >> 16) & 0xFF);
     row.result[3] = F::from_u32((result_bits >> 24) & 0xFF);
-
-    let _ = (r_mant, guard_bit); // suppress unused warnings
+    for i in 0..4 {
+        range_checker.add_count((result_bits >> (i * 8)) & 0xFF, LIMB_BITS);
+    }
 
     let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_inf && a_sign != b_sign);
     let is_inf_res = !is_nan_res && (a_is_inf || b_is_inf || r_exp == 255);
@@ -739,7 +985,307 @@ fn fill_fadd_witness<F: PrimeField32>(
     row.s_inf = F::from_bool(s_inf);
     row.s_zero_both = F::from_bool(s_zero_both);
 
+    // Alignment selection
+    let same_sign = a_sign == b_sign;
+    let a_is_larger = a_exp >= b_exp;
+    let ediff = if a_is_larger {
+        a_exp - b_exp
+    } else {
+        b_exp - a_exp
+    };
+    row.is_add = F::from_bool(same_sign);
+    row.a_is_larger = F::from_bool(a_is_larger);
+    row.ediff = F::from_u32(ediff);
+    range_checker.add_count(ediff, LIMB_BITS);
+
+    // Sound selector: finite, same-sign, both-normal.
+    let s_add = !is_nan_res && !inf_in && !s_zero_both && same_sign && a_is_normal && b_is_normal;
+    row.s_add = F::from_bool(s_add);
+
+    // Selected significands (with implicit bit, since both normal on the s_add path;
+    // off-path values are still well-defined mantissa selections).
+    let a_sig = if a_is_normal {
+        a_mant | 0x800000
+    } else {
+        a_mant
+    };
+    let b_sig = if b_is_normal {
+        b_mant | 0x800000
+    } else {
+        b_mant
+    };
+    let (large_sig, small_sig, large_exp) = if a_is_larger {
+        (a_sig, b_sig, a_exp)
+    } else {
+        (b_sig, a_sig, b_exp)
+    };
+    for i in 0..SIG_NUM_LIMBS {
+        row.large_sig[i] = F::from_u32((large_sig >> (i * LIMB_BITS)) & 0xFF);
+        row.small_sig[i] = F::from_u32((small_sig >> (i * LIMB_BITS)) & 0xFF);
+    }
+
+    let is_deep = ediff >= DEEP_EDIFF;
+    row.is_deep = F::from_bool(is_deep);
+    row.deep_delta = F::from_u32(if is_deep {
+        ediff - DEEP_EDIFF
+    } else {
+        DEEP_EDIFF - 1 - ediff
+    });
+    range_checker.add_count(row.deep_delta.as_canonical_u32(), LIMB_BITS);
+
+    let s_shallow = s_add && !is_deep;
+    row.align_enable = F::from_bool(s_shallow);
+
+    // ── Alignment via ShrnGadget (shallow), else disabled ───────────────
+    let x: [u32; WORK_LIMBS] = [
+        0,
+        small_sig & 0xFF,
+        (small_sig >> 8) & 0xFF,
+        (small_sig >> 16) & 0xFF,
+    ];
+    if s_shallow {
+        let shift = ediff as usize;
+        row.align = make_shrn_cols::<F>(x, shift, range_checker);
+        let ag = row.align.guard.as_canonical_u32();
+        let as_ = row.align.sticky.as_canonical_u32();
+        let lost_sticky = (ag != 0) || (as_ != 0);
+        row.lost_sticky = F::from_bool(lost_sticky);
+    } else {
+        // Disabled gadget: do NOT register range-checker counts (the gadget emits
+        // no sends when enable = 0). Only align.x must match small_sig<<8, which
+        // is constrained unconditionally on is_valid.
+        let mut a = ShrnCols::<F, WORK_LIMBS>::default();
+        a.x[1] = F::from_u32(x[1]);
+        a.x[2] = F::from_u32(x[2]);
+        a.x[3] = F::from_u32(x[3]);
+        row.align = a;
+        row.lost_sticky = F::from_bool(is_deep && (small_sig != 0));
+    }
+
+    if !s_shallow {
+        // Deep path result = larger operand; shallow finite columns are don't-care
+        // (gated off), zero them so unconditional bool/range assertions hold.
+        zero_finite_columns(row);
+        row.result_exp = F::from_u32(if s_add && is_deep { large_exp } else { r_exp });
+        row.is_valid = F::ONE;
+        return;
+    }
+
+    // ── Sum: raw_sum = (large_sig << 8) + aligned ───────────────────────
+    let large_working = (large_sig as u64) << 8; // [0, large_sig bytes...]
+    let aligned = (0..WORK_LIMBS).fold(0u64, |acc, i| {
+        acc | ((row.align.y[i].as_canonical_u32() as u64) << (i * LIMB_BITS))
+    });
+    let raw = large_working + aligned;
+    let raw_bytes: [u32; WORK_LIMBS] =
+        core::array::from_fn(|i| ((raw >> (i * LIMB_BITS)) & 0xFF) as u32);
+    let carry_out = ((raw >> 32) & 1) as u32;
+    let sum_c1 =
+        ((row.large_sig[0].as_canonical_u32() + row.align.y[1].as_canonical_u32()) >> 8) & 1;
+    let sum_c2 =
+        ((row.large_sig[1].as_canonical_u32() + row.align.y[2].as_canonical_u32() + sum_c1) >> 8)
+            & 1;
+    for (i, &b) in raw_bytes.iter().enumerate() {
+        row.raw_sum[i] = F::from_u32(b);
+    }
+    row.sum_c1 = F::from_u32(sum_c1);
+    row.sum_c2 = F::from_u32(sum_c2);
+    row.carry_out = F::from_u32(carry_out);
+
+    // ── Normalize: norm = raw >> carry_out ──────────────────────────────
+    let norm = raw >> carry_out;
+    for (i, &b) in raw_bytes.iter().enumerate() {
+        row.rs_high7[i] = F::from_u32(b >> 1);
+        row.rs_lowbit[i] = F::from_u32(b & 1);
+        row.norm_sig[i] = F::from_u32(((norm >> (i * LIMB_BITS)) & 0xFF) as u32);
+        range_checker.add_count(row.rs_high7[i].as_canonical_u32(), 7);
+        range_checker.add_count(row.norm_sig[i].as_canonical_u32(), LIMB_BITS);
+    }
+
+    // ── RNE rounding ────────────────────────────────────────────────────
+    let ns0 = (norm & 0xFF) as u32;
+    let ns1 = ((norm >> 8) & 0xFF) as u32;
+    let guard = (ns0 >> 7) & 1;
+    let ns0_lo = ns0 & 0x7F;
+    let mant_lsb = ns1 & 1;
+    let ns1_high = ns1 >> 1;
+    let dropped = carry_out * (raw_bytes[0] & 1);
+    let below_guard = ns0_lo + dropped + row.lost_sticky.as_canonical_u32();
+    let sticky = below_guard != 0;
+    let round_up = guard == 1 && (sticky || mant_lsb == 1);
+
+    row.guard = F::from_u32(guard);
+    row.ns0_lo = F::from_u32(ns0_lo);
+    row.ns1_high = F::from_u32(ns1_high);
+    row.mant_lsb = F::from_u32(mant_lsb);
+    row.below_guard = F::from_u32(below_guard);
+    row.below_guard_inv = if below_guard != 0 {
+        F::from_u32(below_guard).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.sticky = F::from_bool(sticky);
+    row.round_up = F::from_bool(round_up);
+    range_checker.add_count(ns0_lo, 7);
+    range_checker.add_count(ns1_high, 7);
+
+    // ── Output reconstruction ───────────────────────────────────────────
+    let s0 = ((norm >> 8) & 0xFF) as u32 + round_up as u32; // norm_sig[1] + round_up
+    let rc0 = s0 >> 8;
+    let s1 = ((norm >> 16) & 0xFF) as u32 + rc0; // norm_sig[2] + rc0
+    let rc1 = s1 >> 8;
+    let top7c = (((norm >> 24) & 0x7F) as u32) + rc1; // (norm_sig[3]-128) + rc1
+    let rc2 = top7c >> 7;
+    let rc2_rem = top7c & 0x7F;
+    let result_exp_calc = large_exp + carry_out + rc2;
+
+    row.rc0 = F::from_u32(rc0);
+    row.rc1 = F::from_u32(rc1);
+    row.rc2 = F::from_u32(rc2);
+    row.rc2_rem = F::from_u32(rc2_rem);
+    row.r_exp_lo = F::from_u32(r_exp & 1);
+    row.r_exp_hi = F::from_u32(r_exp >> 1);
+    row.r_exp_hi_zero_inv = if r_exp >> 1 != 0 {
+        F::from_u32(r_exp >> 1).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.r_exp_hi_max_inv = if r_exp >> 1 != 127 {
+        (F::from_u32(127) - F::from_u32(r_exp >> 1))
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    range_checker.add_count(rc2_rem, 7);
+
+    // Sanity: witness must agree with the native result on this path (only for a
+    // normal result; overflow -> inf does not match the significand reconstruction).
+    if (1u32..=254).contains(&r_exp) {
+        debug_assert_eq!(
+            result_exp_calc, r_exp,
+            "fadd finite exponent mismatch: a={:08x} b={:08x}",
+            a_bits, b_bits
+        );
+        let recon0 = (((norm >> 8) & 0xFF) as u32 + round_up as u32) & 0xFF;
+        let recon1 = (((norm >> 16) & 0xFF) as u32 + rc0) & 0xFF;
+        let recon2 = rc2_rem + (r_exp & 1) * 128;
+        debug_assert_eq!(
+            recon0,
+            result_bits & 0xFF,
+            "fadd finite mantissa byte0 mismatch: a={:08x} b={:08x}",
+            a_bits,
+            b_bits
+        );
+        debug_assert_eq!(recon1, (result_bits >> 8) & 0xFF);
+        debug_assert_eq!(recon2, (result_bits >> 16) & 0xFF);
+    }
+
+    let _ = result_exp_calc;
+    row.s_normal = F::from_bool(s_shallow && (1u32..=254).contains(&r_exp));
+    row.s_overflow = F::from_bool(s_shallow && r_exp == 255);
     row.is_valid = F::ONE;
+}
+
+/// Zero the finite-path columns (used when the s_shallow gate is off, so the
+/// unconditional bool assertions still hold).
+fn zero_finite_columns<F: PrimeField32>(row: &mut FaddCoreCols<F>) {
+    for i in 0..WORK_LIMBS {
+        row.raw_sum[i] = F::ZERO;
+        row.norm_sig[i] = F::ZERO;
+        row.rs_high7[i] = F::ZERO;
+        row.rs_lowbit[i] = F::ZERO;
+    }
+    row.sum_c1 = F::ZERO;
+    row.sum_c2 = F::ZERO;
+    row.carry_out = F::ZERO;
+    row.guard = F::ZERO;
+    row.ns0_lo = F::ZERO;
+    row.ns1_high = F::ZERO;
+    row.mant_lsb = F::ZERO;
+    row.below_guard = F::ZERO;
+    row.below_guard_inv = F::ZERO;
+    row.sticky = F::ZERO;
+    row.round_up = F::ZERO;
+    row.rc0 = F::ZERO;
+    row.rc1 = F::ZERO;
+    row.rc2 = F::ZERO;
+    row.rc2_rem = F::ZERO;
+    row.r_exp_lo = F::ZERO;
+    row.r_exp_hi = F::ZERO;
+    row.r_exp_hi_zero_inv = F::ZERO;
+    row.r_exp_hi_max_inv = F::ZERO;
+    row.s_normal = F::ZERO;
+    row.s_overflow = F::ZERO;
+}
+
+/// Build a `ShrnCols` witness (mirrors `fp_shift::tests::make_cols`) and register
+/// the corresponding range-checker counts. `enable` defaults to 1.
+fn make_shrn_cols<F: PrimeField32>(
+    x: [u32; WORK_LIMBS],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, WORK_LIMBS> {
+    let shift = shift.min(WORK_LIMBS * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; WORK_LIMBS];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    // Register range-checker counts to balance ShrnGadget's interaction sends.
+    for i in 0..WORK_LIMBS {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r); // bit_shift_carry[i] @ r bits
+        range_checker.add_count(y[i], LIMB_BITS);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
+    }
 }
 
 #[cfg(test)]
@@ -791,7 +1337,7 @@ mod special_tests {
     fn run(c: &FaddCoreCols<F>) -> NumericBuilder<F> {
         let mut b = NumericBuilder::new(vec![]);
         FaddCoreAir::new(
-            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            openvm_circuit_primitives::var_range::VariableRangeCheckerBus::new(0, 16),
             0,
         )
         .eval_special_cases(&mut b, c);
@@ -846,5 +1392,200 @@ mod special_tests {
         let mut c = make_cols(3.0f32.to_bits(), 4.0f32.to_bits());
         c.result[0] = F::from_u32(0xAB);
         assert!(run(&c).ok(), "finite case must not be constrained here");
+    }
+}
+
+#[cfg(test)]
+mod finite_add_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{
+        SharedVariableRangeCheckerChip, VariableRangeCheckerBus, VariableRangeCheckerChip,
+    };
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+
+    fn rc() -> SharedVariableRangeCheckerChip {
+        Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )))
+    }
+
+    fn air() -> FaddCoreAir {
+        FaddCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0)
+    }
+
+    /// Build a full witness row via the production filler, then run eval_finite_add.
+    fn run(a: u32, b: u32) -> (NumericBuilder<F>, FaddCoreCols<F>) {
+        run_with(a, b, &rc())
+    }
+
+    fn run_with(
+        a: u32,
+        b: u32,
+        chip: &SharedVariableRangeCheckerChip,
+    ) -> (NumericBuilder<F>, FaddCoreCols<F>) {
+        let mut row = FaddCoreCols::<F>::default();
+        let result = fadd_s(a, b);
+        fill_fadd_witness(&mut row, a, b, result, chip);
+        let mut builder = NumericBuilder::new(vec![]);
+        air().eval_finite_add(&mut builder, &row);
+        (builder, row)
+    }
+
+    fn run_row(row: &FaddCoreCols<F>) -> NumericBuilder<F> {
+        let mut builder = NumericBuilder::new(vec![]);
+        air().eval_finite_add(&mut builder, row);
+        builder
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        // Same-sign (matching the caller's sign), both-normal f32 bits.
+        fn normal_same_sign(&mut self, sign: u32) -> u32 {
+            let exp = (self.next() as u32 % 254) + 1;
+            let mant = (self.next() as u32) & 0x7FFFFF;
+            (sign << 31) | (exp << 23) | mant
+        }
+    }
+
+    #[test]
+    fn finite_add_honest_passes() {
+        let chip = rc();
+        let mut rng = Rng(0xA15A_5F1D_C0DE_BEEF);
+        let mut carry_seen = false;
+        let mut round_up_seen = false;
+        let mut deep_seen = false;
+        let mut overflow_seen = false;
+        let mut trials = 0;
+        while trials < 40000 {
+            let sign = ((rng.next() as u32) & 1) << 31;
+            let a = rng.normal_same_sign(sign);
+            let b = rng.normal_same_sign(sign);
+            trials += 1;
+            let (builder, row) = run_with(a, b, &chip);
+            assert!(
+                builder.ok(),
+                "honest finite-add failed: {:?}\n a={:08x} b={:08x}",
+                builder.failures,
+                a,
+                b
+            );
+            if row.carry_out == F::ONE {
+                carry_seen = true;
+            }
+            if row.round_up == F::ONE {
+                round_up_seen = true;
+            }
+            if row.is_deep == F::ONE {
+                deep_seen = true;
+            }
+            let r_exp = (fadd_s(a, b) >> 23) & 0xFF;
+            if r_exp == 255 {
+                overflow_seen = true;
+            }
+        }
+        let _ = trials;
+        assert!(carry_seen, "never exercised a carry-out normalization");
+        assert!(round_up_seen, "never exercised a round_up=1 case");
+        assert!(deep_seen, "never exercised the deep (ediff>=25) path");
+        assert!(overflow_seen, "never exercised an overflow->inf result");
+    }
+
+    #[test]
+    fn finite_add_known_values() {
+        // 1.0 + 1.0 = 2.0 (carry-out normalization)
+        let (b, _) = run(1.0f32.to_bits(), 1.0f32.to_bits());
+        assert!(b.ok(), "{:?}", b.failures);
+        // 1.0 + 2.0 = 3.0 (no carry)
+        let (b, _) = run(1.0f32.to_bits(), 2.0f32.to_bits());
+        assert!(b.ok(), "{:?}", b.failures);
+        // 1.0 + (tiny, ediff=25) = 1.0 (deep path)
+        let tiny = f32::from_bits(1 << 0); // smallest subnormal is not normal; use exp=102
+        let large = 1.0f32;
+        // build a normal small operand 25 exp below 1.0 (exp 127): exp 102
+        let small = f32::from_bits((102u32 << 23) | 1).to_bits();
+        let _ = tiny;
+        let (b, _) = run(large.to_bits(), small);
+        assert!(b.ok(), "deep path: {:?}", b.failures);
+        // MAX + MAX = +inf (overflow)
+        let (b, _) = run(f32::MAX.to_bits(), f32::MAX.to_bits());
+        assert!(b.ok(), "overflow: {:?}", b.failures);
+    }
+
+    #[test]
+    fn finite_add_corrupt_result_rejected() {
+        let (_, mut row) = run(1.5f32.to_bits(), 2.5f32.to_bits());
+        row.result[0] = F::from_u32(row.result[0].as_canonical_u32() ^ 1);
+        assert!(!run_row(&row).ok(), "corrupted mantissa must be rejected");
+    }
+
+    #[test]
+    fn finite_add_corrupt_exponent_rejected() {
+        let (_, mut row) = run(1.5f32.to_bits(), 2.5f32.to_bits());
+        // Flip the result exponent low bit without fixing r_exp_lo.
+        row.result_exp = F::from_u32(row.result_exp.as_canonical_u32() ^ 1);
+        assert!(!run_row(&row).ok(), "corrupted exponent must be rejected");
+    }
+
+    #[test]
+    fn finite_add_corrupt_round_up_rejected() {
+        let (_, mut row) = run(1.0f32.to_bits(), f32::from_bits(0x3f800001).to_bits());
+        // Force an incorrect rounding decision.
+        let flipped = F::from_u32(1 - row.round_up.as_canonical_u32());
+        row.round_up = flipped;
+        // This may or may not flip the result enough to fail depending on the
+        // value; corrupt the result to match the flipped round_up so the only
+        // inconsistency is round_up vs guard/sticky.
+        // Simpler robust check: flip guard -> round_up relation breaks.
+        row.guard = F::from_u32(1 - row.guard.as_canonical_u32());
+        assert!(!run_row(&row).ok(), "corrupted guard must be rejected");
+    }
+
+    #[test]
+    fn finite_add_corrupt_carry_out_rejected() {
+        let (_, mut row) = run(1.0f32.to_bits(), 1.0f32.to_bits()); // forces carry_out = 1
+        assert_eq!(row.carry_out, F::ONE);
+        row.carry_out = F::ZERO; // wrongly claim no carry
+        assert!(!run_row(&row).ok(), "wrong carry_out must be rejected");
+    }
+
+    #[test]
+    fn finite_add_special_inputs_unconstrained() {
+        // Special inputs have s_add = 0, so eval_finite_add must not fire any
+        // result-tying constraint (and must not spuriously fail).
+        for &(a, b) in &[
+            (f32::NAN.to_bits(), 1.0f32.to_bits()),
+            (f32::INFINITY.to_bits(), 1.0f32.to_bits()),
+            (0.0f32.to_bits(), 0.0f32.to_bits()),
+            (1.0f32.to_bits(), f32::NAN.to_bits()),
+        ] {
+            let (builder, _) = run(a, b);
+            assert!(
+                builder.ok(),
+                "special input must not fail finite-add: a={:08x} b={:08x}: {:?}",
+                a,
+                b,
+                builder.failures
+            );
+        }
+    }
+
+    #[test]
+    fn finite_add_subtraction_unconstrained() {
+        // Opposite-sign (subtraction) finite inputs are NOT covered by this path
+        // (s_add = 0), so the constraints must not fire / fail.
+        let (builder, _) = run(5.0f32.to_bits(), (-3.0f32).to_bits());
+        assert!(builder.ok(), "subtraction must not be constrained here");
     }
 }
