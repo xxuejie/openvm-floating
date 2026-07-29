@@ -1586,8 +1586,8 @@ mod fuzz_tests {
     #[cfg(feature = "proving")]
     #[test]
     fn fuzz_prove_fmul() {
-        // Deterministic set exercising normal / overflow / NaN / inf / zero paths
-        // (the first air_test for fmul — it previously had none).
+        // Deterministic set exercising normal / overflow / subnormal / underflow
+        // / NaN / inf / zero paths of the finite constraints.
         let cases: Vec<(u32, u32)> = vec![
             (3.0f32.to_bits(), 4.0f32.to_bits()),
             (f32::MAX.to_bits(), f32::MAX.to_bits()),
@@ -1595,6 +1595,8 @@ mod fuzz_tests {
             (f32::INFINITY.to_bits(), 2.0f32.to_bits()),
             (0.0f32.to_bits(), 5.0f32.to_bits()),
             ((-3.0f32).to_bits(), 7.0f32.to_bits()),
+            (0x3C << 23, 0x3C << 23), // exp 60*60 → subnormal result
+            (0x43 << 23, 0x43 << 23), // tiny → underflow 0
             (1.5f32.to_bits(), 1.5f32.to_bits()),
         ];
         let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fmul_s(rd, rs1, rs2));

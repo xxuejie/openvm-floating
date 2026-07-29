@@ -220,7 +220,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         let exec_bridge = ExecutionBridge::new(execution_bus, program_bus);
         let range_checker_bus = inventory.range_checker().bus;
 
-        let range_tuple_checker = {
+        let _range_tuple_checker = {
             let existing_air = inventory.find_air::<RangeTupleCheckerAir<2>>().find(|c| {
                 c.bus.sizes[0] >= self.range_tuple_checker_sizes[0]
                     && c.bus.sizes[1] >= self.range_tuple_checker_sizes[1]
@@ -240,7 +240,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
 
         let fmul = Rv32FmulAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
-            FmulCoreAir::new(range_tuple_checker, FpOpcode::CLASS_OFFSET),
+            FmulCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fmul);
 
@@ -360,7 +360,7 @@ where
         let timestamp_max_bits = inventory.timestamp_max_bits();
         let mem_helper = SharedMemoryHelper::new(range_checker.clone(), timestamp_max_bits);
 
-        let range_tuple_checker = {
+        let _range_tuple_checker = {
             let existing_chip = inventory
                 .find_chip::<SharedRangeTupleCheckerChip<2>>()
                 .find(|c| {
@@ -381,7 +381,7 @@ where
         let fmul = Rv32FmulChip::new(
             FmulFiller::new(
                 Rv32FpAdapterFiller,
-                range_tuple_checker.clone(),
+                range_checker.clone(),
                 FpOpcode::CLASS_OFFSET,
             ),
             mem_helper.clone(),

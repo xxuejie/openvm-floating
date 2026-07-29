@@ -28,7 +28,7 @@ Per-chip soundness of the **result**:
 | fcmp        | ✅                   | ✅ fully sound                    |
 | fminmax     | ✅                   | ✅ fully sound                    |
 | fxfer       | n/a                  | ✅ fully sound (copy)             |
-| fmul        | ✅                   | normal ✅, overflow ✅; subnormal/underflow ❌ |
+| fmul        | ✅                   | ✅ fully sound (normal + overflow + subnormal/underflow) |
 | fadd        | ✅                   | same-sign both-normal ✅ (normal+overflow+deep); cancellation / subnormal ❌ |
 | fsub        | ✅                   | opposite-sign both-normal ✅ (magnitude add); cancellation / subnormal ❌ |
 | fdiv        | ✅ (pre-existing)    | ❌ finite unconstrained           |
@@ -185,10 +185,14 @@ all variable shifts.
      support N=6. Light cancellation (`lshift <= 8`) is correct even in 4 bytes,
      but soundness requires covering the heavy case too. `ShlnGadget` is committed
      and tested standalone; the chip-level wiring is what remains.
-3. **fmul subnormal / underflow** — wire `ShrnGadget` into fmul; for
-   `exp_normal ≤ 0`, shift `norm` right by `25 - exp_normal`, round, result is
-   subnormal (exp field 0) or zero. Boundary: rounding up to smallest normal.
-   Deep underflow (`shift ≥ 48`) → zero.
+3. ~~**fmul subnormal / underflow**~~ — **DONE.** Switched fmul to
+   `VariableRangeCheckerBus` and added `eval_finite_subnormal`: shifts the
+   normalized product right by `cshift = min(25 - exp_normal, 55)` via
+   `ShrnGadget<7>` (an `IsLtSubAir` caps the deep-underflow shift), RNE-rounds
+   to a subnormal mantissa, and handles the round-up-to-smallest-normal and
+   deep-underflow→0 boundaries. Also fixed two pre-existing fmul bugs that the
+   first fmul air_test revealed (garbage `c2` on special/zero inputs; padding-row
+   failures of unconditional is-zero gadgets).
 4. ~~**fcvt_i2f / fcvt_f2i**~~ — **DONE.** fcvt_f2i in-range RTZ truncation
    via `ShrnGadget<4>` + two's-complement; fcvt_i2f RNE via magnitude placement
    `x = |int| << 24` and `ShrnGadget<7>` (`sig = x >> (exp - 126)`), with the

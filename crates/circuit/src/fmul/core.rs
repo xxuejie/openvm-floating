@@ -5,9 +5,11 @@ use openvm_circuit::{
     system::memory::{online::TracingMemory, MemoryAuxColsFactory},
 };
 use openvm_circuit_primitives::{
-    range_tuple::{RangeTupleCheckerBus, SharedRangeTupleCheckerChip},
+    is_less_than::{IsLessThanIo, IsLtSubAir},
     utils::not,
-    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper,
+    var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
+    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper, SubAir,
+    TraceSubRowGenerator,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
 use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, LocalOpcode};
@@ -19,6 +21,8 @@ use openvm_stark_backend::{
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
     BaseAirWithPublicValues,
 };
+
+use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
 
 pub const SIG_NUM_LIMBS: usize = 3;
 pub const PRODUCT_NUM_LIMBS: usize = 6;
@@ -130,13 +134,26 @@ pub struct FmulCoreCols<T> {
     pub m5_255_inv: T, // inverse for "norm_sig[5] == 255"
     pub s_overflow: T, // finite inputs AND product exponent >= 255 (result is +-inf)
 
+    // === Subnormal / underflow (see eval_finite_subnormal) ===
+    pub s_subnormal: T, // finite inputs AND result exp field == 0 (subnormal or underflow)
+    pub sub_efz: T,     // (result exp field == 0) indicator, gated on is_valid
+    pub sub_capped: T,  // bool: true shift >= 56 (capped to 55 ⇒ deep underflow → 0)
+    pub sub_lt_decomp: [T; 1], // lower decomposition for sub_capped = (sum < 97)
+    pub sub_shift: T,   // capped shift cshift ∈ [25, 55]
+    pub sub_shrn: ShrnCols<T, 7>, // result significand = norm_sig >> cshift (+ guard/sticky)
+    pub sub_y0_high7: T, // sub_shrn.y[0] >> 1
+    pub sub_lsb: T,     // bit 0 of sub_shrn.y[0]
+    pub sub_round_up: T,
+    pub sub_rc0: T, // rounding carry out of mantissa byte 0
+    pub sub_rc1: T, // rounding carry out of mantissa byte 1
+
     pub is_valid: T,
 }
 
 #[derive(Copy, Clone, Debug, derive_new::new, ColumnsAir)]
 #[columns_via(FmulCoreCols<u8>)]
 pub struct FmulCoreAir {
-    pub range_tuple_bus: RangeTupleCheckerBus<2>,
+    pub range_bus: VariableRangeCheckerBus,
     pub offset: usize,
 }
 
@@ -287,9 +304,12 @@ where
             }
             carry[i] = (expected - cols.product[i]) * carry_divide;
 
-            self.range_tuple_bus
-                .send(vec![cols.product[i].into(), carry[i].clone()])
-                .eval(builder, cols.is_valid);
+            self.range_bus
+                .range_check(cols.product[i].into(), LIMB_BITS)
+                .eval(builder, cols.is_valid.into());
+            self.range_bus
+                .range_check(carry[i].clone(), 10)
+                .eval(builder, cols.is_valid.into());
         }
         // Final carry must be zero
         builder
@@ -372,6 +392,8 @@ where
         self.eval_finite_output(builder, cols);
         // Finite overflow (product exponent >= 255 -> +-inf).
         self.eval_finite_overflow(builder, cols);
+        // Finite subnormal / underflow (product exponent <= 0 -> subnormal or 0).
+        self.eval_finite_subnormal(builder, cols);
 
         // ── Phase 8: Special-case selectors + result constraints ─────────
         self.eval_special_cases(builder, cols);
@@ -623,10 +645,131 @@ impl FmulCoreAir {
         );
 
         // Genuine overflow: exp_check >= 255. Range-check (exp_check - 255) to
-        // [0, 256) via the tuple bus (a negative value wraps outside the range).
-        self.range_tuple_bus
-            .send(vec![exp_check - f255, AB::Expr::ZERO])
+        // [0, 256) (a negative value wraps outside the range).
+        self.range_bus
+            .range_check(exp_check - f255, LIMB_BITS)
             .eval(builder, cols.s_overflow);
+    }
+
+    /// Constrain the finite subnormal / underflow result (product exponent ≤ 0).
+    ///
+    /// The normalized product `norm_sig` (implicit bit at 47) is shifted right by
+    /// `cshift = min(25 - exp_normal, 55)` via `ShrnGadget<7>`; the low bits become
+    /// the subnormal mantissa, with RNE rounding from the gadget's guard/sticky +
+    /// the mantissa LSB. For `exp_normal = -23` (`cshift = 48`) this yields the
+    /// smallest subnormal (or 0); for deeper underflow (`cshift ≥ 49`, or capped at
+    /// 55) the result is 0. Rounding up to exactly 2^23 produces the smallest
+    /// *normal* (exp field 1) via the carry into result byte 2's top bit.
+    pub fn eval_finite_subnormal<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FmulCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f97: AB::F = AB::F::from_u32(97);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f152: AB::F = AB::F::from_u32(152);
+        let f256: AB::F = AB::F::from_u32(1 << LIMB_BITS);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
+
+        // s_subnormal = s_finite AND result exp field == 0. Split across a column
+        // (sub_efz = exp field == 0) so the is_valid gating stays within degree 4
+        // (s_finite*exp_field_zero is degree 4; gating it directly would be 5).
+        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
+        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
+        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.sub_efz, exp_field_zero);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.s_subnormal, s_finite.clone() * cols.sub_efz);
+        builder.assert_bool(cols.s_subnormal);
+        let s = cols.s_subnormal;
+
+        // sub_capped = (true shift >= 56) = (a_exp + b_exp + is_high < 97). On
+        // s_subnormal rows exp_normal <= 0, so the sum <= 127 (< 2^8).
+        let sum = a_exp.clone() + b_exp.clone() + cols.is_high;
+        let lt_air = IsLtSubAir::new(self.range_bus, 8);
+        let io = IsLessThanIo::new(
+            sum.clone(),
+            AB::Expr::from(f97),
+            cols.sub_capped.into(),
+            s.into(),
+        );
+        lt_air.eval(builder, (io, &cols.sub_lt_decomp));
+        builder.assert_bool(cols.sub_capped);
+
+        // cshift = !capped ? (152 - sum) : 55.  (152 - sum = 25 - exp_normal.)
+        builder
+            .when(s * (one.clone() - cols.sub_capped))
+            .assert_eq(cols.sub_shift, AB::Expr::from(f152) - sum.clone());
+        builder
+            .when(s * cols.sub_capped)
+            .assert_eq(cols.sub_shift, AB::F::from_u32(55));
+        self.range_bus
+            .range_check(cols.sub_shift.into(), 6)
+            .eval(builder, s.into());
+
+        // ShrnGadget<7>: y = norm_sig >> cshift (norm_sig in the low 48 bits).
+        for i in 0..6 {
+            builder
+                .when(s)
+                .assert_eq(cols.sub_shrn.x[i], cols.norm_sig[i]);
+        }
+        builder.when(s).assert_zero(cols.sub_shrn.x[6]);
+        builder
+            .when(s)
+            .assert_eq(cols.sub_shrn.shift, cols.sub_shift);
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.sub_shrn);
+        builder.assert_eq(cols.sub_shrn.enable, s);
+
+        // For cshift >= 25, y < 2^24, so bytes [3..7] must be zero.
+        for i in 3..7 {
+            builder.when(s).assert_zero(cols.sub_shrn.y[i]);
+        }
+
+        // RNE rounding (guard/sticky from the gadget; lsb = bit 0 of y[0]).
+        builder
+            .when(s)
+            .assert_eq(cols.sub_shrn.y[0], cols.sub_y0_high7 * f2 + cols.sub_lsb);
+        builder.assert_bool(cols.sub_lsb);
+        self.range_bus
+            .range_check(cols.sub_y0_high7.into(), 7)
+            .eval(builder, s.into());
+        builder.assert_bool(cols.sub_shrn.guard);
+        builder.assert_bool(cols.sub_shrn.sticky);
+        let sticky_or_lsb =
+            cols.sub_shrn.sticky + cols.sub_lsb - cols.sub_shrn.sticky * cols.sub_lsb;
+        builder
+            .when(s)
+            .assert_eq(cols.sub_round_up, cols.sub_shrn.guard * sticky_or_lsb);
+        builder.assert_bool(cols.sub_round_up);
+
+        // Output reconstruction: result mantissa = y[0..2] + (y[2]&0x7F), rounded.
+        builder.assert_bool(cols.sub_rc0);
+        builder.assert_bool(cols.sub_rc1);
+        builder.when(s).assert_eq(
+            cols.result[0] + cols.sub_rc0 * f256,
+            cols.sub_shrn.y[0] + cols.sub_round_up,
+        );
+        builder.when(s).assert_eq(
+            cols.result[1] + cols.sub_rc1 * f256,
+            cols.sub_shrn.y[1] + cols.sub_rc0,
+        );
+        // result[2] = y[2] + rc1 (∈ [0, 0x80]; the top bit is the exp field's low
+        // bit, set iff rounding carries into the smallest normal).
+        builder
+            .when(s)
+            .assert_eq(cols.result[2], cols.sub_shrn.y[2] + cols.sub_rc1);
+        builder
+            .when(s)
+            .assert_eq(cols.result[3], cols.result_sign * f128);
+        builder.when(s).assert_eq(cols.r_exp_hi, AB::Expr::ZERO);
     }
 }
 
@@ -705,19 +848,18 @@ where
 pub struct FmulFiller<A> {
     adapter: A,
     pub offset: usize,
-    pub range_tuple_chip: SharedRangeTupleCheckerChip<2>,
+    pub range_checker: SharedVariableRangeCheckerChip,
+    lt_air: IsLtSubAir,
 }
 
 impl<A> FmulFiller<A> {
-    pub fn new(
-        adapter: A,
-        range_tuple_chip: SharedRangeTupleCheckerChip<2>,
-        offset: usize,
-    ) -> Self {
+    pub fn new(adapter: A, range_checker: SharedVariableRangeCheckerChip, offset: usize) -> Self {
+        let lt_air = IsLtSubAir::new(range_checker.bus(), 8);
         Self {
             adapter,
             offset,
-            range_tuple_chip,
+            range_checker,
+            lt_air,
         }
     }
 }
@@ -743,7 +885,8 @@ where
             a_bits,
             b_bits,
             result_bits,
-            &self.range_tuple_chip,
+            &self.range_checker,
+            &self.lt_air,
         );
     }
 }
@@ -766,7 +909,8 @@ fn fill_fmul_witness<F: PrimeField32>(
     a_bits: u32,
     b_bits: u32,
     result_bits: u32,
-    range_chip: &SharedRangeTupleCheckerChip<2>,
+    range_chip: &SharedVariableRangeCheckerChip,
+    lt_air: &IsLtSubAir,
 ) {
     let (a_sign, a_exp_lo, a_exp_hi, a_mant0, a_mant1, a_mant2, a_exp) = decompose(a_bits);
     let (b_sign, b_exp_lo, b_exp_hi, b_mant0, b_mant1, b_mant2, b_exp) = decompose(b_bits);
@@ -887,7 +1031,8 @@ fn fill_fmul_witness<F: PrimeField32>(
         }
         let c = sum >> LIMB_BITS;
         carry = c;
-        range_chip.add_count(&[prod_limb, c]);
+        range_chip.add_count(prod_limb, LIMB_BITS);
+        range_chip.add_count(c, 10);
     }
 
     // Normalization
@@ -1037,7 +1182,7 @@ fn fill_fmul_witness<F: PrimeField32>(
     // corresponding lookup in eval_finite_overflow balances.
     if s_overflow {
         let exp_check = a_exp + b_exp - 127 + is_high as u32 + c2;
-        range_chip.add_count(&[exp_check - 255, 0]);
+        range_chip.add_count(exp_check - 255, LIMB_BITS);
     }
 
     // The reconstruction is only meaningful for normal results; sanity-check
@@ -1052,9 +1197,132 @@ fn fill_fmul_witness<F: PrimeField32>(
         "fmul overflow exponent mismatch"
     );
 
+    // ── Subnormal / underflow witness ──────────────────────────────────
+    let s_subnormal = s_finite && r_exp == 0;
+    row.s_subnormal = F::from_bool(s_subnormal);
+    row.sub_efz = F::from_bool(r_exp == 0);
+    if s_subnormal {
+        let exp_normal = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
+        let sum = a_exp + b_exp + is_high as u32;
+        let true_shift = 25 - exp_normal; // = 152 - sum
+        let sub_capped = true_shift >= 56;
+        row.sub_capped = F::from_bool(sub_capped);
+        lt_air.generate_subrow(
+            (range_chip.as_ref(), sum, 97),
+            (&mut row.sub_lt_decomp, &mut row.sub_capped),
+        );
+        let cshift = if sub_capped { 55u32 } else { true_shift as u32 };
+        row.sub_shift = F::from_u32(cshift);
+        range_chip.add_count(cshift, 6);
+        let x: [u32; 7] = core::array::from_fn(|i| ((norm >> (i * LIMB_BITS)) & 0xFF) as u32);
+        row.sub_shrn = make_shrn_cols7::<F>(x, cshift as usize, range_chip);
+        let y0 = row.sub_shrn.y[0].as_canonical_u32();
+        let y1 = row.sub_shrn.y[1].as_canonical_u32();
+        let y2 = row.sub_shrn.y[2].as_canonical_u32();
+        row.sub_y0_high7 = F::from_u32(y0 >> 1);
+        row.sub_lsb = F::from_u32(y0 & 1);
+        range_chip.add_count(y0 >> 1, 7);
+        let guard = row.sub_shrn.guard.as_canonical_u32();
+        let sticky = row.sub_shrn.sticky.as_canonical_u32() != 0;
+        let round_up = guard == 1 && (sticky || (y0 & 1) == 1);
+        row.sub_round_up = F::from_bool(round_up);
+        let s0 = y0 + round_up as u32;
+        let rc0 = s0 >> 8;
+        let s1 = y1 + rc0;
+        let rc1 = s1 >> 8;
+        row.sub_rc0 = F::from_u32(rc0);
+        row.sub_rc1 = F::from_u32(rc1);
+        debug_assert_eq!(
+            (y2 + rc1) & 0xFF,
+            result_bits >> 16 & 0xFF,
+            "fmul subnormal byte2: a={:08x} b={:08x}",
+            a_bits,
+            b_bits
+        );
+        debug_assert_eq!(s0 & 0xFF, result_bits & 0xFF, "fmul subnormal byte0");
+        debug_assert_eq!(s1 & 0xFF, result_bits >> 8 & 0xFF, "fmul subnormal byte1");
+    } else {
+        row.sub_capped = F::ZERO;
+        row.sub_shift = F::ZERO;
+        row.sub_shrn = ShrnCols::<F, 7>::default();
+        row.sub_y0_high7 = F::ZERO;
+        row.sub_lsb = F::ZERO;
+        row.sub_round_up = F::ZERO;
+        row.sub_rc0 = F::ZERO;
+        row.sub_rc1 = F::ZERO;
+    }
+
     row.is_valid = F::ONE;
 
     let _ = (r_mant, p5_lo);
+}
+
+/// Build a `ShrnCols<7>` witness and register range-checker counts for ShrnGadget.
+fn make_shrn_cols7<F: PrimeField32>(
+    x: [u32; 7],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 7> {
+    const N: usize = 7;
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    for i in 0..N {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
+    }
 }
 
 #[cfg(test)]
@@ -1113,7 +1381,7 @@ mod special_tests {
     fn run(c: &FmulCoreCols<F>) -> NumericBuilder<F> {
         let mut b = NumericBuilder::new(vec![]);
         FmulCoreAir::new(
-            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            openvm_circuit_primitives::var_range::VariableRangeCheckerBus::new(0, 16),
             0,
         )
         .eval_special_cases(&mut b, c);
@@ -1264,7 +1532,7 @@ mod finite_tests {
     fn run(c: &FmulCoreCols<F>) -> NumericBuilder<F> {
         let mut b = NumericBuilder::new(vec![]);
         FmulCoreAir::new(
-            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            openvm_circuit_primitives::var_range::VariableRangeCheckerBus::new(0, 16),
             0,
         )
         .eval_finite_output(&mut b, c);
@@ -1428,7 +1696,7 @@ mod overflow_tests {
     fn run(c: &FmulCoreCols<F>) -> NumericBuilder<F> {
         let mut b = NumericBuilder::new(vec![]);
         FmulCoreAir::new(
-            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            openvm_circuit_primitives::var_range::VariableRangeCheckerBus::new(0, 16),
             0,
         )
         .eval_finite_overflow(&mut b, c);
@@ -1475,24 +1743,24 @@ mod overflow_tests {
 mod full_eval_tests {
     use super::*;
     use crate::test_utils::NumericBuilder;
-    use openvm_circuit_primitives::range_tuple::{RangeTupleCheckerBus, RangeTupleCheckerChip};
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
     use openvm_stark_sdk::p3_baby_bear::BabyBear;
     use std::sync::Arc;
 
     type F = BabyBear;
 
-    fn filler_cols(a: u32, b: u32) -> (FmulCoreCols<F>, Arc<RangeTupleCheckerChip<2>>) {
-        let chip = Arc::new(RangeTupleCheckerChip::new(RangeTupleCheckerBus::new(
-            0,
-            [1 << 8, 8 << 8],
+    fn filler_cols(a: u32, b: u32) -> (FmulCoreCols<F>, Arc<VariableRangeCheckerChip>) {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
         )));
+        let lt = IsLtSubAir::new(chip.bus(), 8);
         let mut cols = FmulCoreCols::<F>::default();
-        fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip);
+        fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip, &lt);
         (cols, chip)
     }
 
     fn air() -> FmulCoreAir {
-        FmulCoreAir::new(RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]), 0)
+        FmulCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0)
     }
 
     #[test]
@@ -1526,6 +1794,64 @@ mod full_eval_tests {
                 b,
                 b3.failures
             );
+            let mut b4 = NumericBuilder::new(vec![]);
+            air().eval_finite_subnormal(&mut b4, &cols);
+            assert!(
+                b4.ok(),
+                "subnormal a={:08x} b={:08x}: {:?}",
+                a,
+                b,
+                b4.failures
+            );
         }
+    }
+
+    #[test]
+    fn subnormal_fuzz_passes() {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let lt = IsLtSubAir::new(chip.bus(), 8);
+        let air = FmulCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0);
+        let mut rng = 0xB0BE_F7EE_0DEF_1234u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u32
+        };
+        let mut trials = 0;
+        let mut sub_seen = false;
+        let mut deep_seen = false;
+        while trials < 60000 && (!sub_seen || !deep_seen) {
+            let ea = (next() % 80) + 1;
+            let eb = (next() % 80) + 1;
+            let a = (ea << 23) | (next() & 0x7FFFFF);
+            let b = (eb << 23) | (next() & 0x7FFFFF);
+            let result = fmul_s(a, b);
+            trials += 1;
+            if (result >> 23) & 0xFF != 0 {
+                continue;
+            }
+            let mut cols = FmulCoreCols::<F>::default();
+            fill_fmul_witness(&mut cols, a, b, result, &chip, &lt);
+            let mut builder = NumericBuilder::new(vec![]);
+            air.eval_finite_subnormal(&mut builder, &cols);
+            assert!(
+                builder.ok(),
+                "subnormal a={:08x} b={:08x}: {:?}",
+                a,
+                b,
+                builder.failures
+            );
+            if cols.sub_capped == F::ONE {
+                deep_seen = true;
+            } else {
+                sub_seen = true;
+            }
+        }
+        let _ = trials;
+        assert!(sub_seen, "never exercised a (non-deep) subnormal result");
+        assert!(deep_seen, "never exercised a deep-underflow result");
     }
 }
