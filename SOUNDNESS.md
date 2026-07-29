@@ -171,6 +171,20 @@ all variable shifts.
    (alignment, sum) are reused; only the normalize stage changes from a 1-bit
    right shift to a variable left shift. Subnormal inputs also fall here (result
    may be subnormal) and need the deep-clamp threshold re-derived for subtraction.
+   - **Hard-won finding (attempted, reverted):** a 4-byte (32-bit) working field
+     is **insufficient** for cancellation. For *heavy* cancellation (`lshift >= 9`,
+     i.e. the result's leading bit drops below position 23), the result **mantissa
+     itself** depends on the alignment-lost bits' values (the variable left shift
+     amplifies alignment error up into the mantissa), not just on a sticky bool.
+     The 4-byte `ShrnGadget` alignment collapses sub-field bits into `lost_sticky`,
+     so the reconstructed mantissa is off (completeness break on heavy
+     cancellation). **Fix: use a 6-byte (48-bit) working field** for the
+     cancellation path — place the implicit bit at bit 47 with ~3 guard/sticky
+     bytes below, so the alignment guard/sticky survive a left shift of up to 24.
+     The reusable `ShlnGadget` (already added, N-generic) and `ShrnGadget` both
+     support N=6. Light cancellation (`lshift <= 8`) is correct even in 4 bytes,
+     but soundness requires covering the heavy case too. `ShlnGadget` is committed
+     and tested standalone; the chip-level wiring is what remains.
 3. **fmul subnormal / underflow** — wire `ShrnGadget` into fmul; for
    `exp_normal ≤ 0`, shift `norm` right by `25 - exp_normal`, round, result is
    subnormal (exp field 0) or zero. Boundary: rounding up to smallest normal.
@@ -182,14 +196,17 @@ all variable shifts.
 
 ### Concrete next step
 
-**fadd/fsub cancellation (variable left-shift normalize).** Build a left-shift
-gadget `ShlnGadget` mirroring `ShrnGadget` (byte-granular + sub-byte one-hot,
-range-checked low/high witnesses) but shifting left, producing the shift amount
-= leading-zero count. Then gate the cancellation branch (`is_add=0` for fadd,
-`is_add=1` for fsub, both-normal, `raw_top < 2^23`): normalize `raw_sum` left by
-the CLZ, recompute guard/sticky from the bits shifted out, and reuse the existing
-RNE-round + output-recon helpers. The same-sign no-cancellation columns already
-added (large_sig/small_sig, align, raw_sum, rs_high7/rs_lowbit, etc.) are reused.
+**fadd/fsub cancellation with a 6-byte working field.** The variable left-shift
+gadget (`ShlnGadget`) is built and tested. To finish cancellation: add a parallel
+6-byte (48-bit) working significand for the cancellation path (implicit bit at
+47, ~3 guard/sticky bytes below the 24-bit mantissa), align the smaller operand
+into it via `ShrnGadget<6>`, subtract (borrow chain), left-normalize via
+`ShlnGadget<6>` so the leading bit reaches bit 47, then the guard/sticky/round/
+output reconstruction is the same structure as the no-cancellation path (guard =
+bit 7 of the low byte, sticky = below-guard OR lost_sticky). Gate the result
+recon on `s_cancel_normal` (result exp field in [1, 254]); subnormal/zero
+cancellation results and `ediff == 0` (same-exponent subtraction, which needs a
+mantissa sign compare) remain deferred.
 
 ## Reference pointers in the upstream openvm dep
 
