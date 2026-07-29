@@ -20,6 +20,8 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
+use crate::fp_shift::{run_shrn, ShrnCols, ShrnGadget, SHLIMB_BITS};
+
 /// Number of `lt_decomp` limbs for the 8-bit exponent comparison.
 /// Warning: requires `8.div_ceil(range_max_bits) = LT_AUX_LEN`.
 pub const LT_AUX_LEN: usize = 1;
@@ -97,6 +99,15 @@ pub struct FcvtF2ICoreCols<T> {
     pub wit: [T; 4],
     pub ws_flag: T,
     pub wu_flag: T,
+
+    // === In-range truncation (RTZ) ===
+    pub lt_aux2: LessThanAuxCols<T, LT_AUX_LEN>, // for lt_127 = (exp < 127)
+    pub lt_127: T,
+    pub s_shift: T, // sel_wit AND exp >= 127 (the truncating shift runs)
+    pub shift: T,
+    pub shrn: ShrnCols<T, 4>, // magnitude = (sig << 8) >> (158 - exp)
+    pub negate: T,            // ws_flag AND a_sign
+    pub neg_carry: [T; 4],    // two's-complement borrow chain (wit = -magnitude)
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -266,13 +277,15 @@ where
             );
             // Negative inputs convert to 0 for .wu.
             builder.when(cols.zero_res).assert_zero(cols.result[i]);
-            // In-range: the rounded integer witness.
-            // TODO: verify the RNE rounding relation between a and wit
-            // (needs shift/round machinery similar to fadd normalization).
+            // In-range: wit is constrained to the RTZ-truncated integer by
+            // eval_in_range; result mirrors wit.
             builder
                 .when(cols.sel_wit)
                 .assert_eq(cols.result[i], cols.wit[i]);
         }
+
+        // ── In-range truncation (RTZ): wit = trunc(value) ────────────────
+        self.eval_in_range(builder, cols);
 
         let expected_opcode = cols.ws_flag * AB::F::from_u32(FpOpcode::FCVT_W_S as u32)
             + cols.wu_flag * AB::F::from_u32(FpOpcode::FCVT_WU_S as u32)
@@ -292,6 +305,101 @@ where
 
     fn start_offset(&self) -> usize {
         self.offset
+    }
+}
+
+impl FcvtF2ICoreAir {
+    /// Constrain the in-range integer witness `wit` to equal `trunc(value)` (RTZ).
+    ///
+    /// The magnitude is `(sig << 7) >> (157 - exp)` where `sig = mant | 0x800000`
+    /// (the input is normal for `exp >= 127`, which is the only case where the
+    /// magnitude is nonzero). For `.w` with `a_sign`, `wit` is the two's-complement
+    /// negation of the magnitude; for `.wu` (and positive `.w`) `wit` equals it.
+    /// All other `sel_wit` rows (subnormal/zero input, or `exp < 127` ⇒ value < 1)
+    /// have `wit = 0`.
+    fn eval_in_range<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FcvtF2ICoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f158: AB::F = AB::F::from_u32(158);
+        let f255: AB::F = AB::F::from_u32(255);
+        let f256: AB::F = AB::F::from_u32(1 << SHLIMB_BITS);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
+
+        // lt_127 = (a_exp < 127).
+        let lt_air = IsLtSubAir::new(self.range_bus, 8);
+        let io = IsLessThanIo::new(
+            a_exp.clone(),
+            AB::Expr::from(f127),
+            cols.lt_127.into(),
+            cols.is_valid.into(),
+        );
+        lt_air.eval(builder, (io, &cols.lt_aux2.lower_decomp));
+        builder.assert_bool(cols.lt_127);
+
+        // s_shift = sel_wit AND (exp >= 127). For these rows the input is normal
+        // (exp in [127, 158] ⊂ [1, 254], since sat excludes exp >= 158 for .w and
+        // exp >= 159 for .wu).
+        builder.assert_eq(cols.s_shift, cols.sel_wit * (one.clone() - cols.lt_127));
+        builder.assert_bool(cols.s_shift);
+        let s_shift = cols.s_shift;
+
+        // x = sig << 8 = [0, a[0], a[1], a_mant2 + 128] (sig = mant | 0x800000).
+        // Only constrained when the shift runs; off rows zero-fill the gadget.
+        let sig2 = cols.a_mant2 + f128;
+        builder.when(s_shift).assert_zero(cols.shrn.x[0]);
+        builder.when(s_shift).assert_eq(cols.shrn.x[1], cols.a[0]);
+        builder.when(s_shift).assert_eq(cols.shrn.x[2], cols.a[1]);
+        builder.when(s_shift).assert_eq(cols.shrn.x[3], sig2);
+
+        // Truncating right shift: magnitude = x >> (158 - exp), shift in [0, 31].
+        builder
+            .when(s_shift)
+            .assert_eq(cols.shift, AB::Expr::from(f158) - a_exp.clone());
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.shrn);
+        builder.when(s_shift).assert_eq(cols.shrn.shift, cols.shift);
+        builder.assert_eq(cols.shrn.enable, s_shift);
+
+        // negate = ws AND a_sign (two's-complement for negative .w).
+        builder.assert_eq(cols.negate, cols.ws_flag * cols.a_sign);
+        builder.assert_bool(cols.negate);
+        for i in 0..4 {
+            builder.assert_bool(cols.neg_carry[i]);
+        }
+
+        // sel_wit rows where the shift does NOT run ⇒ wit = 0 (value < 1).
+        for i in 0..4 {
+            builder
+                .when(cols.sel_wit * (one.clone() - s_shift))
+                .assert_zero(cols.wit[i]);
+        }
+
+        // s_shift, !negate: wit = magnitude (shrn.y).
+        for i in 0..4 {
+            builder
+                .when(s_shift * (one.clone() - cols.negate))
+                .assert_eq(cols.wit[i], cols.shrn.y[i]);
+        }
+
+        // s_shift, negate: wit = -magnitude = ~magnitude + 1 (byte borrow chain).
+        builder.when(s_shift * cols.negate).assert_eq(
+            cols.wit[0],
+            (AB::Expr::from(f255) - cols.shrn.y[0]) + AB::Expr::ONE - cols.neg_carry[0] * f256,
+        );
+        for i in 1..4 {
+            builder.when(s_shift * cols.negate).assert_eq(
+                cols.wit[i],
+                (AB::Expr::from(f255) - cols.shrn.y[i]) + cols.neg_carry[i - 1]
+                    - cols.neg_carry[i] * f256,
+            );
+        }
     }
 }
 
@@ -482,6 +590,128 @@ where
         }
         core_row.ws_flag = F::from_bool(!is_wu);
         core_row.wu_flag = F::from_bool(is_wu);
+
+        // ── In-range truncation witness ──────────────────────────────────
+        let lt_127 = a_exp < 127;
+        self.lt_air.generate_subrow(
+            (self.range_checker.as_ref(), a_exp, 127),
+            (&mut core_row.lt_aux2.lower_decomp, &mut core_row.lt_127),
+        );
+        core_row.lt_127 = F::from_bool(lt_127);
+        let s_shift = sel_wit && !lt_127;
+        core_row.s_shift = F::from_bool(s_shift);
+        core_row.negate = F::from_bool(!is_wu && a_sign == 1);
+
+        if s_shift {
+            // x = sig << 8 = [0, a[0], a[1], a_mant2 + 128]; magnitude = x >> (158-exp).
+            let sig: u32 = (a_mant | 0x800000) & 0xFFFFFF;
+            let x_val = sig << 8;
+            let x: [u32; 4] = [
+                x_val & 0xFF,
+                (x_val >> 8) & 0xFF,
+                (x_val >> 16) & 0xFF,
+                (x_val >> 24) & 0xFF,
+            ];
+            let shift = 158 - a_exp;
+            core_row.shift = F::from_u32(shift);
+            core_row.shrn = make_shrn_cols::<F>(x, shift as usize, &self.range_checker);
+            // wit is already = result (native trunc). Verify it matches the shift
+            // + two's-complement reconstruction.
+            let mag = (sig as u64) << 8 >> shift;
+            let mag_bytes: [u32; 4] = core::array::from_fn(|i| ((mag >> (i * 8)) & 0xFF) as u32);
+            if !is_wu && a_sign == 1 {
+                // wit = -mag (two's complement). Recover the borrow chain.
+                let neg = (0u64).wrapping_sub(mag);
+                let neg_bytes: [u32; 4] =
+                    core::array::from_fn(|i| ((neg >> (i * 8)) & 0xFF) as u32);
+                let mut carry_in = 1u32; // +1 of two's complement
+                for i in 0..4 {
+                    let lhs = (255 - mag_bytes[i]) + carry_in;
+                    core_row.neg_carry[i] = F::from_u32(lhs >> 8);
+                    carry_in = lhs >> 8;
+                    debug_assert_eq!(neg_bytes[i], core_row.wit[i].as_canonical_u32());
+                }
+            } else {
+                for (i, &mb) in mag_bytes.iter().enumerate() {
+                    core_row.neg_carry[i] = F::ZERO;
+                    debug_assert_eq!(mb, core_row.wit[i].as_canonical_u32());
+                }
+            }
+        } else {
+            core_row.shift = F::ZERO;
+            core_row.shrn = ShrnCols::<F, 4>::default();
+            for i in 0..4 {
+                core_row.neg_carry[i] = F::ZERO;
+            }
+        }
+
         core_row.is_valid = F::ONE;
+    }
+}
+
+/// Build a `ShrnCols<4>` witness and register range-checker counts for ShrnGadget.
+fn make_shrn_cols<F: PrimeField32>(
+    x: [u32; 4],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 4> {
+    let shift = shift.min(4 * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = crate::fp_shift::run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; 4];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    for i in 0..4 {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
     }
 }

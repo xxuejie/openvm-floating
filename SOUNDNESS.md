@@ -34,7 +34,7 @@ Per-chip soundness of the **result**:
 | fdiv        | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fma         | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fsqrt       | ✅ (pre-existing)    | ❌ finite unconstrained           |
-| fcvt_f2i    | ✅ (pre-existing)    | ❌ in-range truncation unconstrained |
+| fcvt_f2i    | ✅                   | ✅ in-range RTZ truncation (shift + two's-complement) |
 | fcvt_i2f    | ✅ (zero only)       | ❌ RNE rounding unconstrained     |
 
 **fadd/fsub finite no-cancellation path** (new): for two normal operands whose

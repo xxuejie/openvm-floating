@@ -1480,7 +1480,23 @@ mod fuzz_tests {
     #[test]
     fn fuzz_prove_fcvt_f2i() {
         let mut rng = XorShift64::new(0xB0B0_0004);
-        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let mut cases: Vec<u32> = (0..18).map(|_| rand_bits(&mut rng)).collect();
+        // Curated in-range truncation cases exercising both .w/.wu, signs, and the
+        // exp boundaries (127, 150, 157, 158) of the new RTZ constraint.
+        cases.extend([
+            2.0f32.to_bits(),
+            (-3.0f32).to_bits(),
+            2.5f32.to_bits(),
+            (-2.5f32).to_bits(),
+            0x4affffff, // ~2^12, .w in-range
+            0xcaffffff, // large negative, .w in-range
+            0x4f7fffff, // ~2^32-128, .wu in-range (exp 158)
+            0x3f000000, // 0.5 -> trunc 0
+            0x42000000, // 8.0
+            0x4219999a, // ~9.6 -> trunc 9
+            0x80000000, // -0 -> 0
+            0x00400000, // subnormal -> 0
+        ]);
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, i| {
             if i % 2 == 0 {
                 fcvt_w_s(rd, rs1)
