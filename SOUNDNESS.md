@@ -29,7 +29,7 @@ Per-chip soundness of the **result**:
 | fminmax     | ✅                   | ✅ fully sound                    |
 | fxfer       | n/a                  | ✅ fully sound (copy)             |
 | fmul        | ✅                   | ✅ fully sound (normal + overflow + subnormal/underflow) |
-| fadd        | ✅                   | same-sign both-normal ✅ (normal+overflow+deep); cancellation / subnormal ❌ |
+| fadd        | ✅                   | same-sign ✅ + cancellation (ediff∈[1,24]) ✅; ediff=0 cancellation / subnormal ❌ |
 | fsub        | ✅                   | opposite-sign both-normal ✅ (magnitude add); cancellation / subnormal ❌ |
 | fdiv        | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fma         | ✅ (pre-existing)    | ❌ finite unconstrained           |
