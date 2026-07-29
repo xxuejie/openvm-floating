@@ -1585,6 +1585,28 @@ mod fuzz_tests {
 
     #[cfg(feature = "proving")]
     #[test]
+    fn fuzz_prove_fmul() {
+        // Deterministic set exercising normal / overflow / NaN / inf / zero paths
+        // (the first air_test for fmul — it previously had none).
+        let cases: Vec<(u32, u32)> = vec![
+            (3.0f32.to_bits(), 4.0f32.to_bits()),
+            (f32::MAX.to_bits(), f32::MAX.to_bits()),
+            (f32::NAN.to_bits(), 1.0f32.to_bits()),
+            (f32::INFINITY.to_bits(), 2.0f32.to_bits()),
+            (0.0f32.to_bits(), 5.0f32.to_bits()),
+            ((-3.0f32).to_bits(), 7.0f32.to_bits()),
+            (1.5f32.to_bits(), 1.5f32.to_bits()),
+        ];
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fmul_s(rd, rs1, rs2));
+        prove_chunk(instrs, mem);
+    }
+
+    fn sign_exp_mant(sign: u32, exp: u32, mant: u32) -> u32 {
+        (sign << 31) | (exp << 23) | (mant & 0x7FFFFF)
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
     fn fuzz_prove_fadd() {
         let mut rng = XorShift64::new(0xB0B0_0009);
         // Mix random bits (special/subnormal/subtraction) with same-sign both-normal

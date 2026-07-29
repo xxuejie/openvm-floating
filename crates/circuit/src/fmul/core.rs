@@ -514,11 +514,16 @@ impl FmulCoreAir {
         builder.assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
 
         // Sound "(r_exp_hi == 0)" and "(r_exp_hi == 127)" indicators via is-zero gadgets.
+        // Gated on is_valid: on padding rows the inverse columns are 0.
         let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
-        builder.assert_zero(cols.r_exp_hi * he0.clone());
+        builder
+            .when(cols.is_valid)
+            .assert_zero(cols.r_exp_hi * he0.clone());
         let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
         let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
-        builder.assert_zero(delta127 * he127.clone());
+        builder
+            .when(cols.is_valid)
+            .assert_zero(delta127 * he127.clone());
 
         // s_normal = s_finite AND result exp field not in {0, 255}.
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
@@ -575,12 +580,13 @@ impl FmulCoreAir {
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
 
         // eq_i = (norm_sig[i] == 255) via is-zero on (255 - norm_sig[i]).
+        // Gated on is_valid: on padding rows the inverse columns are 0.
         let d3 = AB::Expr::from(f255) - cols.norm_sig[3];
         let eq3 = one.clone() - d3.clone() * cols.m3_255_inv;
-        builder.assert_zero(d3 * eq3.clone());
+        builder.when(cols.is_valid).assert_zero(d3 * eq3.clone());
         let d4 = AB::Expr::from(f255) - cols.norm_sig[4];
         let eq4 = one.clone() - d4.clone() * cols.m4_255_inv;
-        builder.assert_zero(d4 * eq4.clone());
+        builder.when(cols.is_valid).assert_zero(d4 * eq4.clone());
         let d5 = AB::Expr::from(f255) - cols.norm_sig[5];
         let eq5 = one.clone() - d5 * cols.m5_255_inv;
         // (norm_sig[5] == 255 iff its low 7 mantissa bits are all ones, since bit
@@ -956,21 +962,12 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.s_inf = F::from_bool(s_inf);
     row.s_zero = F::from_bool(s_zero);
 
-    // Finite normal-result output reconstruction witnesses.
+    // Finite normal-result output reconstruction witnesses. (c0/c1/c2 are
+    // computed after s_finite below — they are only meaningful for finite
+    // inputs, where norm has its implicit bit at 47.)
     let nb3 = ((norm >> 24) & 0xFF) as u32;
     let nb4 = ((norm >> 32) & 0xFF) as u32;
     let nb5 = ((norm >> 40) & 0xFF) as u32;
-    let s0 = nb3 + round_up as u32;
-    let c0 = s0 >> 8;
-    let s1 = nb4 + c0;
-    let c1 = s1 >> 8;
-    // For a normal result the normalized product has its implicit bit at 47,
-    // so nb5 >= 128 and (nb5 - 128) is the top 7 mantissa bits before rounding.
-    let top7 = nb5.wrapping_sub(128);
-    let c2 = top7.wrapping_add(c1) >> 7;
-    row.c0 = F::from_u32(c0);
-    row.c1 = F::from_u32(c1);
-    row.c2 = F::from_u32(c2);
     let r_exp_hi = r_exp >> 1;
     row.r_exp_lo = F::from_u32(r_exp & 1);
     row.r_exp_hi = F::from_u32(r_exp_hi);
@@ -989,6 +986,25 @@ fn fill_fmul_witness<F: PrimeField32>(
     let s_finite = !is_nan_res && !inf_in && !zero_in;
     let s_normal = s_finite && (1..=254).contains(&r_exp);
     row.s_normal = F::from_bool(s_normal);
+
+    // Rounding carries. Only meaningful for finite inputs (norm has its implicit
+    // bit at 47, so nb5 >= 128); for special/zero inputs they are don't-care
+    // (the cascade is gated on s_finite), so set them 0 to satisfy the
+    // unconditional booleanity assertions.
+    let (c0, c1, c2) = if s_finite {
+        let s0 = nb3 + round_up as u32;
+        let c0 = s0 >> 8;
+        let s1 = nb4 + c0;
+        let c1 = s1 >> 8;
+        let top7 = nb5.wrapping_sub(128);
+        let c2 = top7.wrapping_add(c1) >> 7;
+        (c0, c1, c2)
+    } else {
+        (0u32, 0u32, 0u32)
+    };
+    row.c0 = F::from_u32(c0);
+    row.c1 = F::from_u32(c1);
+    row.c2 = F::from_u32(c2);
 
     // Overflow witnesses (eval_finite_overflow).
     let nb3 = ((norm >> 24) & 0xFF) as u32;
@@ -1450,5 +1466,66 @@ mod overflow_tests {
         let mut c = make_overflow_cols(f32::MAX.to_bits(), f32::MAX.to_bits());
         c.result[0] = F::ONE; // inf has zero mantissa
         assert!(!run(&c).ok(), "non-inf overflow result must be rejected");
+    }
+}
+
+/// A numeric builder that records the *value* of each failing constraint, to help
+/// pinpoint which constraint a full-eval failure comes from.
+#[cfg(test)]
+mod full_eval_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::range_tuple::{RangeTupleCheckerBus, RangeTupleCheckerChip};
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+
+    fn filler_cols(a: u32, b: u32) -> (FmulCoreCols<F>, Arc<RangeTupleCheckerChip<2>>) {
+        let chip = Arc::new(RangeTupleCheckerChip::new(RangeTupleCheckerBus::new(
+            0,
+            [1 << 8, 8 << 8],
+        )));
+        let mut cols = FmulCoreCols::<F>::default();
+        fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip);
+        (cols, chip)
+    }
+
+    fn air() -> FmulCoreAir {
+        FmulCoreAir::new(RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]), 0)
+    }
+
+    #[test]
+    fn full_eval_special_inputs_pass() {
+        // Run each eval helper on filler-built witness for special inputs, to see
+        // which (if any) fails — the manual numeric tests use hand-built cols.
+        for &(a, b) in &[
+            (f32::NAN.to_bits(), 1.0f32.to_bits()),
+            (f32::INFINITY.to_bits(), 2.0f32.to_bits()),
+            (0.0f32.to_bits(), 5.0f32.to_bits()),
+        ] {
+            let (cols, _chip) = filler_cols(a, b);
+            let mut b1 = NumericBuilder::new(vec![]);
+            air().eval_special_cases(&mut b1, &cols);
+            assert!(
+                b1.ok(),
+                "special a={:08x} b={:08x}: {:?}",
+                a,
+                b,
+                b1.failures
+            );
+            let mut b2 = NumericBuilder::new(vec![]);
+            air().eval_finite_output(&mut b2, &cols);
+            assert!(b2.ok(), "output a={:08x} b={:08x}: {:?}", a, b, b2.failures);
+            let mut b3 = NumericBuilder::new(vec![]);
+            air().eval_finite_overflow(&mut b3, &cols);
+            assert!(
+                b3.ok(),
+                "overflow a={:08x} b={:08x}: {:?}",
+                a,
+                b,
+                b3.failures
+            );
+        }
     }
 }
