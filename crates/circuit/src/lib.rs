@@ -28,6 +28,7 @@ pub mod fdiv;
 pub mod fma;
 pub mod fminmax;
 pub mod fmul;
+pub mod fp_shift;
 pub mod fsgnj;
 pub mod fsqrt;
 pub mod fsub;
