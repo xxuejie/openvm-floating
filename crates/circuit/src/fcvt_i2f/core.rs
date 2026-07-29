@@ -18,6 +18,8 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
+use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+
 /// IEEE 754 / RISC-V FCVT.S.W: convert i32 to f32 with RNE rounding.
 #[inline(always)]
 pub fn fcvt_s_w(x: u32) -> u32 {
@@ -55,6 +57,20 @@ pub struct FcvtI2FCoreCols<T> {
 
     pub ws_flag: T,
     pub wu_flag: T,
+
+    // === Conversion (magnitude normalize + RNE round) ===
+    pub mag: [T; 4],          // |integer| bytes (.w neg ⇒ two's complement of a)
+    pub neg_carry: [T; 4],    // two's-complement borrow chain for the magnitude
+    pub s_convert: T,         // !a_is_zero (the normalize/round path runs)
+    pub shift: T,             // result_exp - 126 (right-shift amount of x = mag<<24)
+    pub shrn: ShrnCols<T, 7>, // sig = (mag << 24) >> shift, with guard/sticky
+    pub y0_high7: T,          // shrn.y[0] >> 1
+    pub lsb: T,               // bit 0 of shrn.y[0] (mantissa LSB for RNE tie)
+    pub round_up: T,
+    pub rc0: T,     // rounding carry out of mantissa byte 0
+    pub rc1: T,     // rounding carry out of mantissa byte 1
+    pub rc2: T,     // rounding carry into the implicit bit (exponent)
+    pub rc2_rem: T, // rounded top 7 mantissa bits
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -152,9 +168,8 @@ where
             (one.clone() - cols.wu_flag) * cols.a_sign * (one.clone() - cols.a_is_zero),
         );
 
-        // TODO: verify the RNE rounding relation between the integer input
-        // and the result's exponent/mantissa (needs shift/round machinery
-        // similar to fadd normalization).
+        // ── Conversion: magnitude normalize + RNE round ─────────────────
+        self.eval_convert(builder, cols);
 
         // Range check input and result bytes.
         for i in 0..4 {
@@ -184,6 +199,146 @@ where
 
     fn start_offset(&self) -> usize {
         self.offset
+    }
+}
+
+impl FcvtI2FCoreAir {
+    /// Constrain the int→float conversion (RNE) for nonzero inputs.
+    ///
+    /// The magnitude `m = |integer|` is placed at `x = m << 24` (7 bytes); the
+    /// result significand is `sig = x >> (r_exp - 126)`, which lands the leading
+    /// bit at position 23 (the implicit bit) — the shift is forced because the
+    /// high output bytes must be zero and bit 23 must be set. RNE rounding uses
+    /// the ShrnGadget's guard/sticky plus the mantissa LSB. Zero input ⇒ +0
+    /// (handled elsewhere).
+    fn eval_convert<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FcvtI2FCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f126: AB::F = AB::F::from_u32(126);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f24: AB::F = AB::F::from_u32(24);
+        let f255: AB::F = AB::F::from_u32(255);
+        let f256: AB::F = AB::F::from_u32(1 << SHLIMB_BITS);
+        let one = AB::Expr::ONE;
+
+        let r_exp = cols.r_exp_lo + cols.r_hi * f2;
+
+        // s_convert = !a_is_zero (the normalize/round path runs on nonzero input).
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.s_convert, one.clone() - cols.a_is_zero);
+        builder.assert_bool(cols.s_convert);
+        let s = cols.s_convert;
+
+        // ── Magnitude: m = a, except .w negative ⇒ m = -a (two's complement) ──
+        let negate_input = cols.ws_flag * cols.a_sign;
+        for i in 0..4 {
+            builder.assert_bool(cols.neg_carry[i]);
+        }
+        // byte 0: mag[0] = a[0]            when !negate
+        //         mag[0] = (255-a[0])+1 - neg_carry[0]*256  when negate
+        builder
+            .when(s * (one.clone() - negate_input.clone()))
+            .assert_eq(cols.mag[0], cols.a[0]);
+        builder.when(s * negate_input.clone()).assert_eq(
+            cols.mag[0],
+            (AB::Expr::from(f255) - cols.a[0]) + AB::Expr::ONE - cols.neg_carry[0] * f256,
+        );
+        for i in 1..4 {
+            builder
+                .when(s * (one.clone() - negate_input.clone()))
+                .assert_eq(cols.mag[i], cols.a[i]);
+            builder.when(s * negate_input.clone()).assert_eq(
+                cols.mag[i],
+                (AB::Expr::from(f255) - cols.a[i]) + cols.neg_carry[i - 1]
+                    - cols.neg_carry[i] * f256,
+            );
+        }
+
+        // x = mag << 24 = [0, 0, 0, mag[0], mag[1], mag[2], mag[3]] (7 bytes).
+        builder.when(s).assert_zero(cols.shrn.x[0]);
+        builder.when(s).assert_zero(cols.shrn.x[1]);
+        builder.when(s).assert_zero(cols.shrn.x[2]);
+        builder.when(s).assert_eq(cols.shrn.x[3], cols.mag[0]);
+        builder.when(s).assert_eq(cols.shrn.x[4], cols.mag[1]);
+        builder.when(s).assert_eq(cols.shrn.x[5], cols.mag[2]);
+        builder.when(s).assert_eq(cols.shrn.x[6], cols.mag[3]);
+
+        // Right shift by (r_exp - 126 - rc2) = un-rounded exponent - 126: the shift
+        // that lands the leading bit at position 23. (r_exp = shift + 126 + rc2 is
+        // constrained below; rc2 is the rounding carry into the implicit bit.)
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.shrn);
+        builder.when(s).assert_eq(cols.shrn.shift, cols.shift);
+        builder.assert_eq(cols.shrn.enable, s);
+
+        // Bits above the 24-bit significand must be zero (forces shift large enough).
+        for i in 3..7 {
+            builder.when(s).assert_zero(cols.shrn.y[i]);
+        }
+        // Implicit bit at position 23 (forces shift small enough): shrn.y[2] >= 128,
+        // i.e. (shrn.y[2] - 128) is a 7-bit value used in the carry chain below.
+
+        // ── RNE rounding ────────────────────────────────────────────────
+        // lsb = bit 0 of shrn.y[0] (mantissa LSB); guard/sticky from the gadget.
+        builder
+            .when(s)
+            .assert_eq(cols.shrn.y[0], cols.y0_high7 * f2 + cols.lsb);
+        builder.assert_bool(cols.lsb);
+        self.range_bus
+            .range_check(cols.y0_high7.into(), 7)
+            .eval(builder, s);
+        let sticky_or_lsb = cols.shrn.sticky + cols.lsb - cols.shrn.sticky * cols.lsb;
+        builder.assert_bool(cols.shrn.guard);
+        builder.assert_bool(cols.shrn.sticky);
+        builder
+            .when(s)
+            .assert_eq(cols.round_up, cols.shrn.guard * sticky_or_lsb);
+        builder.assert_bool(cols.round_up);
+
+        // ── Output reconstruction ───────────────────────────────────────
+        // result mantissa = shrn.y[0..2] ++ (shrn.y[2]&0x7F), rounded up by round_up.
+        builder.assert_bool(cols.rc0);
+        builder.assert_bool(cols.rc1);
+        builder.assert_bool(cols.rc2);
+        builder.when(s).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            cols.shrn.y[0] + cols.round_up,
+        );
+        builder
+            .when(s)
+            .assert_eq(cols.result[1] + cols.rc1 * f256, cols.shrn.y[1] + cols.rc0);
+        // top7c = (shrn.y[2] - 128) + rc1 = rc2_rem + rc2*128.
+        builder.when(s).assert_eq(
+            (cols.shrn.y[2] - f128) + cols.rc1,
+            cols.rc2_rem + cols.rc2 * f128,
+        );
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s);
+        builder
+            .when(s)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder
+            .when(s)
+            .assert_eq(cols.result[3], cols.r_hi + cols.r_sign * f128);
+        // r_exp = shift + 126 + rc2 (exponent gains the rounding carry into the
+        // implicit bit). The result is never inf (r_exp != 255 is constrained
+        // elsewhere); rc2 ∈ {0,1} and r_exp <= 159 < 255 here.
+        builder
+            .when(s)
+            .assert_eq(r_exp.clone(), cols.shift + f126 + cols.rc2);
+        // range-check the magnitude bytes (bounds the integer input).
+        for i in 0..4 {
+            self.range_bus
+                .range_check(cols.mag[i].into(), 8)
+                .eval(builder, s);
+        }
+        let _ = (f127, f24);
     }
 }
 
@@ -352,6 +507,171 @@ where
 
         core_row.ws_flag = F::from_bool(!is_wu);
         core_row.wu_flag = F::from_bool(is_wu);
+
+        // ── Conversion witness ───────────────────────────────────────────
+        let s_convert = a_bits != 0;
+        core_row.s_convert = F::from_bool(s_convert);
+        let a_sign = (a_bits >> 31) & 1;
+        let negate_input = !is_wu && a_sign == 1;
+        // magnitude m = |integer|
+        let m: u32 = if negate_input {
+            (!a_bits).wrapping_add(1)
+        } else {
+            a_bits
+        };
+        for i in 0..4 {
+            core_row.mag[i] = F::from_u32((m >> (i * 8)) & 0xFF);
+        }
+        // Recover the negation borrow chain (only meaningful when negate_input).
+        if negate_input {
+            let mut carry_in = 1u32;
+            for i in 0..4 {
+                let lhs = (255 - ((a_bits >> (i * 8)) & 0xFF)) + carry_in;
+                core_row.neg_carry[i] = F::from_u32(lhs >> 8);
+                carry_in = lhs >> 8;
+            }
+        } else {
+            for i in 0..4 {
+                core_row.neg_carry[i] = F::ZERO;
+            }
+        }
+
+        if s_convert {
+            // x = m << 24 (7 bytes), sig = x >> shift, shift = r_exp - 126.
+            for i in 0..4 {
+                self.range_checker.add_count((m >> (i * 8)) & 0xFF, 8);
+            }
+            let x: [u32; 7] = [
+                0,
+                0,
+                0,
+                m & 0xFF,
+                (m >> 8) & 0xFF,
+                (m >> 16) & 0xFF,
+                (m >> 24) & 0xFF,
+            ];
+            // r_exp from the native result; the constraint ties shift = r_exp - 126.
+            // Recover the un-rounded exponent (rc2 may bump it by 1).
+            let p = 31 - m.leading_zeros(); // top bit position
+            let e_unrounded = p + 127;
+            core_row.shift = F::from_u32(e_unrounded - 126);
+            core_row.shrn =
+                make_shrn_cols7::<F>(x, (e_unrounded - 126) as usize, &self.range_checker);
+            let y0 = core_row.shrn.y[0].as_canonical_u32();
+            core_row.y0_high7 = F::from_u32(y0 >> 1);
+            core_row.lsb = F::from_u32(y0 & 1);
+            self.range_checker.add_count(y0 >> 1, 7);
+            let guard = core_row.shrn.guard.as_canonical_u32();
+            let sticky = core_row.shrn.sticky.as_canonical_u32() != 0;
+            let round_up = guard == 1 && (sticky || (y0 & 1) == 1);
+            core_row.round_up = F::from_bool(round_up);
+            // Mantissa rounding carry chain over result bytes.
+            let s0 = ((result) & 0xFF) as u32; // result byte 0
+            let _ = s0;
+            // Reconstruct carries from the native result vs the un-rounded sig.
+            let y0v = core_row.shrn.y[0].as_canonical_u32();
+            let y1v = core_row.shrn.y[1].as_canonical_u32();
+            let y2v = core_row.shrn.y[2].as_canonical_u32();
+            let sum0 = y0v + round_up as u32;
+            let rc0 = sum0 >> 8;
+            let sum1 = y1v + rc0;
+            let rc1 = sum1 >> 8;
+            let top7c = (y2v - 128) + rc1;
+            let rc2 = top7c >> 7;
+            let rc2_rem = top7c & 0x7F;
+            core_row.rc0 = F::from_u32(rc0);
+            core_row.rc1 = F::from_u32(rc1);
+            core_row.rc2 = F::from_u32(rc2);
+            core_row.rc2_rem = F::from_u32(rc2_rem);
+            self.range_checker.add_count(rc2_rem, 7);
+            // Sanity: the reconstructed exponent must match the native result.
+            debug_assert_eq!(
+                (e_unrounded - 126) + 126 + rc2,
+                r_exp,
+                "fcvt_i2f exp mismatch: a={:08x}",
+                a_bits
+            );
+            debug_assert_eq!((y2v - 128) + rc1, rc2_rem + rc2 * 128);
+        } else {
+            core_row.shift = F::ZERO;
+            core_row.shrn = ShrnCols::<F, 7>::default();
+            core_row.y0_high7 = F::ZERO;
+            core_row.lsb = F::ZERO;
+            core_row.round_up = F::ZERO;
+            core_row.rc0 = F::ZERO;
+            core_row.rc1 = F::ZERO;
+            core_row.rc2 = F::ZERO;
+            core_row.rc2_rem = F::ZERO;
+        }
+
         core_row.is_valid = F::ONE;
+    }
+}
+
+/// Build a `ShrnCols<7>` witness and register range-checker counts for ShrnGadget.
+fn make_shrn_cols7<F: PrimeField32>(
+    x: [u32; 7],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 7> {
+    const N: usize = 7;
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    for i in 0..N {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
     }
 }

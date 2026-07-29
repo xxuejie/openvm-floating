@@ -1511,7 +1511,24 @@ mod fuzz_tests {
     #[test]
     fn fuzz_prove_fcvt_i2f() {
         let mut rng = XorShift64::new(0xB0B0_0005);
-        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let mut cases: Vec<u32> = (0..18).map(|_| rand_bits(&mut rng)).collect();
+        // Curated cases exercising RNE rounding boundaries, signs, and magnitude
+        // negation (.w). 2^24+1/2^24+3 are tie/round-up; large values need the
+        // carry-into-exponent path; i32::MIN checks two's-complement magnitude.
+        cases.extend([
+            1,          // 1.0
+            0x01000000, // 2^24 (exact boundary)
+            0x01000001, // 2^24 + 1 (tie → even)
+            0x01000003, // 2^24 + 3 (round up)
+            0x7FFFFFFF, // i32::MAX (.w), u32 large (.wu)
+            0x80000000, // i32::MIN (.w negative, |m| = 2^31)
+            0xFFFFFFFF, // -1 (.w), u32::MAX (.wu)
+            0xC0000000, // large negative (.w)
+            0x00001234, // small positive
+            0x40000000, // 2^30
+            0x00800000, // 2^23
+            0x00800001, // 2^23 + 1
+        ]);
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, i| {
             if i % 2 == 0 {
                 fcvt_s_w(rd, rs1)

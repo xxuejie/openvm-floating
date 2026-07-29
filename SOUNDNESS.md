@@ -35,7 +35,7 @@ Per-chip soundness of the **result**:
 | fma         | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fsqrt       | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fcvt_f2i    | ✅                   | ✅ in-range RTZ truncation (shift + two's-complement) |
-| fcvt_i2f    | ✅ (zero only)       | ❌ RNE rounding unconstrained     |
+| fcvt_i2f    | ✅ (zero only)       | ✅ RNE rounding (normalize + round) |
 
 **fadd/fsub finite no-cancellation path** (new): for two normal operands whose
 exponents differ by < 25 and whose effective operation is a magnitude addition
@@ -189,8 +189,11 @@ all variable shifts.
    `exp_normal ≤ 0`, shift `norm` right by `25 - exp_normal`, round, result is
    subnormal (exp field 0) or zero. Boundary: rounding up to smallest normal.
    Deep underflow (`shift ≥ 48`) → zero.
-4. **fcvt_i2f / fcvt_f2i** — int↔float shift/round (fcvt_f2i is RTZ truncation,
-   no rounding metadata needed; fcvt_i2f is RNE with leading-zero normalize).
+4. ~~**fcvt_i2f / fcvt_f2i**~~ — **DONE.** fcvt_f2i in-range RTZ truncation
+   via `ShrnGadget<4>` + two's-complement; fcvt_i2f RNE via magnitude placement
+   `x = |int| << 24` and `ShrnGadget<7>` (`sig = x >> (exp - 126)`), with the
+   leading bit forced to position 23 and RNE rounding from the gadget's
+   guard/sticky + mantissa LSB.
 5. **fma finite** — 48-bit product + 3-way alignment + single RNE rounding.
 6. **fdiv / fsqrt finite** — long division / integer isqrt (hardest; rarest).
 
