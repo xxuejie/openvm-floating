@@ -1868,6 +1868,15 @@ mod chip_proving_tests {
     }
 
     #[test]
+    fn test_prove_fmul_overflow() {
+        // MAX * MAX = +inf (exercises the finite overflow -> inf path).
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, f32::MAX);
+        write_fp_reg(&mut mem, 2, f32::MAX);
+        prove_program(vec![fmul_s(0, 1, 2), terminate()], mem);
+    }
+
+    #[test]
     fn test_prove_fmul_edge_cases() {
         let cases: &[(u32, f32, f32)] = &[(1, 1e20, 1e-20)];
         let mut mem = SparseMemoryImage::new();
