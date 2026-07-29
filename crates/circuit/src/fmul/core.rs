@@ -114,6 +114,16 @@ pub struct FmulCoreCols<T> {
     pub s_inf: T,   // result is +-inf due to an infinite input
     pub s_zero: T,  // result is +-0 due to a zero input
 
+    // Finite normal-result output reconstruction (see eval_finite_output).
+    pub c0: T,       // carry out of mantissa byte 0 when adding round_up
+    pub c1: T,       // carry out of mantissa byte 1
+    pub c2: T,       // carry out of mantissa top 7 bits -> into exponent
+    pub r_exp_lo: T, // bit 0 of result exponent field
+    pub r_exp_hi: T, // bits [7:1] of result exponent field
+    pub r_exp_hi_zero_inv: T,
+    pub r_exp_hi_max_inv: T,
+    pub s_normal: T, // finite inputs AND result exponent field in [1, 254]
+
     pub is_valid: T,
 }
 
@@ -280,31 +290,37 @@ where
             .when(cols.is_valid)
             .assert_zero(carry[PRODUCT_NUM_LIMBS - 1].clone());
 
+        // Sound finite-input selector: normalization / output reconstruction are
+        // only meaningful when both inputs are finite and nonzero. (Selectors are
+        // constrained by eval_special_cases below; constraint order is irrelevant
+        // since they must all hold simultaneously.)
+        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
+
         // ── Phase 5: Normalization ───────────────────────────────────────
         builder.assert_bool(cols.is_high);
         // product[5] has bit 47 or bit 46 set (for normal×normal).
         // When is_high=1 (bit 47 set): product[5] = p5_lo + 128
         // When is_high=0 (bit 46 set, 47 clear): product[5] = p5_lo + 64
-        // Gate with not(is_special): zero/inf/NaN results don't have the
-        // expected leading bit, so these constraints must not fire.
+        // Gated on s_finite: zero/inf/NaN-input results don't have the expected
+        // leading bit, so these constraints must not fire for them.
         builder
             .when(cols.is_valid)
-            .when(not(cols.is_special))
+            .when(s_finite.clone())
             .when(cols.is_high)
             .assert_eq(cols.product[5], cols.p5_lo + f128);
         builder
             .when(cols.is_valid)
-            .when(not(cols.is_special))
+            .when(s_finite.clone())
             .when(not(cols.is_high))
             .assert_eq(cols.product[5], cols.p5_lo + f64);
 
-        // Verify norm_sig: when is_high, norm_sig = product; when !is_high, norm_sig = product << 1
-        // Also gate with not(is_special) for the same reason.
+        // Verify norm_sig: when is_high, norm_sig = product; when !is_high, norm_sig = product << 1.
+        // Gated on s_finite for the same reason.
         let mut shift_carry = AB::Expr::ZERO;
         for i in 0..PRODUCT_NUM_LIMBS {
             // is_high case: norm_sig[i] == product[i]
             builder
-                .when(not(cols.is_special))
+                .when(s_finite.clone())
                 .when(cols.is_high)
                 .assert_eq(cols.norm_sig[i], cols.product[i]);
 
@@ -312,7 +328,7 @@ where
             let shifted = cols.product[i] * f2 + shift_carry.clone();
             let new_carry = (shifted.clone() - cols.norm_sig[i]) * carry_divide;
             builder
-                .when(not(cols.is_special))
+                .when(s_finite.clone())
                 .when(not(cols.is_high))
                 .assert_eq(cols.norm_sig[i], shifted - new_carry.clone() * f256);
             shift_carry = new_carry;
@@ -344,22 +360,10 @@ where
         builder.assert_eq(cols.round_up, cols.guard * sticky_or_lsb);
         builder.assert_bool(cols.round_up);
 
-        // ── Phase 7: Result exponent (normal case) ──────────────────────
-        // TODO: The exponent formula does not account for rounding carry.
-        // When round_up=1 and the significand overflows (e.g., 0x7FFFFF →
-        // 0x800000 wraps to 0x000000 with exponent +1), the actual result
-        // exponent is exp_normal + 1. The full fix requires a `round_carry`
-        // column set by the filler when `round_up && norm_sig[3..5]` are
-        // all-ones, plus the constraint:
-        //   result_exp = a_exp + b_exp - 127 + is_high + round_carry
-        // For now, skip the constraint when round_up=1 (matches the
-        // circuit's TODO status — exponent verification is incomplete).
-        let exp_normal = a_exp + b_exp - AB::F::from_u32(127) + cols.is_high;
-        builder
-            .when(cols.is_valid)
-            .when(not(cols.is_special))
-            .when(not(cols.round_up))
-            .assert_eq(cols.result_exp, exp_normal);
+        // ── Phase 7: Finite normal-result output reconstruction ──────────
+        // Ties result bytes / exponent to norm_sig + round_up via a carry chain
+        // (rounding carry included). Gated on s_normal.
+        self.eval_finite_output(builder, cols);
 
         // ── Phase 8: Special-case selectors + result constraints ─────────
         self.eval_special_cases(builder, cols);
@@ -468,6 +472,78 @@ impl FmulCoreAir {
         builder
             .when(cols.s_zero)
             .assert_eq(cols.result[3], cols.result_sign * f128);
+    }
+
+    /// Constrain the finite *normal*-result output: tie the result bytes to the
+    /// (already-constrained) normalized product `norm_sig`, the RNE `round_up`,
+    /// and the exponent `a_exp + b_exp - 127 + is_high`, via a 3-byte carry
+    /// chain whose final carry adjusts the exponent. Gated on `s_normal`
+    /// (finite inputs and a normal result exponent field in [1, 254]); overflow
+    /// and subnormal/underflow results are handled separately.
+    pub fn eval_finite_output<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FmulCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
+        let exp_normal = a_exp + b_exp - f127 + cols.is_high;
+
+        // Carry / decomposition flags.
+        builder.assert_bool(cols.c0);
+        builder.assert_bool(cols.c1);
+        builder.assert_bool(cols.c2);
+        builder.assert_bool(cols.r_exp_lo);
+        builder.assert_bool(cols.s_normal);
+
+        // result_exp = r_exp_lo + 2 * r_exp_hi.
+        builder.assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
+
+        // Sound "(r_exp_hi == 0)" and "(r_exp_hi == 127)" indicators via is-zero gadgets.
+        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
+        builder.assert_zero(cols.r_exp_hi * he0.clone());
+        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
+        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
+        builder.assert_zero(delta127 * he127.clone());
+
+        // s_normal = s_finite AND result exp field not in {0, 255}.
+        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
+        let exp_is_zero = (one.clone() - cols.r_exp_lo) * he0;
+        let exp_is_max = cols.r_exp_lo * he127;
+        builder.assert_eq(
+            cols.s_normal,
+            s_finite * (one.clone() - exp_is_zero - exp_is_max),
+        );
+
+        // Output reconstruction (gated on s_normal):
+        //   result[0] = norm_sig[3]            + round_up - c0*256
+        //   result[1] = norm_sig[4]            + c0       - c1*256
+        //   result[2] = (norm_sig[5] - 128)    + c1       + (r_exp_lo - c2)*128
+        //   result[3] = r_exp_hi + result_sign*128
+        //   result_exp = exp_normal + c2
+        builder.when(cols.s_normal).assert_eq(
+            cols.result[0],
+            cols.norm_sig[3] + cols.round_up - cols.c0 * f256,
+        );
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result[1], cols.norm_sig[4] + cols.c0 - cols.c1 * f256);
+        builder.when(cols.s_normal).assert_eq(
+            cols.result[2],
+            cols.norm_sig[5] - f128 + cols.c1 + (cols.r_exp_lo - cols.c2) * f128,
+        );
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result_exp, exp_normal + cols.c2);
     }
 }
 
@@ -803,6 +879,47 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.s_inf = F::from_bool(s_inf);
     row.s_zero = F::from_bool(s_zero);
 
+    // Finite normal-result output reconstruction witnesses.
+    let nb3 = ((norm >> 24) & 0xFF) as u32;
+    let nb4 = ((norm >> 32) & 0xFF) as u32;
+    let nb5 = ((norm >> 40) & 0xFF) as u32;
+    let s0 = nb3 + round_up as u32;
+    let c0 = s0 >> 8;
+    let s1 = nb4 + c0;
+    let c1 = s1 >> 8;
+    // For a normal result the normalized product has its implicit bit at 47,
+    // so nb5 >= 128 and (nb5 - 128) is the top 7 mantissa bits before rounding.
+    let top7 = nb5.wrapping_sub(128);
+    let c2 = top7.wrapping_add(c1) >> 7;
+    row.c0 = F::from_u32(c0);
+    row.c1 = F::from_u32(c1);
+    row.c2 = F::from_u32(c2);
+    let r_exp_hi = r_exp >> 1;
+    row.r_exp_lo = F::from_u32(r_exp & 1);
+    row.r_exp_hi = F::from_u32(r_exp_hi);
+    row.r_exp_hi_zero_inv = if r_exp_hi != 0 {
+        F::from_u32(r_exp_hi).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.r_exp_hi_max_inv = if r_exp_hi != 127 {
+        (F::from_u32(127) - F::from_u32(r_exp_hi))
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let s_finite = !is_nan_res && !inf_in && !zero_in;
+    let s_normal = s_finite && (1..=254).contains(&r_exp);
+    row.s_normal = F::from_bool(s_normal);
+
+    // The reconstruction is only meaningful for normal results; sanity-check
+    // the exponent carry there so any witness drift surfaces immediately.
+    debug_assert!(
+        !s_normal || r_exp == a_exp + b_exp - 127 + is_high as u32 + c2,
+        "fmul normal-result exponent reconstruction mismatch"
+    );
+
     row.is_valid = F::ONE;
 
     let _ = (r_mant, p5_lo);
@@ -934,5 +1051,165 @@ mod special_tests {
             b.ok(),
             "finite case must not be constrained by special-case gates"
         );
+    }
+}
+
+#[cfg(test)]
+mod finite_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+
+    type F = BabyBear;
+
+    fn is_normal(bits: u32) -> bool {
+        let e = (bits >> 23) & 0xFF;
+        (1..=254).contains(&e)
+    }
+
+    /// Build a row whose finite-output fields are consistent with fmul_s(a, b),
+    /// assuming both inputs and the result are normal f32 values.
+    fn make_finite_cols(a: u32, b: u32) -> FmulCoreCols<F> {
+        let a_exp = (a >> 23) & 0xFF;
+        let b_exp = (b >> 23) & 0xFF;
+        let a_sig = (a & 0x7FFFFF) | 0x800000;
+        let b_sig = (b & 0x7FFFFF) | 0x800000;
+        let prod = (a_sig as u64) * (b_sig as u64);
+        let is_high = (prod >> 47) & 1 == 1;
+        let norm = if is_high { prod } else { prod << 1 };
+        let guard_bit = ((norm >> 23) & 1) as u32;
+        let slack = norm & 0xFFFFFF;
+        let sticky = (slack & 0x7FFFFF) != 0;
+        let mant_lsb = (norm >> 24) & 1;
+        let round_up = guard_bit == 1 && (sticky || mant_lsb == 1);
+
+        let result = fmul_s(a, b);
+        let r_exp = (result >> 23) & 0xFF;
+        let r_sign = ((a >> 31) & 1) ^ ((b >> 31) & 1);
+
+        let nb5 = ((norm >> 40) & 0xFF) as u32;
+        let s0 = ((norm >> 24) & 0xFF) as u32 + round_up as u32;
+        let c0 = s0 >> 8;
+        let s1 = ((norm >> 32) & 0xFF) as u32 + c0;
+        let c1 = s1 >> 8;
+        let top7 = nb5.wrapping_sub(128);
+        let c2 = top7.wrapping_add(c1) >> 7;
+        let r_exp_hi = r_exp >> 1;
+
+        FmulCoreCols {
+            is_high: F::from_bool(is_high),
+            round_up: F::from_bool(round_up),
+            a_exp_lo: F::from_u32(a_exp & 1),
+            a_exp_hi: F::from_u32(a_exp >> 1),
+            b_exp_lo: F::from_u32(b_exp & 1),
+            b_exp_hi: F::from_u32(b_exp >> 1),
+            result_sign: F::from_u32(r_sign),
+            result_exp: F::from_u32(r_exp),
+            norm_sig: core::array::from_fn(|i| F::from_u32((norm >> (i * 8)) as u32 & 0xFF)),
+            result: core::array::from_fn(|i| F::from_u32((result >> (i * 8)) & 0xFF)),
+            c0: F::from_u32(c0),
+            c1: F::from_u32(c1),
+            c2: F::from_u32(c2),
+            r_exp_lo: F::from_u32(r_exp & 1),
+            r_exp_hi: F::from_u32(r_exp_hi),
+            r_exp_hi_zero_inv: if r_exp_hi != 0 {
+                F::from_u32(r_exp_hi).try_inverse().unwrap_or(F::ZERO)
+            } else {
+                F::ZERO
+            },
+            r_exp_hi_max_inv: if r_exp_hi != 127 {
+                (F::from_u32(127) - F::from_u32(r_exp_hi))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            } else {
+                F::ZERO
+            },
+            s_normal: F::ONE,
+            ..Default::default()
+        }
+    }
+
+    fn run(c: &FmulCoreCols<F>) -> NumericBuilder<F> {
+        let mut b = NumericBuilder::new(vec![]);
+        FmulCoreAir::new(
+            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            0,
+        )
+        .eval_finite_output(&mut b, c);
+        b
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn normal_f32_bits(&mut self) -> u32 {
+            let sign = ((self.next() as u32) & 1) << 31;
+            let exp = (self.next() as u32 % 254) + 1;
+            let mant = (self.next() as u32) & 0x7FFFFF;
+            sign | (exp << 23) | mant
+        }
+    }
+
+    #[test]
+    fn finite_output_honest_witness_passes() {
+        let mut rng = Rng(0x0F1A_1FE5_A5A5_A5A5);
+        let mut round_up_seen = false;
+        let mut trials = 0;
+        while trials < 20000 {
+            let a = rng.normal_f32_bits();
+            let b = rng.normal_f32_bits();
+            let result = fmul_s(a, b);
+            // Only test the normal-result path here.
+            if !is_normal(result) {
+                continue;
+            }
+            trials += 1;
+            let c = make_finite_cols(a, b);
+            if c.round_up == F::ONE {
+                round_up_seen = true;
+            }
+            let bld = run(&c);
+            assert!(
+                bld.ok(),
+                "honest finite-output failed: {:?}\n a={:08x} b={:08x}",
+                bld.failures,
+                a,
+                b
+            );
+        }
+        assert!(round_up_seen, "fuzz never exercised a round_up=1 case");
+    }
+
+    #[test]
+    fn finite_output_corrupt_mantissa_rejected() {
+        let mut c = make_finite_cols(3.0f32.to_bits(), 4.0f32.to_bits());
+        c.result[0] = F::from_u32(c.result[0].as_canonical_u32() ^ 1);
+        let b = run(&c);
+        assert!(!b.ok(), "corrupted mantissa byte must be rejected");
+    }
+
+    #[test]
+    fn finite_output_corrupt_exponent_rejected() {
+        let mut c = make_finite_cols(3.0f32.to_bits(), 4.0f32.to_bits());
+        // Flip result_exp without changing r_exp_lo/r_exp_hi -> decomposition breaks.
+        c.result_exp = F::from_u32(c.result_exp.as_canonical_u32() ^ 2);
+        let b = run(&c);
+        assert!(!b.ok(), "corrupted exponent must be rejected");
+    }
+
+    #[test]
+    fn finite_output_wrong_rounding_rejected() {
+        // Force an incorrect carry -> reconstruction should fail.
+        let mut c = make_finite_cols(1.0f32.to_bits(), 1.0f32.to_bits());
+        c.c0 = F::ONE;
+        let b = run(&c);
+        assert!(!b.ok(), "incorrect carry must be rejected");
     }
 }
