@@ -37,6 +37,16 @@ pub struct ShrnCols<T, const N: usize> {
 
     // === Output ===
     pub y: [T; N], // shifted value = x >> shift, little-endian bytes
+
+    // === Rounding metadata (guard / sticky) ===
+    pub guard: T,         // bit (shift-1) of x (0 when shift == 0)
+    pub sticky: T,        // 1 iff any bit of x strictly below `guard` is set
+    pub pmsb: T,          // MSB of partial_carry = guard when r >= 1
+    pub prest: T,         // partial_carry minus its MSB (bits below guard in boundary)
+    pub hmsb: T,          // bit 7 of x[q-1] = guard when r == 0
+    pub hrest: T,         // x[q-1] minus its top bit
+    pub lost_combined: T, // sum of all bits strictly below the guard (nonzero-ness = sticky)
+    pub combined_inv: T,  // inverse for the sticky nonzero check
 }
 
 /// Variable right-shift gadget (shift value; guard/sticky to be added).
@@ -124,6 +134,102 @@ impl ShrnGadget {
                 .range_check(cols.y[k].into(), SHLIMB_BITS)
                 .eval(builder, cols.enable);
         }
+
+        self.eval_round(builder, cols);
+    }
+
+    /// Constrain the RNE rounding metadata (`guard`, `sticky`) for the shift.
+    ///
+    /// Lost bits = `x mod 2^shift`. `guard` = bit `(shift-1)`, `sticky` = any bit
+    /// below it. With `shift = 8q + r`:
+    /// - `r >= 1`: guard is bit `(r-1)` of `x[q]` = MSB of `bit_shift_carry[q]`;
+    ///   the fully-lost bytes `x[0..q-1]` and the low `(r-1)` bits of `x[q]` feed sticky.
+    /// - `r == 0`: guard is bit 7 of `x[q-1]`; sticky is the rest of `x[0..q-1]`.
+    pub fn eval_round<AB, const N: usize>(&self, builder: &mut AB, cols: &ShrnCols<AB::Var, N>)
+    where
+        AB: InteractionBuilder,
+    {
+        let f128: AB::F = AB::F::from_u32(128);
+        let one = AB::Expr::ONE;
+        let enable = cols.enable;
+
+        builder.assert_bool(cols.guard);
+        builder.assert_bool(cols.sticky);
+        builder.assert_bool(cols.pmsb);
+        builder.assert_bool(cols.hmsb);
+
+        // partial_carry = bit_shift_carry[q] = x[q] mod 2^r  (0 when r == 0).
+        let partial_carry: AB::Expr = (0..N).fold(AB::Expr::ZERO, |acc, i| {
+            acc + cols.limb_shift_marker[i] * cols.bit_shift_carry[i]
+        });
+        // highest_full = x[q-1]  (0 when q == 0).
+        let highest_full: AB::Expr = (1..N).fold(AB::Expr::ZERO, |acc, i| {
+            acc + cols.limb_shift_marker[i] * cols.x[i - 1]
+        });
+
+        // prefix[i] = x[0]+...+x[i-1]
+        let mut prefix: Vec<AB::Expr> = Vec::with_capacity(N + 1);
+        prefix.push(AB::Expr::ZERO);
+        for i in 0..N {
+            prefix.push(prefix[i].clone() + cols.x[i]);
+        }
+        // Sum of fully-lost bytes:
+        //   r >= 1: x[0..q-1]  = prefix[q]
+        //   r == 0: x[0..q-2]  = prefix[q-1]
+        let full_rge1: AB::Expr = (0..N).fold(AB::Expr::ZERO, |acc, i| {
+            acc + cols.limb_shift_marker[i] * prefix[i].clone()
+        });
+        let full_r0: AB::Expr = (1..N).fold(AB::Expr::ZERO, |acc, i| {
+            acc + cols.limb_shift_marker[i] * prefix[i - 1].clone()
+        });
+
+        // Decompose partial_carry = prest + pmsb * 2^(r-1) for r >= 1; range-check prest.
+        for j in 1..SHLIMB_BITS {
+            let cnt = enable * cols.bit_shift_marker[j];
+            builder
+                .when(enable)
+                .when(cols.bit_shift_marker[j])
+                .assert_eq(
+                    partial_carry.clone(),
+                    cols.prest + cols.pmsb * AB::F::from_usize(1 << (j - 1)),
+                );
+            self.range_bus
+                .send(cols.prest, AB::Expr::from_usize(j - 1))
+                .eval(builder, cnt);
+        }
+        // Decompose highest_full = hrest + hmsb * 128 for r == 0; range-check hrest.
+        builder
+            .when(enable)
+            .when(cols.bit_shift_marker[0])
+            .assert_eq(highest_full.clone(), cols.hrest + cols.hmsb * f128);
+        self.range_bus
+            .range_check(cols.hrest, 7)
+            .eval(builder, enable * cols.bit_shift_marker[0]);
+
+        // guard = rsl[0]*hmsb + (1 - rsl[0])*pmsb
+        let not_r0 = one.clone() - cols.bit_shift_marker[0];
+        builder.when(enable).assert_eq(
+            cols.guard,
+            cols.bit_shift_marker[0] * cols.hmsb + not_r0.clone() * cols.pmsb,
+        );
+
+        // lost_combined = sum of all bits strictly below the guard.
+        //   r >= 1: prest + full_rge1
+        //   r == 0: hrest + full_r0
+        builder.when(enable).assert_eq(
+            cols.lost_combined,
+            not_r0.clone() * (cols.prest + full_rge1)
+                + cols.bit_shift_marker[0] * (cols.hrest + full_r0),
+        );
+
+        // sticky = (lost_combined != 0):  sticky = lost_combined * inv,
+        // and lost_combined * sticky == lost_combined (forces sticky=1 when nonzero).
+        builder
+            .when(enable)
+            .assert_eq(cols.sticky, cols.lost_combined * cols.combined_inv);
+        builder
+            .when(enable)
+            .assert_zero(cols.lost_combined * cols.sticky - cols.lost_combined);
     }
 }
 
@@ -140,12 +246,30 @@ pub fn run_shrn<const N: usize>(x: &[u32; N], shift: usize) -> ([u32; N], usize,
     (y, limb_shift, bit_shift)
 }
 
+/// Host-side guard/sticky for rounding `x >> shift`: guard = bit (shift-1),
+/// sticky = any bit strictly below the guard is set.
+pub fn run_shrn_round<const N: usize>(x: &[u32; N], shift: usize) -> (u32, bool) {
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let val: u128 = (0..N).fold(0u128, |acc, i| acc | ((x[i] as u128) << (i * SHLIMB_BITS)));
+    let guard = if shift >= 1 {
+        ((val >> (shift - 1)) & 1) as u32
+    } else {
+        0
+    };
+    let sticky = if shift >= 1 {
+        (val & ((1u128 << (shift - 1)) - 1)) != 0
+    } else {
+        false
+    };
+    (guard, sticky)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::NumericBuilder;
     use openvm_circuit_primitives::var_range::VariableRangeCheckerBus;
-    use openvm_stark_backend::p3_field::PrimeField32;
+    use openvm_stark_backend::p3_field::{Field, PrimeField32};
     use openvm_stark_sdk::p3_baby_bear::BabyBear;
 
     type F = BabyBear;
@@ -153,22 +277,56 @@ mod tests {
 
     fn make_cols(x: [u32; N], shift: usize) -> ShrnCols<F, N> {
         let shift = shift.min(N * SHLIMB_BITS - 1);
-        let (y, limb_shift, bit_shift) = run_shrn(&x, shift);
+        let (y, q, r) = run_shrn(&x, shift);
+        let (guard, sticky) = run_shrn_round(&x, shift);
         let mut limb_shift_marker = [F::ZERO; N];
         let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
-        limb_shift_marker[limb_shift] = F::ONE;
-        bit_shift_marker[bit_shift] = F::ONE;
-        let bit_shift_carry =
-            core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << bit_shift) - 1)));
+        limb_shift_marker[q] = F::ONE;
+        bit_shift_marker[r] = F::ONE;
+
+        // partial-carry decomposition (r >= 1)
+        let pc = x[q] & ((1u32 << r) - 1);
+        let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+        let prest = if r >= 1 {
+            pc - pmsb * (1u32 << (r - 1))
+        } else {
+            0
+        };
+        // highest fully-lost byte decomposition (r == 0)
+        let hf = if q >= 1 { x[q - 1] } else { 0 };
+        let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+        let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+        // lost-combined (sum of bits strictly below the guard)
+        let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+        let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+        let lost_combined = if r >= 1 {
+            prest + full_rge1
+        } else {
+            hrest + full_r0
+        };
+        let combined_inv = if lost_combined != 0 {
+            F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+
         ShrnCols {
             x: core::array::from_fn(|i| F::from_u32(x[i])),
             shift: F::from_u32(shift as u32),
             enable: F::ONE,
             limb_shift_marker,
             bit_shift_marker,
-            bit_mult: F::from_u32(1u32 << bit_shift),
-            bit_shift_carry,
+            bit_mult: F::from_u32(1u32 << r),
+            bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
             y: core::array::from_fn(|i| F::from_u32(y[i])),
+            guard: F::from_u32(guard),
+            sticky: F::from_bool(sticky),
+            pmsb: F::from_u32(pmsb),
+            prest: F::from_u32(prest),
+            hmsb: F::from_u32(hmsb),
+            hrest: F::from_u32(hrest),
+            lost_combined: F::from_u32(lost_combined),
+            combined_inv,
         }
     }
 
@@ -231,5 +389,97 @@ mod tests {
         c.y[0] = F::from_u32(222);
         let b = run(&c);
         assert!(b.ok(), "disabled gadget must not constrain");
+    }
+
+    #[test]
+    fn shrn_guard_sticky_match_host() {
+        let mut rng = 0x1234_9876_CAFE_BABEu64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u32
+        };
+        for _ in 0..8000 {
+            let x: [u32; N] = core::array::from_fn(|_| next() & 0xFF);
+            let shift = (next() as usize) % (N * SHLIMB_BITS);
+            let c = make_cols(x, shift);
+            // honest witness must pass all constraints (incl. guard/sticky)
+            let b = run(&c);
+            assert!(b.ok(), "shift {} of {:?}: {:?}", shift, x, b.failures);
+            // and the witness guard/sticky must match the host computation
+            let (g, s) = run_shrn_round(&x, shift);
+            assert_eq!(
+                c.guard.as_canonical_u32(),
+                g,
+                "guard shift {} x={:?}",
+                shift,
+                x
+            );
+            assert_eq!(
+                c.sticky.as_canonical_u32(),
+                s as u32,
+                "sticky shift {} x={:?}",
+                shift,
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn shrn_guard_sticky_known_values() {
+        // shift 1: guard = bit 0, sticky = 0
+        let c = make_cols([0b0000_0001, 0, 0, 0, 0, 0], 1);
+        assert_eq!(
+            (c.guard.as_canonical_u32(), c.sticky.as_canonical_u32()),
+            (1, 0)
+        );
+        // shift 3: guard = bit 2 (=1), sticky = bits[0,1] (=1,0) -> 1
+        let c = make_cols([0b0000_0101, 0, 0, 0, 0, 0], 3);
+        assert_eq!(
+            (c.guard.as_canonical_u32(), c.sticky.as_canonical_u32()),
+            (1, 1)
+        );
+        // shift 8: guard = bit 7 of byte0 (=1), sticky = bits[0..7] (=0) -> 0
+        let c = make_cols([0x80, 0, 0, 0, 0, 0], 8);
+        assert_eq!(
+            (c.guard.as_canonical_u32(), c.sticky.as_canonical_u32()),
+            (1, 0)
+        );
+        // shift 9: guard = bit 0 of byte1 (=1), sticky = all of byte0 (=0x37) -> 1
+        let c = make_cols([0x37, 0x01, 0, 0, 0, 0], 9);
+        assert_eq!(
+            (c.guard.as_canonical_u32(), c.sticky.as_canonical_u32()),
+            (1, 1)
+        );
+        // shift 16: guard = bit 7 of byte1 (=1), sticky = bits below
+        let c = make_cols([0xFF, 0x80, 0, 0, 0, 0], 16);
+        assert_eq!(
+            (c.guard.as_canonical_u32(), c.sticky.as_canonical_u32()),
+            (1, 1)
+        );
+        // shift 0: no rounding
+        let c = make_cols([0xFF, 0x80, 0x01, 0x00, 0xAB, 0xCD], 0);
+        assert_eq!(
+            (c.guard.as_canonical_u32(), c.sticky.as_canonical_u32()),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn shrn_corrupt_guard_rejected() {
+        // Flip the guard bit to a wrong value -> must fail.
+        let mut c = make_cols([0xFF, 0x80, 0x01, 0x00, 0xAB, 0xCD], 13);
+        c.guard = F::from_u32(1 - c.guard.as_canonical_u32());
+        let b = run(&c);
+        assert!(!b.ok(), "corrupted guard must be rejected");
+    }
+
+    #[test]
+    fn shrn_corrupt_sticky_rejected() {
+        let mut c = make_cols([0xFF, 0x80, 0x01, 0x00, 0xAB, 0xCD], 13);
+        c.sticky = F::from_u32(1 - c.sticky.as_canonical_u32());
+        let b = run(&c);
+        assert!(!b.ok(), "corrupted sticky must be rejected");
     }
 }
