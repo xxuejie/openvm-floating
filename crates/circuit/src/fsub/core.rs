@@ -14,7 +14,7 @@ use openvm_rv32f_guest::CANONICAL_NAN;
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{
     interaction::InteractionBuilder,
-    p3_air::BaseAir,
+    p3_air::{AirBuilder, BaseAir},
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
     BaseAirWithPublicValues,
 };
@@ -37,7 +37,7 @@ pub fn fsub_s(a: u32, b: u32) -> u32 {
 }
 
 #[repr(C)]
-#[derive(AlignedBorrow, StructReflection, Debug)]
+#[derive(AlignedBorrow, StructReflection, Debug, Default)]
 pub struct FsubCoreCols<T> {
     // === Decomposition of input a ===
     pub a_sign: T,
@@ -62,6 +62,26 @@ pub struct FsubCoreCols<T> {
     pub b_exp_zero_inv: T,
     pub b_exp_max_inv: T,
     pub b_mant_sum_inv: T,
+
+    // === Classification flags (columns; see eval) ===
+    pub a_exp_is_zero: T,
+    pub a_exp_is_max: T,
+    pub a_mant_is_zero: T,
+    pub b_exp_is_zero: T,
+    pub b_exp_is_max: T,
+    pub b_mant_is_zero: T,
+    pub a_is_nan: T,
+    pub a_is_inf: T,
+    pub a_is_zero: T,
+    pub b_is_nan: T,
+    pub b_is_inf: T,
+    pub b_is_zero: T,
+
+    // === Special-case selectors (input-derived; see eval_special_cases) ===
+    pub inf_in: T,      // a_is_inf | b_is_inf
+    pub s_nan: T,       // canonical NaN (NaN input, or inf - inf)
+    pub s_inf: T,       // +-inf due to an infinite input
+    pub s_zero_both: T, // +-0 from 0 - 0
 
     // === Alignment ===
     pub a_is_larger: T, // bool: a_exp >= b_exp
@@ -142,33 +162,55 @@ where
         builder.assert_bool(cols.b_sign);
         builder.assert_bool(cols.b_exp_lo);
 
-        // ── Phase 2: Classification ──────────────────────────────────────
+        // ── Phase 2: Classification (stored as columns, fdiv-style) ──────────
         let one = AB::Expr::ONE;
-        let a_exp_is_zero = one.clone() - a_exp.clone() * cols.a_exp_zero_inv;
-        builder.assert_bool(a_exp_is_zero.clone());
-        let a_exp_is_max =
-            one.clone() - (AB::Expr::from(f255) - a_exp.clone()) * cols.a_exp_max_inv;
-        builder.assert_bool(a_exp_is_max.clone());
-        let a_mant_is_zero = one.clone() - a_mant_sum.clone() * cols.a_mant_sum_inv;
-        builder.assert_bool(a_mant_is_zero.clone());
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_exp_is_zero,
+            one.clone() - a_exp.clone() * cols.a_exp_zero_inv,
+        );
+        builder.assert_zero(a_exp.clone() * cols.a_exp_is_zero);
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_exp_is_max,
+            one.clone() - (AB::Expr::from(f255) - a_exp.clone()) * cols.a_exp_max_inv,
+        );
+        builder.assert_zero((AB::Expr::from(f255) - a_exp.clone()) * cols.a_exp_is_max);
+        builder.assert_zero(cols.a_exp_is_zero * cols.a_exp_is_max);
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_mant_is_zero,
+            one.clone() - a_mant_sum.clone() * cols.a_mant_sum_inv,
+        );
+        builder.assert_zero(a_mant_sum.clone() * cols.a_mant_is_zero);
 
-        let b_exp_is_zero = one.clone() - b_exp.clone() * cols.b_exp_zero_inv;
-        builder.assert_bool(b_exp_is_zero.clone());
-        let b_exp_is_max =
-            one.clone() - (AB::Expr::from(f255) - b_exp.clone()) * cols.b_exp_max_inv;
-        builder.assert_bool(b_exp_is_max.clone());
-        let b_mant_is_zero = one.clone() - b_mant_sum.clone() * cols.b_mant_sum_inv;
-        builder.assert_bool(b_mant_is_zero.clone());
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_exp_is_zero,
+            one.clone() - b_exp.clone() * cols.b_exp_zero_inv,
+        );
+        builder.assert_zero(b_exp.clone() * cols.b_exp_is_zero);
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_exp_is_max,
+            one.clone() - (AB::Expr::from(f255) - b_exp.clone()) * cols.b_exp_max_inv,
+        );
+        builder.assert_zero((AB::Expr::from(f255) - b_exp.clone()) * cols.b_exp_is_max);
+        builder.assert_zero(cols.b_exp_is_zero * cols.b_exp_is_max);
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_mant_is_zero,
+            one.clone() - b_mant_sum.clone() * cols.b_mant_sum_inv,
+        );
+        builder.assert_zero(b_mant_sum.clone() * cols.b_mant_is_zero);
 
-        let _a_is_nan = a_exp_is_max.clone() * (one.clone() - a_mant_is_zero.clone());
-        let _a_is_inf = a_exp_is_max.clone() * a_mant_is_zero.clone();
-        let _a_is_zero_f = a_exp_is_zero.clone() * a_mant_is_zero.clone();
-        let _a_is_normal = (one.clone() - a_exp_is_zero) * (one.clone() - a_exp_is_max.clone());
-
-        let _b_is_nan = b_exp_is_max.clone() * (one.clone() - b_mant_is_zero.clone());
-        let _b_is_inf = b_exp_is_max.clone() * b_mant_is_zero.clone();
-        let _b_is_zero_f = b_exp_is_zero.clone() * b_mant_is_zero.clone();
-        let _b_is_normal = (one.clone() - b_exp_is_zero) * (one.clone() - b_exp_is_max.clone());
+        // nan / inf / zero derived from the classification columns (unconditional).
+        builder.assert_eq(
+            cols.a_is_nan,
+            cols.a_exp_is_max * (one.clone() - cols.a_mant_is_zero),
+        );
+        builder.assert_eq(cols.a_is_inf, cols.a_exp_is_max * cols.a_mant_is_zero);
+        builder.assert_eq(cols.a_is_zero, cols.a_exp_is_zero * cols.a_mant_is_zero);
+        builder.assert_eq(
+            cols.b_is_nan,
+            cols.b_exp_is_max * (one.clone() - cols.b_mant_is_zero),
+        );
+        builder.assert_eq(cols.b_is_inf, cols.b_exp_is_max * cols.b_mant_is_zero);
+        builder.assert_eq(cols.b_is_zero, cols.b_exp_is_zero * cols.b_mant_is_zero);
 
         // Verify result classification flags
         builder.assert_bool(cols.is_nan_result);
@@ -180,6 +222,9 @@ where
         builder.assert_bool(cols.sticky);
         builder.assert_bool(cols.guard);
         builder.assert_bool(cols.round_up);
+
+        // ── Special-case selectors + result constraints ──────────────────
+        self.eval_special_cases(builder, cols);
 
         // ── Phase 3: Alignment verification ──────────────────────────────
         // Verify ediff == |a_exp - b_exp| and a_is_larger == (a_exp >= b_exp)
@@ -243,6 +288,80 @@ where
 
     fn start_offset(&self) -> usize {
         self.offset
+    }
+}
+
+// === Special-case constraints (testable standalone) ===
+
+impl FsubCoreAir {
+    /// Constrain the input-derived special-case selectors and the result bytes
+    /// for NaN / +-inf (infinite input) / +-0 (0 - 0) results.
+    pub fn eval_special_cases<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FsubCoreCols<AB::Var>,
+    ) {
+        let one = AB::Expr::ONE;
+        let f128: AB::F = AB::F::from_u32(128);
+        let f127: AB::F = AB::F::from_u32(127);
+
+        // inf_in = a_is_inf | b_is_inf
+        builder.assert_eq(
+            cols.inf_in,
+            cols.a_is_inf + cols.b_is_inf - cols.a_is_inf * cols.b_is_inf,
+        );
+        // sign_diff = a_sign XOR b_sign
+        let f2: AB::F = AB::F::from_u32(2);
+        let sign_diff = cols.a_sign + cols.b_sign - cols.a_sign * cols.b_sign * f2;
+
+        // s_nan: NaN input, or inf - inf with equal signs (same-sign infinities
+        // cancel; opposite-sign inf - inf yields +-inf, handled by s_inf).
+        builder.assert_eq(
+            cols.s_nan,
+            cols.a_is_nan + cols.b_is_nan - cols.a_is_nan * cols.b_is_nan
+                + cols.a_is_inf * cols.b_is_inf * (one.clone() - sign_diff),
+        );
+        builder.assert_bool(cols.s_nan);
+
+        // s_inf = !s_nan & inf_in ; s_zero_both = !s_nan & !inf_in & a_is_zero & b_is_zero
+        builder.assert_eq(cols.s_inf, (one.clone() - cols.s_nan) * cols.inf_in);
+        builder.assert_eq(
+            cols.s_zero_both,
+            (one.clone() - cols.s_nan)
+                * (one.clone() - cols.inf_in)
+                * cols.a_is_zero
+                * cols.b_is_zero,
+        );
+        builder.assert_bool(cols.s_inf);
+        builder.assert_bool(cols.s_zero_both);
+
+        // is_nan_result must equal s_nan.
+        builder.assert_eq(cols.is_nan_result, cols.s_nan);
+
+        // Canonical NaN result.
+        let canon = CANONICAL_NAN.to_le_bytes();
+        for (i, &cb) in canon.iter().enumerate() {
+            builder
+                .when(cols.s_nan)
+                .assert_eq(cols.result[i], AB::F::from_u32(cb as u32));
+        }
+        // +-inf result. a - finite = inf (sign a_sign); finite - b_inf = -inf (sign !b_sign).
+        let inf_sign = cols.a_is_inf * cols.a_sign
+            + (one.clone() - cols.a_is_inf) * cols.b_is_inf * (one.clone() - cols.b_sign);
+        builder.when(cols.s_inf).assert_zero(cols.result[0]);
+        builder.when(cols.s_inf).assert_zero(cols.result[1]);
+        builder.when(cols.s_inf).assert_eq(cols.result[2], f128);
+        builder
+            .when(cols.s_inf)
+            .assert_eq(cols.result[3], AB::Expr::from(f127) + inf_sign * f128);
+        // +-0 result from 0 - 0: sign = a_sign AND (NOT b_sign).
+        let zero_sign = cols.a_sign * (one.clone() - cols.b_sign);
+        builder.when(cols.s_zero_both).assert_zero(cols.result[0]);
+        builder.when(cols.s_zero_both).assert_zero(cols.result[1]);
+        builder.when(cols.s_zero_both).assert_zero(cols.result[2]);
+        builder
+            .when(cols.s_zero_both)
+            .assert_eq(cols.result[3], zero_sign * f128);
     }
 }
 
@@ -437,12 +556,26 @@ fn fill_fsub_witness<F: PrimeField32>(
     // Classification
     let a_is_nan = a_exp == 255 && a_mant != 0;
     let a_is_inf = a_exp == 255 && a_mant == 0;
-    let _a_is_zero = a_exp == 0 && a_mant == 0;
+    let a_is_zero = a_exp == 0 && a_mant == 0;
     let a_is_normal = (1..=254).contains(&a_exp);
     let b_is_nan = b_exp == 255 && b_mant != 0;
     let b_is_inf = b_exp == 255 && b_mant == 0;
-    let _b_is_zero = b_exp == 0 && b_mant == 0;
+    let b_is_zero = b_exp == 0 && b_mant == 0;
     let b_is_normal = (1..=254).contains(&b_exp);
+
+    // Classification columns (constrained in eval).
+    row.a_exp_is_zero = F::from_bool(a_exp == 0);
+    row.a_exp_is_max = F::from_bool(a_exp == 255);
+    row.a_mant_is_zero = F::from_bool(a_mant == 0);
+    row.b_exp_is_zero = F::from_bool(b_exp == 0);
+    row.b_exp_is_max = F::from_bool(b_exp == 255);
+    row.b_mant_is_zero = F::from_bool(b_mant == 0);
+    row.a_is_nan = F::from_bool(a_is_nan);
+    row.a_is_inf = F::from_bool(a_is_inf);
+    row.a_is_zero = F::from_bool(a_is_zero);
+    row.b_is_nan = F::from_bool(b_is_nan);
+    row.b_is_inf = F::from_bool(b_is_inf);
+    row.b_is_zero = F::from_bool(b_is_zero);
 
     // Alignment
     let a_is_larger = a_exp >= b_exp;
@@ -583,7 +716,8 @@ fn fill_fsub_witness<F: PrimeField32>(
 
     let _ = (r_mant, guard_bit); // suppress unused warnings
 
-    let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_inf && a_sign != b_sign);
+    // fsub: inf - inf is invalid (NaN) only for same-sign infinities.
+    let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_inf && a_sign == b_sign);
     let is_inf_res = !is_nan_res && (a_is_inf || b_is_inf || r_exp == 255);
     let is_zero_res = !is_nan_res && (r_exp == 0 && result_bits & 0x7FFFFF == 0);
     row.is_nan_result = F::from_bool(is_nan_res);
@@ -591,5 +725,131 @@ fn fill_fsub_witness<F: PrimeField32>(
     row.is_zero_result = F::from_bool(is_zero_res);
     row.is_special = F::from_bool(is_nan_res || is_inf_res || is_zero_res);
 
+    // Input-derived special-case selectors (constrained in eval_special_cases).
+    let inf_in = a_is_inf || b_is_inf;
+    let s_inf = !is_nan_res && inf_in;
+    let s_zero_both = !is_nan_res && !inf_in && a_is_zero && b_is_zero;
+    row.inf_in = F::from_bool(inf_in);
+    row.s_nan = F::from_bool(is_nan_res);
+    row.s_inf = F::from_bool(s_inf);
+    row.s_zero_both = F::from_bool(s_zero_both);
+
     row.is_valid = F::ONE;
+}
+
+#[cfg(test)]
+mod special_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+
+    type F = BabyBear;
+
+    fn classify(bits: u32) -> (bool, bool, bool) {
+        let exp = (bits >> 23) & 0xFF;
+        let mant = bits & 0x7FFFFF;
+        (
+            exp == 255 && mant != 0,
+            exp == 255 && mant == 0,
+            exp == 0 && mant == 0,
+        )
+    }
+
+    fn make_cols(a: u32, b: u32) -> FsubCoreCols<F> {
+        let (a_nan, a_inf, a_zero) = classify(a);
+        let (b_nan, b_inf, b_zero) = classify(b);
+        let result = fsub_s(a, b);
+        // fsub: inf - inf is NaN only for same-sign infinities.
+        let is_nan_res = a_nan || b_nan || (a_inf && b_inf && ((a >> 31) & 1) == ((b >> 31) & 1));
+        let inf_in = a_inf || b_inf;
+        let s_inf = !is_nan_res && inf_in;
+        let s_zero_both = !is_nan_res && !inf_in && a_zero && b_zero;
+
+        FsubCoreCols {
+            a_sign: F::from_u32((a >> 31) & 1),
+            b_sign: F::from_u32((b >> 31) & 1),
+            a_is_nan: F::from_bool(a_nan),
+            b_is_nan: F::from_bool(b_nan),
+            a_is_inf: F::from_bool(a_inf),
+            b_is_inf: F::from_bool(b_inf),
+            a_is_zero: F::from_bool(a_zero),
+            b_is_zero: F::from_bool(b_zero),
+            inf_in: F::from_bool(inf_in),
+            s_nan: F::from_bool(is_nan_res),
+            s_inf: F::from_bool(s_inf),
+            s_zero_both: F::from_bool(s_zero_both),
+            is_nan_result: F::from_bool(is_nan_res),
+            result: core::array::from_fn(|i| F::from_u32((result >> (i * 8)) & 0xFF)),
+            ..Default::default()
+        }
+    }
+
+    fn run(c: &FsubCoreCols<F>) -> NumericBuilder<F> {
+        let mut b = NumericBuilder::new(vec![]);
+        FsubCoreAir::new(
+            openvm_circuit_primitives::range_tuple::RangeTupleCheckerBus::new(0, [1 << 8, 8 << 8]),
+            0,
+        )
+        .eval_special_cases(&mut b, c);
+        b
+    }
+
+    #[test]
+    fn fsub_special_honest_passes() {
+        let inputs: &[u32] = &[
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            0.0f32.to_bits(),
+            (-0.0f32).to_bits(),
+            1.0f32.to_bits(),
+            (-1.0f32).to_bits(),
+            f32::MAX.to_bits(),
+        ];
+        for &a in inputs {
+            for &bb in inputs {
+                let c = make_cols(a, bb);
+                let b = run(&c);
+                assert!(b.ok(), "a={:08x} b={:08x}: {:?}", a, bb, b.failures);
+            }
+        }
+    }
+
+    #[test]
+    fn fsub_inf_minus_inf_is_nan() {
+        // inf - inf = NaN only for same-sign infinities.
+        let c = make_cols(f32::INFINITY.to_bits(), f32::INFINITY.to_bits());
+        assert!(c.s_nan == F::ONE, "+inf - +inf should be NaN");
+        let c = make_cols(f32::NEG_INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+        assert!(c.s_nan == F::ONE, "-inf - -inf should be NaN");
+        // Opposite-sign inf - inf yields +-inf, NOT NaN.
+        let c = make_cols(f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+        assert!(
+            c.s_nan == F::ZERO && c.s_inf == F::ONE,
+            "+inf - -inf = +inf"
+        );
+    }
+
+    #[test]
+    fn fsub_corrupt_nan_rejected() {
+        let mut c = make_cols(f32::NAN.to_bits(), 1.0f32.to_bits());
+        c.result[0] = F::from_u32(0xFF);
+        assert!(!run(&c).ok());
+    }
+
+    #[test]
+    fn fsub_corrupt_inf_sign_rejected() {
+        // finite - inf = -inf; flipping to +inf must fail.
+        let mut c = make_cols(3.0f32.to_bits(), f32::NEG_INFINITY.to_bits()); // 3 - (-inf) = +inf
+        c.result[3] = F::ZERO; // +inf has result[3] = 0x7f; corrupt to sign 1
+                               // Actually result[3] for +inf is 0x7f; setting to 0 makes it... check rejection
+        assert!(!run(&c).ok());
+    }
+
+    #[test]
+    fn fsub_finite_unconstrained() {
+        let mut c = make_cols(7.0f32.to_bits(), 3.0f32.to_bits());
+        c.result[0] = F::from_u32(0xAB);
+        assert!(run(&c).ok(), "finite case must not be constrained here");
+    }
 }

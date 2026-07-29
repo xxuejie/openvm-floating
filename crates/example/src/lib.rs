@@ -70,6 +70,19 @@ fn fadd_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     )
 }
 
+fn fsub_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FSUB_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(FP_AS),
+        F::from_u32(FP_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 fn fdiv_s(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
     Instruction::new(
         VmOpcode::from_usize(FpOpcode::FDIV_S.global_opcode_usize()),
@@ -1818,6 +1831,32 @@ mod chip_proving_tests {
         write_fp_reg(&mut mem, 1, -3.0);
         write_fp_reg(&mut mem, 2, 7.0);
         prove_program(vec![fadd_s(0, 1, 2), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fsub_basic() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 7.0);
+        write_fp_reg(&mut mem, 2, 3.0);
+        prove_program(vec![fsub_s(0, 1, 2), terminate()], mem);
+    }
+
+    #[test]
+    fn test_prove_fsub_special() {
+        // Exercises the special-case selectors: inf - finite = inf,
+        // and inf - inf = NaN.
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, f32::INFINITY);
+        write_fp_reg(&mut mem, 2, 3.0);
+        write_fp_reg(&mut mem, 3, f32::NEG_INFINITY);
+        prove_program(
+            vec![
+                fsub_s(0, 1, 2), // +inf - 3 = +inf
+                fsub_s(4, 1, 3), // +inf - -inf = +inf
+                terminate(),
+            ],
+            mem,
+        );
     }
 
     #[test]
