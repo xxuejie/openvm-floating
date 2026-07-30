@@ -157,9 +157,11 @@ pub struct FsubCoreCols<T> {
     pub ediff_nz: T,
     pub ediff_nz_inv: T,
     pub s_fb: T,
-    pub s_one_zero: T, // finite AND exactly one input is zero
-    pub s_cancel: T,   // finite AND is_add (same sign) AND both-normal AND !is_deep
-    pub a_ge_b: T,     // bool: a_sig >= b_sig (magnitude compare for ediff=0)
+    pub s_bn: T,         // finite AND both normal (cancellation path)
+    pub s_one_zero: T,   // finite AND exactly one input is zero
+    pub s_sub_result: T, // shallow AND result exp field == 0 (subnormal/zero)
+    pub s_cancel: T,     // s_bn AND is_add (same sign) AND !is_deep
+    pub a_ge_b: T,       // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T,
 
     // === Result ===
@@ -717,6 +719,9 @@ impl FsubCoreAir {
         builder.assert_eq(cols.s_overflow, s_shallow * exp_field_max.clone());
         builder.assert_bool(cols.s_normal);
         builder.assert_bool(cols.s_overflow);
+        // s_sub_result = shallow AND result exp field == 0.
+        builder.assert_eq(cols.s_sub_result, s_shallow * exp_field_zero.clone());
+        builder.assert_bool(cols.s_sub_result);
 
         // Normal result: tie mantissa bytes to the rounded significand.
         builder.when(cols.s_normal).assert_eq(
@@ -736,6 +741,29 @@ impl FsubCoreAir {
         builder
             .when(cols.s_overflow)
             .assert_eq(cols.result[2], f128);
+        // Subnormal result: no implicit bit to strip from norm_sig[3].
+        let ssr = cols.s_sub_result;
+        builder.when(ssr).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            cols.norm_sig[1] + cols.round_up,
+        );
+        builder.when(ssr).assert_eq(
+            cols.result[1] + cols.rc1 * f256,
+            cols.norm_sig[2] + cols.rc0,
+        );
+        builder
+            .when(ssr)
+            .assert_eq(cols.norm_sig[3] + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, ssr.into());
+        builder
+            .when(ssr)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder
+            .when(ssr)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
+        builder.when(ssr).assert_eq(cols.result_exp, cols.rc2);
     }
 
     /// Constrain the cancellation (same-sign subtraction) result path via a 6-byte
@@ -758,9 +786,14 @@ impl FsubCoreAir {
 
         // ── Sound selectors ─────────────────────────────────────────────
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
-        builder.assert_eq(
-            cols.s_fb,
+        builder.when(cols.is_valid).assert_eq(
+            cols.s_bn,
             s_finite.clone() * cols.a_is_normal * cols.b_is_normal,
+        );
+        builder.assert_bool(cols.s_bn);
+        builder.when(cols.is_valid).assert_eq(
+            cols.s_fb,
+            s_finite.clone() * (one.clone() - cols.a_is_zero) * (one.clone() - cols.b_is_zero),
         );
         builder.assert_bool(cols.s_fb);
         let ediff_is_zero = one.clone() - cols.ediff * cols.ediff_nz_inv;
@@ -769,10 +802,10 @@ impl FsubCoreAir {
             .when(cols.is_valid)
             .assert_eq(cols.ediff_nz, one.clone() - ediff_is_zero);
         builder.assert_bool(cols.ediff_nz);
-        // s_cancel = s_fb AND is_add (same sign) AND !is_deep.
+        // s_cancel = s_bn AND is_add AND !is_deep.
         builder.assert_eq(
             cols.s_cancel,
-            cols.s_fb * cols.is_add * (one.clone() - cols.is_deep),
+            cols.s_bn * cols.is_add * (one.clone() - cols.is_deep),
         );
         builder.assert_bool(cols.s_cancel);
         let s = cols.s_cancel;
@@ -1271,7 +1304,8 @@ fn fill_fsub_witness<F: PrimeField32>(
         F::ZERO
     };
     let s_cancel = s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep;
-    row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_bn = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_fb = F::from_bool(s_finite_bool && !a_is_zero && !b_is_zero);
     row.s_one_zero = F::from_bool(s_finite_bool && (a_is_zero != b_is_zero));
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
@@ -1455,6 +1489,7 @@ fn fill_fsub_witness<F: PrimeField32>(
     let _ = result_exp_calc;
     row.s_normal = F::from_bool(s_shallow && (1u32..=254).contains(&r_exp));
     row.s_overflow = F::from_bool(s_shallow && r_exp == 255);
+    row.s_sub_result = F::from_bool(s_shallow && r_exp == 0);
     row.is_valid = F::ONE;
 }
 
@@ -1487,6 +1522,7 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FsubCoreCols<F>) {
     row.r_exp_hi_max_inv = F::ZERO;
     row.s_normal = F::ZERO;
     row.s_overflow = F::ZERO;
+    row.s_sub_result = F::ZERO;
 }
 
 /// Build a `ShrnCols` witness and register the corresponding range-checker counts.

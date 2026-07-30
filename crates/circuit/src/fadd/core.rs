@@ -156,9 +156,11 @@ pub struct FaddCoreCols<T> {
     pub cancel_lshift: T,             // left-shift amount (leading-zero count)
     pub ediff_nz: T,                  // ediff != 0 (exclude same-exp subtraction)
     pub ediff_nz_inv: T,
-    pub s_fb: T,            // finite AND both-normal (common finite precondition)
+    pub s_fb: T,            // finite AND both nonzero (includes subnormals)
+    pub s_bn: T,            // finite AND both normal (used by cancellation path)
     pub s_one_zero: T,      // finite AND exactly one input is zero
-    pub s_cancel: T,        // finite AND !is_add AND both-normal AND !is_deep
+    pub s_sub_result: T,    // shallow AND both subnormal AND no carry (subnormal result)
+    pub s_cancel: T,        // s_bn AND !is_add AND !is_deep
     pub a_ge_b: T,          // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T, // s_cancel AND result exp field in [1, 254]
 
@@ -772,6 +774,9 @@ impl FaddCoreAir {
         builder.assert_eq(cols.s_overflow, s_shallow * exp_field_max.clone());
         builder.assert_bool(cols.s_normal);
         builder.assert_bool(cols.s_overflow);
+        // s_sub_result = shallow AND result exp field == 0 (subnormal/zero result).
+        builder.assert_eq(cols.s_sub_result, s_shallow * exp_field_zero.clone());
+        builder.assert_bool(cols.s_sub_result);
 
         // Normal result: tie mantissa bytes to the rounded significand.
         builder.when(cols.s_normal).assert_eq(
@@ -791,6 +796,32 @@ impl FaddCoreAir {
         builder
             .when(cols.s_overflow)
             .assert_eq(cols.result[2], f128);
+        // Subnormal result: no implicit bit to strip from norm_sig[3].
+        // Same carry chain but WITHOUT the -128 offset on norm_sig[3].
+        let ssr = cols.s_sub_result;
+        builder.when(ssr).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            cols.norm_sig[1] + cols.round_up,
+        );
+        builder.when(ssr).assert_eq(
+            cols.result[1] + cols.rc1 * f256,
+            cols.norm_sig[2] + cols.rc0,
+        );
+        // top7c = norm_sig[3] + rc1 (no -128 for subnormals).
+        builder
+            .when(ssr)
+            .assert_eq(cols.norm_sig[3] + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, ssr.into());
+        builder
+            .when(ssr)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder
+            .when(ssr)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
+        // result_exp = rc2 (0 = subnormal, 1 = rounded up to smallest normal).
+        builder.when(ssr).assert_eq(cols.result_exp, cols.rc2);
     }
 
     /// Constrain the cancellation (effective subtraction) result path using a
@@ -815,11 +846,20 @@ impl FaddCoreAir {
 
         // ── Sound selectors ─────────────────────────────────────────────
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
+        // s_bn = finite AND both normal (cancellation path requires normals).
         builder.when(cols.is_valid).assert_eq(
-            cols.s_fb,
+            cols.s_bn,
             s_finite.clone() * cols.a_is_normal * cols.b_is_normal,
         );
+        builder.assert_bool(cols.s_bn);
+        // s_fb = finite AND both nonzero (includes subnormals; magnitude-add path).
+        builder.when(cols.is_valid).assert_eq(
+            cols.s_fb,
+            s_finite.clone() * (one.clone() - cols.a_is_zero) * (one.clone() - cols.b_is_zero),
+        );
         builder.assert_bool(cols.s_fb);
+        // s_sub_result = shallow AND both subnormal AND no carry (subnormal result).
+        // Computed below after he0 is available.
         // ediff != 0 indicator (excludes same-exp subtraction).
         let ediff_is_zero = one.clone() - cols.ediff * cols.ediff_nz_inv;
         builder.assert_zero(cols.ediff * ediff_is_zero.clone());
@@ -827,11 +867,10 @@ impl FaddCoreAir {
             .when(cols.is_valid)
             .assert_eq(cols.ediff_nz, one.clone() - ediff_is_zero);
         builder.assert_bool(cols.ediff_nz);
-        // s_cancel = s_fb AND (NOT is_add) AND (NOT is_deep). (ediff=0 is included;
-        // handled by a separate 3-byte magnitude comparison below.)
+        // s_cancel = s_bn AND (NOT is_add) AND (NOT is_deep).
         builder.assert_eq(
             cols.s_cancel,
-            cols.s_fb * (one.clone() - cols.is_add) * (one.clone() - cols.is_deep),
+            cols.s_bn * (one.clone() - cols.is_add) * (one.clone() - cols.is_deep),
         );
         builder.assert_bool(cols.s_cancel);
         let s = cols.s_cancel;
@@ -1351,7 +1390,8 @@ fn fill_fadd_witness<F: PrimeField32>(
         F::ZERO
     };
     let s_cancel = s_finite_bool && !same_sign && a_is_normal && b_is_normal && !is_deep;
-    row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_bn = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_fb = F::from_bool(s_finite_bool && !a_is_zero && !b_is_zero);
     row.s_one_zero = F::from_bool(s_finite_bool && (a_is_zero != b_is_zero));
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
@@ -1544,6 +1584,7 @@ fn fill_fadd_witness<F: PrimeField32>(
     let _ = result_exp_calc;
     row.s_normal = F::from_bool(s_shallow && (1u32..=254).contains(&r_exp));
     row.s_overflow = F::from_bool(s_shallow && r_exp == 255);
+    row.s_sub_result = F::from_bool(s_shallow && r_exp == 0);
     row.is_valid = F::ONE;
 }
 
@@ -1577,6 +1618,7 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FaddCoreCols<F>) {
     row.r_exp_hi_max_inv = F::ZERO;
     row.s_normal = F::ZERO;
     row.s_overflow = F::ZERO;
+    row.s_sub_result = F::ZERO;
 }
 
 /// Build a `ShrnCols` witness (mirrors `fp_shift::tests::make_cols`) and register
