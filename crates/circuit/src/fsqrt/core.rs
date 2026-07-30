@@ -19,6 +19,8 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
+use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+
 /// IEEE 754 / RISC-V FSQRT.S: correctly-rounded (RNE) square root.
 /// For all nonnegative inputs (including -0.0 and +inf) the result is the
 /// unique IEEE-correctly-rounded value — identical to x86's `sqrtss`.
@@ -39,7 +41,7 @@ pub fn fsqrt_s(bits: u32) -> u32 {
 }
 
 #[repr(C)]
-#[derive(AlignedBorrow, StructReflection, Debug)]
+#[derive(AlignedBorrow, StructReflection, Debug, Default)]
 pub struct FsqrtCoreCols<T> {
     pub a: [T; 4],
 
@@ -65,6 +67,34 @@ pub struct FsqrtCoreCols<T> {
     pub inf_res: T,   // +inf
     pub zero_res: T,  // +-0: result = a
     pub is_special: T,
+
+    // === Finite square root (normal positive inputs) ===
+    pub s_finite: T,
+    pub a_normal: T,
+    pub a_sig: [T; 3],    // significand bytes (mant | implicit)
+    pub a_sig_hi: [T; 3], // bit 7 of each a_sig byte (for odd-exp left shift)
+    pub q: [T; 5],        // floor(sqrt(n)) bytes
+    pub q_hi: [T; 5],     // bit 7 of each q byte (for 2q computation)
+    pub q4_lo4: T,        // low 4 bits of q[4]
+    pub is_hi: T,         // bool: q[4] >= 16 (msb of q is bit 36)
+    pub rem: [T; 6],      // remainder = n - q² bytes
+    pub rem_nz: T,        // bool: rem != 0
+    pub rem_nz_inv: T,
+    pub sq_carry: [T; 9],          // carry chain for q² + rem = n
+    pub twoq: [T; 6],              // 2q bytes (for remainder bound)
+    pub lt_borrow: [T; 6],         // borrow chain for 2q >= rem
+    pub diff: [T; 6],              // 2q - rem diff bytes
+    pub sqrt_shrn: ShrnCols<T, 7>, // mantissa extraction via right shift
+    pub sqrt_shift: T,             // 12 + is_hi
+    pub y0_high7: T,               // y[0] >> 1 (for lsb extraction)
+    pub eff_sticky: T,
+    pub round_up: T,
+    pub rc0: T,
+    pub rc1: T,
+    pub rc2: T,
+    pub rc2_rem: T,
+    pub r_exp_lo: T,
+    pub r_exp_hi: T,
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -200,8 +230,8 @@ where
                 .assert_eq(cols.result[i], cols.a[i]);
         }
 
-        // TODO: verify the finite positive result — correctly-rounded square
-        // root needs integer isqrt + normalization + RNE rounding machinery.
+        // ── Finite result: integer square root verification ─────────────
+        self.eval_finite_sqrt(builder, cols);
 
         let expected_opcode = VmCoreAir::<AB, I>::opcode_to_global_expr(self, FpOpcode::FSQRT_S);
 
@@ -219,6 +249,265 @@ where
 
     fn start_offset(&self) -> usize {
         self.offset
+    }
+}
+
+impl FsqrtCoreAir {
+    /// Constrain the finite square-root result via integer isqrt verification.
+    ///
+    /// Verifies `q² + rem = n` (10-byte carry chain) and `rem ≤ 2q` (6-byte
+    /// borrow chain), where `n = sig << (48 + exp_odd)`. Then extracts the
+    /// 24-bit result significand from q via ShrnGadget (shift 12 + is_hi)
+    /// with RNE rounding. The result exponent is `a_hi + 63 + is_hi + rc2`.
+    ///
+    /// Subnormal inputs are deferred; sqrt output is always normal.
+    pub fn eval_finite_sqrt<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FsqrtCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f16: AB::F = AB::F::from_u32(16);
+        let f63: AB::F = AB::F::from_u32(63);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
+        let one = AB::Expr::ONE;
+
+        // ── Selector: positive finite AND normal AND not special ────────
+        let not_special = one.clone() - cols.is_special;
+        let a_normal_expr = (one.clone() - cols.a_exp_is_zero) * (one.clone() - cols.a_exp_is_max);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.a_normal, a_normal_expr);
+        builder.when(cols.is_valid).assert_eq(
+            cols.s_finite,
+            not_special * cols.a_normal * (one.clone() - cols.a_sign),
+        );
+        builder.assert_bool(cols.s_finite);
+        let s = cols.s_finite;
+
+        // ── Significand construction ────────────────────────────────────
+        builder.when(s).assert_eq(cols.a_sig[0], cols.a[0]);
+        builder.when(s).assert_eq(cols.a_sig[1], cols.a[1]);
+        builder
+            .when(s)
+            .assert_eq(cols.a_sig[2], cols.a_mant2 + f128);
+        for i in 0..3 {
+            builder.assert_bool(cols.a_sig_hi[i]);
+            builder.when(s).assert_eq(
+                cols.a_sig[i],
+                (cols.a_sig[i] - cols.a_sig_hi[i] * f128) + cols.a_sig_hi[i] * f128,
+            );
+            self.range_bus
+                .range_check(cols.a_sig[i].into(), 8)
+                .eval(builder, s.into());
+        }
+
+        // ── n = sig << (48 + exp_odd) ───────────────────────────────────
+        // exp_odd = a_exp_lo. When exp is odd, sig is shifted left by 1.
+        // n has 10 bytes: n[0..6] = 0, n[6..10] from shifted sig.
+        // sig_ext[i] (4 bytes):
+        //   exp even: [a_sig[0], a_sig[1], a_sig[2], 0]
+        //   exp odd:  [lo7[0]*2, lo7[1]*2+hi[0], lo7[2]*2+hi[1], hi[2]]
+        let lo7 = |i: usize| cols.a_sig[i] - cols.a_sig_hi[i] * f128;
+        let exp_odd = cols.a_exp_lo;
+
+        // ── q range checks ──────────────────────────────────────────────
+        for i in 0..5 {
+            self.range_bus
+                .range_check(cols.q[i].into(), 8)
+                .eval(builder, s.into());
+        }
+        // q[4] < 32 (since q < 2^37). Decompose: q[4] = q4_lo4 + is_hi*16.
+        builder.assert_bool(cols.is_hi);
+        builder
+            .when(s)
+            .assert_eq(cols.q[4], cols.q4_lo4 + cols.is_hi * f16);
+        self.range_bus
+            .range_check(cols.q4_lo4.into(), 4)
+            .eval(builder, s.into());
+
+        // q_hi: bit 7 of each q byte. q_hi[4] must be 0 (q[4] < 32).
+        for i in 0..5 {
+            builder.assert_bool(cols.q_hi[i]);
+            builder.when(s).assert_eq(
+                cols.q[i],
+                cols.q[i] - cols.q_hi[i] * f128 + cols.q_hi[i] * f128,
+            );
+        }
+        builder.when(s).assert_zero(cols.q_hi[4]);
+
+        for i in 0..6 {
+            self.range_bus
+                .range_check(cols.rem[i].into(), 8)
+                .eval(builder, s.into());
+        }
+
+        // ── Carry chain: q² + rem = n (10 bytes) ───────────────────────
+        let carry_div = AB::F::from_u32(256).inverse();
+        for i in 0..10 {
+            let mut conv = AB::Expr::ZERO;
+            for k in 0..5usize {
+                let j = i as isize - k as isize;
+                if j >= 0 && (j as usize) < 5 {
+                    conv += cols.q[k] * cols.q[j as usize];
+                }
+            }
+            let rem_byte = if i < 6 {
+                cols.rem[i].into()
+            } else {
+                AB::Expr::ZERO
+            };
+            let carry_in = if i == 0 {
+                AB::Expr::ZERO
+            } else {
+                cols.sq_carry[i - 1].into()
+            };
+            let expected = carry_in + conv + rem_byte;
+            let nih = one.clone() - exp_odd;
+            let n_bi = match i {
+                0..=5 => AB::Expr::ZERO,
+                6 => nih * cols.a_sig[0] + exp_odd * lo7(0) * f2,
+                7 => nih * cols.a_sig[1] + exp_odd * (lo7(1) * f2 + cols.a_sig_hi[0]),
+                8 => nih * cols.a_sig[2] + exp_odd * (lo7(2) * f2 + cols.a_sig_hi[1]),
+                9 => exp_odd * cols.a_sig_hi[2],
+                _ => unreachable!(),
+            };
+            let carry_out = (expected - n_bi) * carry_div;
+            if i < 9 {
+                builder.when(s).assert_eq(cols.sq_carry[i], carry_out);
+                self.range_bus
+                    .range_check(cols.sq_carry[i].into(), 12)
+                    .eval(builder, s.into());
+            } else {
+                builder.when(s).assert_zero(carry_out);
+            }
+        }
+
+        // ── Remainder bound: rem ≤ 2q (6-byte borrow chain) ────────────
+        // twoq bytes: twoq[0] = q[0]*2 - q_hi[0]*256, twoq[i] = q[i]*2 + q_hi[i-1] - q_hi[i]*256.
+        for i in 0..6 {
+            let twoq_expr = if i == 0 {
+                cols.q[0] * f2 - cols.q_hi[0] * f256
+            } else if i < 5 {
+                cols.q[i] * f2 + cols.q_hi[i - 1] - cols.q_hi[i] * f256
+            } else {
+                // twoq[5] = q_hi[4] = 0
+                cols.q_hi[4].into()
+            };
+            builder.when(s).assert_eq(cols.twoq[i], twoq_expr);
+            self.range_bus
+                .range_check(cols.twoq[i].into(), 8)
+                .eval(builder, s.into());
+            builder.assert_bool(cols.lt_borrow[i]);
+        }
+        // byte 0: twoq[0] - rem[0] + borrow*256 = diff[0]
+        builder.when(s).assert_eq(
+            cols.twoq[0] - cols.rem[0] + cols.lt_borrow[0] * f256,
+            cols.diff[0],
+        );
+        for i in 1..6 {
+            builder.when(s).assert_eq(
+                cols.twoq[i] - cols.rem[i] - cols.lt_borrow[i - 1] + cols.lt_borrow[i] * f256,
+                cols.diff[i],
+            );
+        }
+        builder.when(s).assert_zero(cols.lt_borrow[5]);
+        for i in 0..6 {
+            self.range_bus
+                .range_check(cols.diff[i].into(), 8)
+                .eval(builder, s.into());
+        }
+
+        // ── rem_nz ──────────────────────────────────────────────────────
+        let rem_sum =
+            cols.rem[0] + cols.rem[1] + cols.rem[2] + cols.rem[3] + cols.rem[4] + cols.rem[5];
+        let rem_is_zero = one.clone() - rem_sum.clone() * cols.rem_nz_inv;
+        builder.assert_zero(rem_sum * rem_is_zero.clone());
+        builder
+            .when(s)
+            .assert_eq(cols.rem_nz, one.clone() - rem_is_zero);
+        builder.assert_bool(cols.rem_nz);
+
+        // ── Mantissa extraction via ShrnGadget<7> ───────────────────────
+        // x = q extended to 7 bytes. shift = 12 + is_hi.
+        for i in 0..5 {
+            builder.when(s).assert_eq(cols.sqrt_shrn.x[i], cols.q[i]);
+        }
+        for i in 5..7 {
+            builder.when(s).assert_zero(cols.sqrt_shrn.x[i]);
+        }
+        builder.when(s).assert_eq(
+            cols.sqrt_shift,
+            AB::Expr::from(AB::F::from_u32(12)) + cols.is_hi * one.clone(),
+        );
+        // f48/4 = 12
+        builder
+            .when(s)
+            .assert_eq(cols.sqrt_shrn.shift, cols.sqrt_shift);
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.sqrt_shrn);
+        builder.assert_eq(cols.sqrt_shrn.enable, s);
+        // y bytes 3..7 must be zero (result fits in 3 bytes).
+        for i in 3..7 {
+            builder.when(s).assert_zero(cols.sqrt_shrn.y[i]);
+        }
+
+        // ── RNE rounding ────────────────────────────────────────────────
+        // Decompose y[0] = y0_high7 * 2 + lsb_y0 (lsb_y0 ∈ {0,1}).
+        let lsb_y0 = cols.sqrt_shrn.y[0] - cols.y0_high7 * f2;
+        self.range_bus
+            .range_check(cols.y0_high7.into(), 7)
+            .eval(builder, s.into());
+        builder.when(s).assert_bool(lsb_y0.clone());
+
+        // Effective sticky: gadget sticky OR rem_nz.
+        let eff_sticky_expr =
+            cols.sqrt_shrn.sticky + cols.rem_nz - cols.sqrt_shrn.sticky * cols.rem_nz;
+        builder.when(s).assert_eq(cols.eff_sticky, eff_sticky_expr);
+        builder.assert_bool(cols.eff_sticky);
+        builder.assert_bool(cols.sqrt_shrn.guard);
+
+        // round_up = guard AND (eff_sticky OR lsb_y0).
+        let sor = cols.eff_sticky + lsb_y0.clone() - cols.eff_sticky * lsb_y0;
+        builder
+            .when(s)
+            .assert_eq(cols.round_up, cols.sqrt_shrn.guard * sor);
+        builder.assert_bool(cols.round_up);
+
+        // ── Output reconstruction ───────────────────────────────────────
+        // y[2] has implicit bit in bit 7. Extract top7 = y[2] - 128.
+        // Carry chain: y[0] + round_up → rc0; y[1] + rc0 → rc1; (y[2]-128) + rc1 → rc2/rem.
+        builder.assert_bool(cols.rc0);
+        builder.assert_bool(cols.rc1);
+        builder.assert_bool(cols.rc2);
+        builder.when(s).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            cols.sqrt_shrn.y[0] + cols.round_up,
+        );
+        builder.when(s).assert_eq(
+            cols.result[1] + cols.rc1 * f256,
+            cols.sqrt_shrn.y[1] + cols.rc0,
+        );
+        let top7 = cols.sqrt_shrn.y[2] - f128;
+        builder
+            .when(s)
+            .assert_eq(top7 + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s.into());
+
+        // Result exponent: a_hi + 63 + is_hi + rc2.
+        let res_exp = cols.a_hi + AB::Expr::from(f63) + cols.is_hi + cols.rc2;
+        builder
+            .when(s)
+            .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, res_exp);
+
+        // Result bytes.
+        builder
+            .when(s)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder.when(s).assert_eq(cols.result[3], cols.r_exp_hi);
     }
 }
 
@@ -365,6 +654,18 @@ where
         core_row.inf_res = F::from_bool(inf_res);
         core_row.zero_res = F::from_bool(zero_res);
         core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
+
+        let a_normal = (1..=254).contains(&a_exp);
+        let s_finite = !canon_sel && !inf_res && !zero_res && a_normal && a_sign == 0;
+        core_row.s_finite = F::from_bool(s_finite);
+        core_row.a_normal = F::from_bool(a_normal);
+
+        if s_finite {
+            fill_finite_sqrt(core_row, a_exp, a_mant, result, &self.range_checker);
+        } else {
+            zero_finite_columns(core_row);
+        }
+
         core_row.is_valid = F::ONE;
     }
 }
@@ -376,4 +677,447 @@ fn decompose(bits: u32) -> (u32, u32, u32) {
     let exp = (bits >> 23) & 0xFF;
     let mant = bits & 0x7FFFFF;
     (sign, exp, mant)
+}
+
+/// floor(sqrt(n)) for n < 2^128.
+fn isqrt_u128(n: u128) -> u128 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = 1u128 << ((128 - n.leading_zeros() as usize).div_ceil(2));
+    loop {
+        let y = (x + n / x) / 2;
+        if y >= x {
+            break;
+        }
+        x = y;
+    }
+    while x * x > n {
+        x -= 1;
+    }
+    while (x + 1) * (x + 1) <= n {
+        x += 1;
+    }
+    x
+}
+
+/// Zero all finite-path columns (for non-finite rows).
+fn zero_finite_columns<F: PrimeField32>(row: &mut FsqrtCoreCols<F>) {
+    row.s_finite = F::ZERO;
+    for i in 0..3 {
+        row.a_sig[i] = F::ZERO;
+        row.a_sig_hi[i] = F::ZERO;
+    }
+    for i in 0..5 {
+        row.q[i] = F::ZERO;
+        row.q_hi[i] = F::ZERO;
+    }
+    row.q4_lo4 = F::ZERO;
+    row.is_hi = F::ZERO;
+    for i in 0..6 {
+        row.rem[i] = F::ZERO;
+        row.twoq[i] = F::ZERO;
+        row.lt_borrow[i] = F::ZERO;
+        row.diff[i] = F::ZERO;
+    }
+    row.rem_nz = F::ZERO;
+    row.rem_nz_inv = F::ZERO;
+    for i in 0..9 {
+        row.sq_carry[i] = F::ZERO;
+    }
+    row.sqrt_shrn = ShrnCols::<F, 7>::default();
+    row.sqrt_shift = F::ZERO;
+    row.y0_high7 = F::ZERO;
+    row.eff_sticky = F::ZERO;
+    row.round_up = F::ZERO;
+    row.rc0 = F::ZERO;
+    row.rc1 = F::ZERO;
+    row.rc2 = F::ZERO;
+    row.rc2_rem = F::ZERO;
+    row.r_exp_lo = F::ZERO;
+    row.r_exp_hi = F::ZERO;
+}
+
+/// Fill the finite square-root witness columns.
+fn fill_finite_sqrt<F: PrimeField32>(
+    row: &mut FsqrtCoreCols<F>,
+    a_exp: u32,
+    a_mant: u32,
+    result: u32,
+    range_checker: &SharedVariableRangeCheckerChip,
+) {
+    let a_sig = a_mant | 0x800000;
+    let asig_bytes: [u32; 3] = [a_sig & 0xFF, (a_sig >> 8) & 0xFF, (a_sig >> 16) & 0xFF];
+    let exp_odd = a_exp & 1;
+
+    for (i, &sb) in asig_bytes.iter().enumerate() {
+        row.a_sig[i] = F::from_u32(sb);
+        row.a_sig_hi[i] = F::from_u32(sb >> 7);
+        range_checker.add_count(sb, 8);
+    }
+
+    // sig_shifted = a_sig << exp_odd. n = sig_shifted << 48.
+    let sig_shifted = (a_sig as u64) << exp_odd;
+    let n = (sig_shifted as u128) << 48;
+
+    // q = floor(sqrt(n)), rem = n - q².
+    let q_val = isqrt_u128(n);
+    let q_sq = q_val * q_val;
+    let rem_val = n - q_sq;
+
+    let q_bytes: [u32; 5] = core::array::from_fn(|i| ((q_val >> (i * 8)) & 0xFF) as u32);
+    let rem_bytes: [u32; 6] = core::array::from_fn(|i| ((rem_val >> (i * 8)) & 0xFF) as u32);
+
+    for (i, &qb) in q_bytes.iter().enumerate() {
+        row.q[i] = F::from_u32(qb);
+        row.q_hi[i] = F::from_u32(qb >> 7);
+        range_checker.add_count(qb, 8);
+    }
+
+    // q[4] < 32 (q < 2^37). Decompose: q[4] = q4_lo4 + is_hi * 16.
+    let is_hi_val = q_bytes[4] >= 16;
+    row.q4_lo4 = F::from_u32(q_bytes[4] & 0xF);
+    row.is_hi = F::from_bool(is_hi_val);
+    range_checker.add_count(q_bytes[4] & 0xF, 4);
+
+    for (i, &rb) in rem_bytes.iter().enumerate() {
+        row.rem[i] = F::from_u32(rb);
+        range_checker.add_count(rb, 8);
+    }
+
+    // ── n bytes: n[0..6] = 0, n[6..10] from shifted sig ────────────
+    let lo7 = |i: usize| asig_bytes[i] & 0x7F;
+    let n_bytes: [u32; 10] = {
+        let mut nb = [0u32; 10];
+        if exp_odd == 0 {
+            nb[6] = asig_bytes[0];
+            nb[7] = asig_bytes[1];
+            nb[8] = asig_bytes[2];
+            nb[9] = 0;
+        } else {
+            nb[6] = lo7(0) * 2;
+            nb[7] = lo7(1) * 2 + (asig_bytes[0] >> 7);
+            nb[8] = lo7(2) * 2 + (asig_bytes[1] >> 7);
+            nb[9] = asig_bytes[2] >> 7;
+        }
+        nb
+    };
+
+    // ── Carry chain: q² + rem = n (10 bytes) ────────────────────────
+    let q64: [u64; 5] = [
+        q_bytes[0] as u64,
+        q_bytes[1] as u64,
+        q_bytes[2] as u64,
+        q_bytes[3] as u64,
+        q_bytes[4] as u64,
+    ];
+    let mut carry_in: u64 = 0;
+    for i in 0..10 {
+        let mut conv: u64 = 0;
+        for k in 0..5 {
+            if k <= i && (i - k) < 5 {
+                conv += q64[k] * q64[i - k];
+            }
+        }
+        let rem_byte = if i < 6 { rem_bytes[i] as u64 } else { 0 };
+        let expected = carry_in + conv + rem_byte;
+        let carry_out = (expected - n_bytes[i] as u64) / 256;
+        debug_assert_eq!(
+            expected - n_bytes[i] as u64,
+            carry_out * 256,
+            "fsqrt carry byte {}",
+            i
+        );
+        if i < 9 {
+            row.sq_carry[i] = F::from_u32(carry_out as u32);
+            range_checker.add_count(carry_out as u32, 12);
+        } else {
+            debug_assert_eq!(carry_out, 0, "fsqrt final carry nonzero");
+        }
+        carry_in = carry_out;
+    }
+
+    // ── 2q bytes and borrow chain: 2q >= rem ────────────────────────
+    let twoq_bytes: [u32; 6] = {
+        let mut tq = [0u32; 6];
+        let mut carry = 0u32;
+        for i in 0..5 {
+            let val = q_bytes[i] * 2 + carry;
+            tq[i] = val & 0xFF;
+            carry = val >> 8;
+        }
+        tq[5] = carry;
+        tq
+    };
+    for (i, &tq) in twoq_bytes.iter().enumerate() {
+        row.twoq[i] = F::from_u32(tq);
+        range_checker.add_count(tq, 8);
+    }
+    let mut borrow: i64 = 0;
+    for i in 0..6 {
+        let d = twoq_bytes[i] as i64 - rem_bytes[i] as i64 - borrow;
+        let (bv, nb) = if d < 0 { (d + 256, 1) } else { (d, 0) };
+        row.lt_borrow[i] = F::from_u32(nb);
+        row.diff[i] = F::from_u32(bv as u32);
+        range_checker.add_count(bv as u32, 8);
+        borrow = nb as i64;
+    }
+    debug_assert_eq!(borrow, 0, "fsqrt rem > 2q");
+
+    // ── rem_nz ──────────────────────────────────────────────────────
+    let rem_sum: u32 = rem_bytes.iter().sum();
+    let rem_nz = rem_sum != 0;
+    row.rem_nz = F::from_bool(rem_nz);
+    row.rem_nz_inv = if rem_nz {
+        F::from_u32(rem_sum).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    // ── Mantissa extraction via ShrnGadget<7> ───────────────────────
+    let sqrt_shift = 12 + is_hi_val as usize;
+    row.sqrt_shift = F::from_u32(sqrt_shift as u32);
+    let x: [u32; 7] = core::array::from_fn(|i| if i < 5 { q_bytes[i] } else { 0 });
+    row.sqrt_shrn = make_shrn_cols7::<F>(x, sqrt_shift, range_checker);
+
+    let y0 = row.sqrt_shrn.y[0].as_canonical_u32();
+    let y1 = row.sqrt_shrn.y[1].as_canonical_u32();
+    let y2 = row.sqrt_shrn.y[2].as_canonical_u32();
+    row.y0_high7 = F::from_u32(y0 >> 1);
+    range_checker.add_count(y0 >> 1, 7);
+
+    let guard = row.sqrt_shrn.guard.as_canonical_u32();
+    let sticky = row.sqrt_shrn.sticky.as_canonical_u32() != 0;
+    let lsb_y0 = y0 & 1;
+    let eff_sticky = sticky || rem_nz;
+    row.eff_sticky = F::from_bool(eff_sticky);
+
+    let round_up = guard == 1 && (eff_sticky || lsb_y0 == 1);
+    row.round_up = F::from_bool(round_up);
+
+    // ── Output reconstruction ───────────────────────────────────────
+    let s0 = y0 + round_up as u32;
+    let rc0 = s0 >> 8;
+    let s1 = y1 + rc0;
+    let rc1 = s1 >> 8;
+    let top7 = y2 - 128; // remove implicit bit
+    let top7c = top7 + rc1;
+    let rc2 = top7c >> 7;
+    let rc2_rem = top7c & 0x7F;
+    row.rc0 = F::from_u32(rc0);
+    row.rc1 = F::from_u32(rc1);
+    row.rc2 = F::from_u32(rc2);
+    row.rc2_rem = F::from_u32(rc2_rem);
+    range_checker.add_count(rc2_rem, 7);
+
+    let res_exp = (a_exp >> 1) + 63 + is_hi_val as u32 + rc2;
+    row.r_exp_lo = F::from_u32(res_exp & 1);
+    row.r_exp_hi = F::from_u32(res_exp >> 1);
+
+    // Sanity checks.
+    let r_exp_field = (result >> 23) & 0xFF;
+    debug_assert_eq!(
+        res_exp, r_exp_field,
+        "fsqrt exp mismatch: a_exp={} res_exp={} field={}",
+        a_exp, res_exp, r_exp_field
+    );
+    debug_assert_eq!(s0 & 0xFF, result & 0xFF, "fsqrt byte0");
+    debug_assert_eq!(s1 & 0xFF, (result >> 8) & 0xFF, "fsqrt byte1");
+    debug_assert_eq!(
+        (rc2_rem + (res_exp & 1) * 128) & 0xFF,
+        (result >> 16) & 0xFF,
+        "fsqrt byte2"
+    );
+    debug_assert_eq!(res_exp >> 1, (result >> 24) & 0x7F, "fsqrt byte3");
+}
+
+/// Build a `ShrnCols<7>` witness and register range-checker counts.
+fn make_shrn_cols7<F: PrimeField32>(
+    x: [u32; 7],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 7> {
+    const N: usize = 7;
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    for i in 0..N {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
+    }
+}
+
+#[cfg(test)]
+mod finite_numeric_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+
+    fn run(a: u32) -> NumericBuilder<F> {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let mut row = FsqrtCoreCols::<F>::default();
+        let result = fsqrt_s(a);
+        let (a_sign, a_exp, a_mant) = decompose(a);
+        let a_nan = a_exp == 255 && a_mant != 0;
+        let a_inf = a_exp == 255 && a_mant == 0;
+        let a_zero = a_exp == 0 && a_mant == 0;
+        let canon_sel = a_nan || (a_sign == 1 && !a_zero);
+        let inf_res = a_inf && a_sign == 0;
+        let zero_res = a_zero;
+        let is_special = canon_sel || inf_res || zero_res;
+        let a_normal = (1..=254).contains(&a_exp);
+        let s_finite = !is_special && a_normal && a_sign == 0;
+
+        row.is_valid = F::ONE;
+        row.s_finite = F::from_bool(s_finite);
+        row.a_normal = F::from_bool(a_normal);
+        row.is_special = F::from_bool(is_special);
+        row.a_sign = F::from_u32(a_sign);
+        row.a_exp_lo = F::from_u32(a_exp & 1);
+        row.a_hi = F::from_u32(a_exp >> 1);
+        row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+        row.a_exp_is_zero = F::from_bool(a_exp == 0);
+        row.a_exp_is_max = F::from_bool(a_exp == 255);
+        row.a_exp_zero_inv = if a_exp != 0 {
+            F::from_u32(a_exp).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.a_exp_max_inv = if a_exp != 255 {
+            (F::from_u32(255) - F::from_u32(a_exp))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
+        row.a_mant_is_zero = F::from_bool(a_mant == 0);
+        row.a_mant_sum_inv = if a_mant != 0 {
+            F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.a_nan = F::from_bool(a_nan);
+        row.a_inf = F::from_bool(a_inf);
+        row.a_zero = F::from_bool(a_zero);
+        row.canon_sel = F::from_bool(canon_sel);
+        row.inf_res = F::from_bool(inf_res);
+        row.zero_res = F::from_bool(zero_res);
+        for i in 0..4 {
+            row.a[i] = F::from_u32((a >> (i * 8)) & 0xFF);
+            row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        }
+        if s_finite {
+            fill_finite_sqrt(&mut row, a_exp, a_mant, result, &chip);
+        }
+        let air = FsqrtCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0);
+        let mut builder = NumericBuilder::new(vec![]);
+        air.eval_finite_sqrt(&mut builder, &row);
+        builder
+    }
+
+    #[test]
+    fn fsqrt_finite_numeric_passes() {
+        for &a in &[
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            4.0f32.to_bits(),
+            0.25f32.to_bits(),
+            1e10f32.to_bits(),
+            1.5f32.to_bits(),
+            3.0f32.to_bits(),
+            100.0f32.to_bits(),
+            f32::MAX.to_bits(),
+            0x3F800000, // 1.0
+            0x40400000, // 3.0
+            0x7F7FFFFF, // MAX
+        ] {
+            let builder = run(a);
+            assert!(
+                builder.ok(),
+                "fsqrt failed: {:?}\n a={:08x} result={:08x}",
+                builder.failures,
+                a,
+                fsqrt_s(a)
+            );
+        }
+        let mut rng = 0xB0B0_005Eu64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u32
+        };
+        for _ in 0..2000 {
+            let a_exp = (next() % 254) + 1;
+            let a = (a_exp << 23) | (next() & 0x7FFFFF);
+            let builder = run(a);
+            if !builder.ok() {
+                panic!(
+                    "fsqrt fuzz failed: {:?}\n a={:08x} result={:08x}",
+                    builder.failures,
+                    a,
+                    fsqrt_s(a)
+                );
+            }
+        }
+    }
 }

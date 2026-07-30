@@ -1592,8 +1592,39 @@ mod fuzz_tests {
     #[cfg(feature = "proving")]
     #[test]
     fn fuzz_prove_fsqrt() {
-        let mut rng = XorShift64::new(0xB0B0_0008);
-        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        // Deterministic set exercising normal / NaN / inf / zero / negative paths.
+        let cases: Vec<u32> = vec![
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            4.0f32.to_bits(),
+            0.25f32.to_bits(),
+            1e10f32.to_bits(),
+            1.5f32.to_bits(),
+            3.0f32.to_bits(),
+            100.0f32.to_bits(),
+            f32::MAX.to_bits(),
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            0.0f32.to_bits(),
+            (-0.0f32).to_bits(),
+            (-1.0f32).to_bits(),
+            f32::MIN.to_bits(),
+            0x00800000,            // MIN_NORMAL
+            0x7F7FFFFF,            // MAX
+            0x3F800000,            // 1.0
+            0x40490FDB,            // pi
+            0x40000000,            // 2.0
+            0x42C80000,            // 100.0
+            0x49742400,            // 1e6
+            0x4B189680,            // 1e7
+            0x501502F9,            // 1e10
+            0x7F7FFFFF,            // MAX again
+            (-100.0f32).to_bits(), // negative -> NaN
+            0x00000001,            // min subnormal
+            0x80000001,            // negative subnormal -> NaN
+            0x3FA00000,            // 1.25
+            0x40A00000,            // 5.0
+        ];
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fsqrt_s(rd, rs1));
         prove_chunk(instrs, mem);
     }
