@@ -157,6 +157,7 @@ pub struct FaddCoreCols<T> {
     pub ediff_nz: T,                  // ediff != 0 (exclude same-exp subtraction)
     pub ediff_nz_inv: T,
     pub s_fb: T,            // finite AND both-normal (common finite precondition)
+    pub s_one_zero: T,      // finite AND exactly one input is zero
     pub s_cancel: T,        // finite AND !is_add AND both-normal AND !is_deep
     pub a_ge_b: T,          // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T, // s_cancel AND result exp field in [1, 254]
@@ -443,26 +444,45 @@ impl FaddCoreAir {
             .when(cols.s_zero_both)
             .assert_eq(cols.result[3], zero_sign * f128);
 
-        // One-zero: when exactly one input is zero, result = the nonzero operand.
-        // Degree-3 constraints: a_is_zero * (1-b_is_zero) * (result - b_bytes) = 0.
-        // They vanish trivially when both or neither is zero.
-        let not_bz = one.clone() - cols.b_is_zero;
-        let not_az = one.clone() - cols.a_is_zero;
-        builder.assert_zero(cols.a_is_zero * not_bz.clone() * (cols.result[0] - cols.b_mant0));
-        builder.assert_zero(cols.b_is_zero * not_az.clone() * (cols.result[0] - cols.a_mant0));
-        builder.assert_zero(cols.a_is_zero * not_bz.clone() * (cols.result[1] - cols.b_mant1));
-        builder.assert_zero(cols.b_is_zero * not_az.clone() * (cols.result[1] - cols.a_mant1));
+        // One-zero special case: result = the nonzero operand (bytes preserved).
+        // s_one_zero = s_finite AND (a_is_zero XOR b_is_zero). Stored as a column
+        // to keep the result constraints degree ≤ 3.
+        let xor_z = cols.a_is_zero + cols.b_is_zero - cols.a_is_zero * cols.b_is_zero * f2;
+        let s_finite_special = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.s_one_zero, s_finite_special * xor_z);
+        builder.assert_bool(cols.s_one_zero);
+        // When exactly one input is zero, result = the nonzero operand.
         builder.assert_zero(
-            cols.a_is_zero * not_bz.clone() * (cols.result[2] - cols.b_mant2 - cols.b_exp_lo * f128),
+            cols.s_one_zero
+                * (cols.result[0]
+                    - cols.b_mant0
+                    - (one.clone() - cols.a_is_zero) * (cols.a_mant0 - cols.b_mant0)),
         );
         builder.assert_zero(
-            cols.b_is_zero * not_az.clone() * (cols.result[2] - cols.a_mant2 - cols.a_exp_lo * f128),
+            cols.s_one_zero
+                * (cols.result[1]
+                    - cols.b_mant1
+                    - (one.clone() - cols.a_is_zero) * (cols.a_mant1 - cols.b_mant1)),
         );
         builder.assert_zero(
-            cols.a_is_zero * not_bz * (cols.result[3] - cols.b_exp_hi - cols.b_sign * f128),
+            cols.s_one_zero
+                * (cols.result[2]
+                    - cols.b_mant2
+                    - cols.b_exp_lo * f128
+                    - (one.clone() - cols.a_is_zero)
+                        * ((cols.a_mant2 + cols.a_exp_lo * f128)
+                            - (cols.b_mant2 + cols.b_exp_lo * f128))),
         );
         builder.assert_zero(
-            cols.b_is_zero * not_az * (cols.result[3] - cols.a_exp_hi - cols.a_sign * f128),
+            cols.s_one_zero
+                * (cols.result[3]
+                    - cols.b_exp_hi
+                    - cols.b_sign * f128
+                    - (one.clone() - cols.a_is_zero)
+                        * ((cols.a_exp_hi + cols.a_sign * f128)
+                            - (cols.b_exp_hi + cols.b_sign * f128))),
         );
     }
 
@@ -1332,6 +1352,7 @@ fn fill_fadd_witness<F: PrimeField32>(
     };
     let s_cancel = s_finite_bool && !same_sign && a_is_normal && b_is_normal && !is_deep;
     row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_one_zero = F::from_bool(s_finite_bool && (a_is_zero != b_is_zero));
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
 

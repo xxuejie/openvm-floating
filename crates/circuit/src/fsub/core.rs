@@ -157,8 +157,9 @@ pub struct FsubCoreCols<T> {
     pub ediff_nz: T,
     pub ediff_nz_inv: T,
     pub s_fb: T,
-    pub s_cancel: T, // finite AND is_add (same sign) AND both-normal AND !is_deep
-    pub a_ge_b: T,   // bool: a_sig >= b_sig (magnitude compare for ediff=0)
+    pub s_one_zero: T, // finite AND exactly one input is zero
+    pub s_cancel: T,   // finite AND is_add (same sign) AND both-normal AND !is_deep
+    pub a_ge_b: T,     // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T,
 
     // === Result ===
@@ -436,6 +437,29 @@ impl FsubCoreAir {
         builder
             .when(cols.s_zero_both)
             .assert_eq(cols.result[3], zero_sign * f128);
+
+        // One-zero special case for fsub:
+        //   b_is_zero: fsub(a, 0) = a (result = a bytes)
+        //   a_is_zero: fsub(0, b) = -b (mantissa preserved, sign flipped)
+        let xor_z = cols.a_is_zero + cols.b_is_zero - cols.a_is_zero * cols.b_is_zero * f2;
+        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.s_one_zero, s_finite.clone() * xor_z);
+        builder.assert_bool(cols.s_one_zero);
+        // result = a_is_zero ? (-b) : a.
+        let az = cols.a_is_zero.into();
+        let naz = one.clone() - az.clone();
+        let r0 = az.clone() * cols.b_mant0 + naz.clone() * cols.a_mant0;
+        let r1 = az.clone() * cols.b_mant1 + naz.clone() * cols.a_mant1;
+        let r2 = az.clone() * (cols.b_mant2 + cols.b_exp_lo * f128)
+            + naz.clone() * (cols.a_mant2 + cols.a_exp_lo * f128);
+        let r3 = az * (cols.b_exp_hi + (one.clone() - cols.b_sign) * f128)
+            + naz * (cols.a_exp_hi + cols.a_sign * f128);
+        builder.when(cols.s_one_zero).assert_eq(cols.result[0], r0);
+        builder.when(cols.s_one_zero).assert_eq(cols.result[1], r1);
+        builder.when(cols.s_one_zero).assert_eq(cols.result[2], r2);
+        builder.when(cols.s_one_zero).assert_eq(cols.result[3], r3);
     }
 
     /// Constrain the finite, opposite-sign, both-normal result path.
@@ -1248,6 +1272,7 @@ fn fill_fsub_witness<F: PrimeField32>(
     };
     let s_cancel = s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep;
     row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    row.s_one_zero = F::from_bool(s_finite_bool && (a_is_zero != b_is_zero));
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
 
@@ -1841,10 +1866,24 @@ mod special_tests {
         let inf_in = a_inf || b_inf;
         let s_inf = !is_nan_res && inf_in;
         let s_zero_both = !is_nan_res && !inf_in && a_zero && b_zero;
+        let a_mant = a & 0x7FFFFF;
+        let b_mant = b & 0x7FFFFF;
+        let a_exp = (a >> 23) & 0xFF;
+        let b_exp = (b >> 23) & 0xFF;
 
         FsubCoreCols {
             a_sign: F::from_u32((a >> 31) & 1),
             b_sign: F::from_u32((b >> 31) & 1),
+            a_mant0: F::from_u32(a_mant & 0xFF),
+            a_mant1: F::from_u32((a_mant >> 8) & 0xFF),
+            a_mant2: F::from_u32((a_mant >> 16) & 0x7F),
+            a_exp_lo: F::from_u32(a_exp & 1),
+            a_exp_hi: F::from_u32(a_exp >> 1),
+            b_mant0: F::from_u32(b_mant & 0xFF),
+            b_mant1: F::from_u32((b_mant >> 8) & 0xFF),
+            b_mant2: F::from_u32((b_mant >> 16) & 0x7F),
+            b_exp_lo: F::from_u32(b_exp & 1),
+            b_exp_hi: F::from_u32(b_exp >> 1),
             a_is_nan: F::from_bool(a_nan),
             b_is_nan: F::from_bool(b_nan),
             a_is_inf: F::from_bool(a_inf),
