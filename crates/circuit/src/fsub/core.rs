@@ -157,7 +157,8 @@ pub struct FsubCoreCols<T> {
     pub ediff_nz: T,
     pub ediff_nz_inv: T,
     pub s_fb: T,
-    pub s_cancel: T, // finite AND is_add (same sign) AND both-normal AND !is_deep AND ediff!=0
+    pub s_cancel: T, // finite AND is_add (same sign) AND both-normal AND !is_deep
+    pub a_ge_b: T,   // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T,
 
     // === Result ===
@@ -744,10 +745,10 @@ impl FsubCoreAir {
             .when(cols.is_valid)
             .assert_eq(cols.ediff_nz, one.clone() - ediff_is_zero);
         builder.assert_bool(cols.ediff_nz);
-        // s_cancel = s_fb AND is_add (same sign ⇒ subtraction) AND !is_deep AND ediff!=0.
+        // s_cancel = s_fb AND is_add (same sign) AND !is_deep.
         builder.assert_eq(
             cols.s_cancel,
-            cols.s_fb * cols.is_add * (one.clone() - cols.is_deep) * cols.ediff_nz,
+            cols.s_fb * cols.is_add * (one.clone() - cols.is_deep),
         );
         builder.assert_bool(cols.s_cancel);
         let s = cols.s_cancel;
@@ -772,7 +773,7 @@ impl FsubCoreAir {
         let align_shrn = ShrnGadget::new(self.range_bus);
         align_shrn.eval_shrn(builder, &cols.cancel_align);
 
-        // ── 6-byte borrow chain: raw_diff = large_working - aligned ──────
+        // ── 6-byte borrow chain ──────────────────────────────────────────
         let lw = |i: usize| -> AB::Expr {
             match i {
                 0..=2 => AB::Expr::ZERO,
@@ -785,20 +786,48 @@ impl FsubCoreAir {
         for i in 0..5 {
             builder.assert_bool(cols.cancel_borrow[i]);
         }
-        builder.when(s).assert_eq(
+        builder.assert_bool(cols.a_ge_b);
+        let s_e1 = s * cols.ediff_nz;
+        let s_e0 = s * (one.clone() - cols.ediff_nz);
+
+        // --- ediff >= 1: raw_diff = large_working - aligned ---
+        builder.when(s_e1.clone()).assert_eq(
             cols.cancel_diff[0] + cols.cancel_align.y[0],
             cols.cancel_borrow[0] * f256,
         );
         for i in 1..5 {
             let bin = cols.cancel_borrow[i - 1];
-            builder.when(s).assert_eq(
+            builder.when(s_e1.clone()).assert_eq(
                 cols.cancel_diff[i] + cols.cancel_align.y[i] + bin,
                 lw(i) + cols.cancel_borrow[i] * f256,
             );
         }
-        builder.when(s).assert_eq(
+        builder.when(s_e1.clone()).assert_eq(
             cols.cancel_diff[5] + cols.cancel_align.y[5] + cols.cancel_borrow[4],
             lw(5),
+        );
+
+        // --- ediff == 0: raw_diff = effective_large - effective_small ---
+        let eff_large = |i: usize| {
+            cols.a_ge_b * cols.large_sig[i] + (one.clone() - cols.a_ge_b) * cols.small_sig[i]
+        };
+        let eff_small = |i: usize| {
+            cols.a_ge_b * cols.small_sig[i] + (one.clone() - cols.a_ge_b) * cols.large_sig[i]
+        };
+        for i in 0..3 {
+            builder.when(s_e0.clone()).assert_zero(cols.cancel_diff[i]);
+        }
+        builder.when(s_e0.clone()).assert_eq(
+            cols.cancel_diff[3] + eff_small(0),
+            eff_large(0) + cols.cancel_borrow[0] * f256,
+        );
+        builder.when(s_e0.clone()).assert_eq(
+            cols.cancel_diff[4] + eff_small(1) + cols.cancel_borrow[0],
+            eff_large(1) + cols.cancel_borrow[1] * f256,
+        );
+        builder.when(s_e0.clone()).assert_eq(
+            cols.cancel_diff[5] + eff_small(2) + cols.cancel_borrow[1],
+            eff_large(2),
         );
 
         // ── Left-shift normalize via ShlnGadget<6> ──────────────────────
@@ -851,10 +880,13 @@ impl FsubCoreAir {
         // ── Output reconstruction ───────────────────────────────────────
         let large_exp =
             cols.a_is_larger * a_exp.clone() + (one.clone() - cols.a_is_larger) * b_exp.clone();
-        // fsub result sign for same-sign subtraction:
-        //   a_is_larger: result_sign = a_sign; b_is_larger: result_sign = 1 - a_sign.
-        let cancel_sign = cols.a_is_larger * cols.a_sign
+        // fsub result sign: ediff>=1 → cancel_sign_e1; ediff=0 → a_ge_b ? a_sign : (1-a_sign).
+        let cancel_sign_e1 = cols.a_is_larger * cols.a_sign
             + (one.clone() - cols.a_is_larger) * (one.clone() - cols.a_sign);
+        let cancel_sign_e0 =
+            cols.a_ge_b * cols.a_sign + (one.clone() - cols.a_ge_b) * (one.clone() - cols.a_sign);
+        let cancel_sign =
+            cols.ediff_nz * cancel_sign_e1 + (one.clone() - cols.ediff_nz) * cancel_sign_e0;
         builder
             .when(s)
             .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
@@ -1214,8 +1246,7 @@ fn fill_fsub_witness<F: PrimeField32>(
     } else {
         F::ZERO
     };
-    let s_cancel =
-        s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep && ediff != 0;
+    let s_cancel = s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep;
     row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
@@ -1249,6 +1280,8 @@ fn fill_fsub_witness<F: PrimeField32>(
                 large_sig,
                 small_sig,
                 large_exp,
+                a_sig,
+                b_sig,
                 a_sign,
                 a_is_larger,
                 r_exp,
@@ -1504,6 +1537,8 @@ fn fill_cancel_fsub<F: PrimeField32>(
     large_sig: u32,
     small_sig: u32,
     large_exp: u32,
+    a_sig: u32,
+    b_sig: u32,
     a_sign: u32,
     a_is_larger: bool,
     r_exp: u32,
@@ -1513,6 +1548,17 @@ fn fill_cancel_fsub<F: PrimeField32>(
     ediff: u32,
     range_checker: &SharedVariableRangeCheckerChip,
 ) {
+    let (eff_large_sig, eff_small_sig, a_ge_b) = if ediff != 0 {
+        (large_sig, small_sig, false)
+    } else {
+        let ge = a_sig >= b_sig;
+        (
+            if ge { a_sig } else { b_sig },
+            if ge { b_sig } else { a_sig },
+            ge,
+        )
+    };
+    row.a_ge_b = F::from_bool(a_ge_b);
     let x: [u32; 6] = [
         0,
         0,
@@ -1523,10 +1569,14 @@ fn fill_cancel_fsub<F: PrimeField32>(
     ];
     row.cancel_align = make_shrn_cols6::<F>(x, ediff as usize, range_checker);
 
-    let aligned: u64 = (0..6).fold(0u64, |acc, i| {
-        acc | ((row.cancel_align.y[i].as_canonical_u32() as u64) << (i * 8))
-    });
-    let large_working6: u64 = (large_sig as u64) << 24;
+    let large_working6: u64 = (eff_large_sig as u64) << 24;
+    let aligned: u64 = if ediff != 0 {
+        (0..6).fold(0u64, |acc, i| {
+            acc | ((row.cancel_align.y[i].as_canonical_u32() as u64) << (i * 8))
+        })
+    } else {
+        (eff_small_sig as u64) << 24
+    };
     let raw_diff = large_working6.wrapping_sub(aligned);
     debug_assert!(
         raw_diff < (1u64 << 48),
@@ -1620,8 +1670,9 @@ fn fill_cancel_fsub<F: PrimeField32>(
     let rc2_rem = top7c & 0x7F;
     let result_exp_calc = large_exp.wrapping_sub(lshift).wrapping_add(rc2);
 
-    // fsub result sign: a_is_larger ? a_sign : (1 - a_sign).
-    let cancel_r_sign = if a_is_larger { a_sign } else { 1 - a_sign };
+    // fsub result sign: ediff>=1 → a_is_larger ? a_sign : (1-a_sign); ediff=0 → a_ge_b ? a_sign : (1-a_sign).
+    let sign_selector = if ediff != 0 { a_is_larger } else { a_ge_b };
+    let cancel_r_sign = if sign_selector { a_sign } else { 1 - a_sign };
 
     row.carry_out = F::ZERO;
     row.sum_c1 = F::ZERO;

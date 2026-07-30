@@ -157,7 +157,8 @@ pub struct FaddCoreCols<T> {
     pub ediff_nz: T,                  // ediff != 0 (exclude same-exp subtraction)
     pub ediff_nz_inv: T,
     pub s_fb: T,            // finite AND both-normal (common finite precondition)
-    pub s_cancel: T,        // finite AND !is_add AND both-normal AND !is_deep AND ediff!=0
+    pub s_cancel: T,        // finite AND !is_add AND both-normal AND !is_deep
+    pub a_ge_b: T,          // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T, // s_cancel AND result exp field in [1, 254]
 
     // === Result ===
@@ -784,10 +785,11 @@ impl FaddCoreAir {
             .when(cols.is_valid)
             .assert_eq(cols.ediff_nz, one.clone() - ediff_is_zero);
         builder.assert_bool(cols.ediff_nz);
-        // s_cancel = s_fb AND (NOT is_add) AND (NOT is_deep) AND ediff!=0.
+        // s_cancel = s_fb AND (NOT is_add) AND (NOT is_deep). (ediff=0 is included;
+        // handled by a separate 3-byte magnitude comparison below.)
         builder.assert_eq(
             cols.s_cancel,
-            cols.s_fb * (one.clone() - cols.is_add) * (one.clone() - cols.is_deep) * cols.ediff_nz,
+            cols.s_fb * (one.clone() - cols.is_add) * (one.clone() - cols.is_deep),
         );
         builder.assert_bool(cols.s_cancel);
         let s = cols.s_cancel;
@@ -814,9 +816,17 @@ impl FaddCoreAir {
         let align_shrn = ShrnGadget::new(self.range_bus);
         align_shrn.eval_shrn(builder, &cols.cancel_align);
 
-        // ── 6-byte borrow chain: raw_diff = large_working - aligned ──────
-        // large_working = [0, 0, 0, large_sig[0], large_sig[1], large_sig[2]].
-        // raw_diff >= 0 for ediff >= 1 (large dominates).
+        // ── 6-byte borrow chain ──────────────────────────────────────────
+        // Two subcases: ediff >= 1 (aligned via ShrnGadget) and ediff == 0
+        // (both at the same position, effective_large/small via a_ge_b).
+        for i in 0..5 {
+            builder.assert_bool(cols.cancel_borrow[i]);
+        }
+        builder.assert_bool(cols.a_ge_b);
+        let s_e1 = s * cols.ediff_nz; // ediff >= 1
+        let s_e0 = s * (one.clone() - cols.ediff_nz); // ediff == 0
+
+        // --- ediff >= 1: raw_diff = large_working - aligned ---
         let lw = |i: usize| -> AB::Expr {
             match i {
                 0..=2 => AB::Expr::ZERO,
@@ -826,26 +836,46 @@ impl FaddCoreAir {
                 _ => unreachable!(),
             }
         };
-        for i in 0..5 {
-            builder.assert_bool(cols.cancel_borrow[i]);
-        }
-        // byte 0: raw_diff[0] + aligned[0] + 0 = 0 + borrow_out0*256
-        builder.when(s).assert_eq(
+        builder.when(s_e1.clone()).assert_eq(
             cols.cancel_diff[0] + cols.cancel_align.y[0],
             cols.cancel_borrow[0] * f256,
         );
-        // bytes 1..5: raw_diff[i] + aligned[i] + borrow_in = lw[i] + borrow_out*256
         for i in 1..5 {
             let bin = cols.cancel_borrow[i - 1];
-            builder.when(s).assert_eq(
+            builder.when(s_e1.clone()).assert_eq(
                 cols.cancel_diff[i] + cols.cancel_align.y[i] + bin,
                 lw(i) + cols.cancel_borrow[i] * f256,
             );
         }
-        // byte 5 (top): no borrow out (raw_diff >= 0).
-        builder.when(s).assert_eq(
+        builder.when(s_e1.clone()).assert_eq(
             cols.cancel_diff[5] + cols.cancel_align.y[5] + cols.cancel_borrow[4],
             lw(5),
+        );
+
+        // --- ediff == 0: raw_diff = effective_large - effective_small ---
+        // For ediff=0, a_is_larger=true (tie-break), so large_sig=a_sig,
+        // small_sig=b_sig. effective_large/small swap based on a_ge_b.
+        let eff_large = |i: usize| {
+            cols.a_ge_b * cols.large_sig[i] + (one.clone() - cols.a_ge_b) * cols.small_sig[i]
+        };
+        let eff_small = |i: usize| {
+            cols.a_ge_b * cols.small_sig[i] + (one.clone() - cols.a_ge_b) * cols.large_sig[i]
+        };
+        for i in 0..3 {
+            builder.when(s_e0.clone()).assert_zero(cols.cancel_diff[i]);
+        }
+        builder.when(s_e0.clone()).assert_eq(
+            cols.cancel_diff[3] + eff_small(0),
+            eff_large(0) + cols.cancel_borrow[0] * f256,
+        );
+        builder.when(s_e0.clone()).assert_eq(
+            cols.cancel_diff[4] + eff_small(1) + cols.cancel_borrow[0],
+            eff_large(1) + cols.cancel_borrow[1] * f256,
+        );
+        // No final borrow (forces a_ge_b correctness).
+        builder.when(s_e0.clone()).assert_eq(
+            cols.cancel_diff[5] + eff_small(2) + cols.cancel_borrow[1],
+            eff_large(2),
         );
 
         // ── Left-shift normalize via ShlnGadget<6> ──────────────────────
@@ -915,9 +945,11 @@ impl FaddCoreAir {
             cols.r_exp_lo + cols.r_exp_hi * f2,
             large_exp.clone() - cols.cancel_lshift + cols.rc2,
         );
-        builder
-            .when(s)
-            .assert_eq(cols.result_sign, large_sign.clone());
+        // result sign: ediff>=1 → large_sign; ediff=0 → a_ge_b ? a_sign : b_sign.
+        let ediff0_sign = cols.a_ge_b * cols.a_sign + (one.clone() - cols.a_ge_b) * cols.b_sign;
+        let cancel_r_sign =
+            cols.ediff_nz * large_sign.clone() + (one.clone() - cols.ediff_nz) * ediff0_sign;
+        builder.when(s).assert_eq(cols.result_sign, cancel_r_sign);
         // result mantissa from norm[3..5] + round_up.
         builder
             .when(s)
@@ -1276,8 +1308,7 @@ fn fill_fadd_witness<F: PrimeField32>(
     } else {
         F::ZERO
     };
-    let s_cancel =
-        s_finite_bool && !same_sign && a_is_normal && b_is_normal && !is_deep && ediff != 0;
+    let s_cancel = s_finite_bool && !same_sign && a_is_normal && b_is_normal && !is_deep;
     row.s_fb = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
@@ -1316,6 +1347,10 @@ fn fill_fadd_witness<F: PrimeField32>(
                 small_sig,
                 large_exp,
                 large_sign,
+                a_sig,
+                b_sig,
+                a_sign,
+                b_sign,
                 r_exp,
                 result_bits,
                 a_bits,
@@ -1578,6 +1613,10 @@ fn fill_cancel_fadd<F: PrimeField32>(
     small_sig: u32,
     large_exp: u32,
     large_sign: u32,
+    a_sig: u32,
+    b_sig: u32,
+    a_sign: u32,
+    b_sign: u32,
     r_exp: u32,
     result_bits: u32,
     a_bits: u32,
@@ -1585,7 +1624,21 @@ fn fill_cancel_fadd<F: PrimeField32>(
     ediff: u32,
     range_checker: &SharedVariableRangeCheckerChip,
 ) {
-    // ── 6-byte alignment: aligned = (small_sig << 24) >> ediff ─────────
+    // Determine effective large/small for the subtraction.
+    // ediff >= 1: large/small from exp selection (already correct).
+    // ediff == 0: use a_ge_b (mantissa magnitude comparison).
+    let (eff_large_sig, eff_small_sig, a_ge_b) = if ediff != 0 {
+        (large_sig, small_sig, false)
+    } else {
+        let ge = a_sig >= b_sig;
+        (
+            if ge { a_sig } else { b_sig },
+            if ge { b_sig } else { a_sig },
+            ge,
+        )
+    };
+    row.a_ge_b = F::from_bool(a_ge_b);
+    // ── 6-byte alignment via ShrnGadget (ediff >= 1); identity for ediff=0 ─
     let x: [u32; 6] = [
         0,
         0,
@@ -1596,11 +1649,15 @@ fn fill_cancel_fadd<F: PrimeField32>(
     ];
     row.cancel_align = make_shrn_cols6::<F>(x, ediff as usize, range_checker);
 
-    // ── 6-byte subtraction: raw_diff = large_working - aligned ─────────
-    let aligned: u64 = (0..6).fold(0u64, |acc, i| {
-        acc | ((row.cancel_align.y[i].as_canonical_u32() as u64) << (i * 8))
-    });
-    let large_working6: u64 = (large_sig as u64) << 24;
+    // ── 6-byte subtraction: raw_diff = eff_large_working - eff_small_working ─
+    let large_working6: u64 = (eff_large_sig as u64) << 24;
+    let aligned: u64 = if ediff != 0 {
+        (0..6).fold(0u64, |acc, i| {
+            acc | ((row.cancel_align.y[i].as_canonical_u32() as u64) << (i * 8))
+        })
+    } else {
+        (eff_small_sig as u64) << 24
+    };
     let raw_diff = large_working6.wrapping_sub(aligned);
     debug_assert!(
         raw_diff < (1u64 << 48),
@@ -1725,7 +1782,15 @@ fn fill_cancel_fadd<F: PrimeField32>(
         F::ZERO
     };
     row.result_exp = F::from_u32(r_exp);
-    row.result_sign = F::from_u32(large_sign);
+    // Result sign: ediff>=1 → large_sign; ediff=0 → a_ge_b ? a_sign : b_sign.
+    let cancel_r_sign = if ediff != 0 {
+        large_sign
+    } else if a_ge_b {
+        a_sign
+    } else {
+        b_sign
+    };
+    row.result_sign = F::from_u32(cancel_r_sign);
     range_checker.add_count(rc2_rem, 7);
     row.s_cancel_normal = F::from_bool((1u32..=254).contains(&r_exp));
 
@@ -2139,5 +2204,36 @@ mod finite_add_tests {
         // (s_add = 0), so the constraints must not fire / fail.
         let (builder, _) = run(5.0f32.to_bits(), (-3.0f32).to_bits());
         assert!(builder.ok(), "subtraction must not be constrained here");
+    }
+
+    #[test]
+    fn finite_add_ediff0_cancellation() {
+        let chip = rc();
+        // 1.0 + (-(1.0+tiny)) = -tiny. ediff=0, a_ge_b=false.
+        let mut row = FaddCoreCols::<F>::default();
+        fill_fadd_witness(
+            &mut row,
+            0x3f800000,
+            0xbf800001,
+            fadd_s(0x3f800000, 0xbf800001),
+            &chip,
+        );
+        let mut b = NumericBuilder::new(vec![]);
+        air().eval_finite_add(&mut b, &row);
+        air().eval_finite_cancel(&mut b, &row);
+        assert!(b.ok(), "ediff=0 cancel a<b: {:?}", b.failures);
+        // 3.0 + (-2.0) = 1.0. ediff=0, a_ge_b=true.
+        let mut row2 = FaddCoreCols::<F>::default();
+        fill_fadd_witness(
+            &mut row2,
+            3.0f32.to_bits(),
+            (-2.0f32).to_bits(),
+            fadd_s(3.0f32.to_bits(), (-2.0f32).to_bits()),
+            &chip,
+        );
+        let mut b2 = NumericBuilder::new(vec![]);
+        air().eval_finite_add(&mut b2, &row2);
+        air().eval_finite_cancel(&mut b2, &row2);
+        assert!(b2.ok(), "ediff=0 cancel a>b: {:?}", b2.failures);
     }
 }
