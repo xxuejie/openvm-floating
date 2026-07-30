@@ -442,6 +442,28 @@ impl FaddCoreAir {
         builder
             .when(cols.s_zero_both)
             .assert_eq(cols.result[3], zero_sign * f128);
+
+        // One-zero: when exactly one input is zero, result = the nonzero operand.
+        // Degree-3 constraints: a_is_zero * (1-b_is_zero) * (result - b_bytes) = 0.
+        // They vanish trivially when both or neither is zero.
+        let not_bz = one.clone() - cols.b_is_zero;
+        let not_az = one.clone() - cols.a_is_zero;
+        builder.assert_zero(cols.a_is_zero * not_bz.clone() * (cols.result[0] - cols.b_mant0));
+        builder.assert_zero(cols.b_is_zero * not_az.clone() * (cols.result[0] - cols.a_mant0));
+        builder.assert_zero(cols.a_is_zero * not_bz.clone() * (cols.result[1] - cols.b_mant1));
+        builder.assert_zero(cols.b_is_zero * not_az.clone() * (cols.result[1] - cols.a_mant1));
+        builder.assert_zero(
+            cols.a_is_zero * not_bz.clone() * (cols.result[2] - cols.b_mant2 - cols.b_exp_lo * f128),
+        );
+        builder.assert_zero(
+            cols.b_is_zero * not_az.clone() * (cols.result[2] - cols.a_mant2 - cols.a_exp_lo * f128),
+        );
+        builder.assert_zero(
+            cols.a_is_zero * not_bz * (cols.result[3] - cols.b_exp_hi - cols.b_sign * f128),
+        );
+        builder.assert_zero(
+            cols.b_is_zero * not_az * (cols.result[3] - cols.a_exp_hi - cols.a_sign * f128),
+        );
     }
 
     /// Constrain the finite, same-sign, both-normal result path.
@@ -773,7 +795,7 @@ impl FaddCoreAir {
 
         // ── Sound selectors ─────────────────────────────────────────────
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
-        builder.assert_eq(
+        builder.when(cols.is_valid).assert_eq(
             cols.s_fb,
             s_finite.clone() * cols.a_is_normal * cols.b_is_normal,
         );
@@ -1930,10 +1952,27 @@ mod special_tests {
         let inf_in = a_inf || b_inf;
         let s_inf = !is_nan_res && inf_in;
         let s_zero_both = !is_nan_res && !inf_in && a_zero && b_zero;
+        let is_special = is_nan_res || s_inf || s_zero_both;
+
+        // Decompose inputs (needed for the one-zero special case).
+        let a_mant = a & 0x7FFFFF;
+        let b_mant = b & 0x7FFFFF;
+        let a_exp = (a >> 23) & 0xFF;
+        let b_exp = (b >> 23) & 0xFF;
 
         FaddCoreCols {
             a_sign: F::from_u32((a >> 31) & 1),
             b_sign: F::from_u32((b >> 31) & 1),
+            a_mant0: F::from_u32(a_mant & 0xFF),
+            a_mant1: F::from_u32((a_mant >> 8) & 0xFF),
+            a_mant2: F::from_u32((a_mant >> 16) & 0x7F),
+            a_exp_lo: F::from_u32(a_exp & 1),
+            a_exp_hi: F::from_u32(a_exp >> 1),
+            b_mant0: F::from_u32(b_mant & 0xFF),
+            b_mant1: F::from_u32((b_mant >> 8) & 0xFF),
+            b_mant2: F::from_u32((b_mant >> 16) & 0x7F),
+            b_exp_lo: F::from_u32(b_exp & 1),
+            b_exp_hi: F::from_u32(b_exp >> 1),
             a_is_nan: F::from_bool(a_nan),
             b_is_nan: F::from_bool(b_nan),
             a_is_inf: F::from_bool(a_inf),
@@ -1945,6 +1984,7 @@ mod special_tests {
             s_inf: F::from_bool(s_inf),
             s_zero_both: F::from_bool(s_zero_both),
             is_nan_result: F::from_bool(is_nan_res),
+            is_special: F::from_bool(is_special),
             result: core::array::from_fn(|i| F::from_u32((result >> (i * 8)) & 0xFF)),
             ..Default::default()
         }
