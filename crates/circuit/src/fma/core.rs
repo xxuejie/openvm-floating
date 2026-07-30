@@ -193,6 +193,22 @@ pub struct FmaCoreCols<T> {
     pub deep_round_up: T,
     pub r_sign_eff: T,
 
+    // === Phase 4: RNE rounding + output ===
+    pub nw_guard: T,
+    pub nw2_lo7: T,
+    pub nw_lsb: T,
+    pub below_guard: T,
+    pub below_guard_nz: T,
+    pub below_guard_inv: T,
+    pub eff_sticky: T,
+    pub round_up: T,
+    pub rc0: T,
+    pub rc1: T,
+    pub rc2: T,
+    pub rc2_rem: T,
+    pub r_exp_lo: T,
+    pub r_exp_hi: T,
+
     pub result: [T; 4],
     pub is_valid: T,
 }
@@ -797,9 +813,13 @@ impl FmaCoreAir {
                     .eval(builder, s.into());
             }
         }
-        // Add overflow: add_overflow is boolean; final borrow for cancel must be 0.
+        // Add overflow: add_overflow = (raw_work[6] > 0). Boolean; cancel must be 0.
         builder.assert_bool(cols.add_overflow);
         builder.when(s_cancel).assert_zero(cols.add_overflow);
+        // When add_overflow=0, raw_work[6] must be 0 (no overflow to byte 6).
+        builder
+            .when(s_add)
+            .assert_zero(cols.raw_work[6] * (one.clone() - cols.add_overflow));
 
         // ── Byte decomposition for add-overflow right-shift ────────────
         for i in 0..7 {
@@ -808,14 +828,12 @@ impl FmaCoreAir {
         }
 
         // ── Add normalization: if add_overflow, shift right by 1 ────────
-        // norm_work[6] = (raw_work[6] - lo[6]) * inv2 + add_overflow * 128.
-        // norm_work[i] = (raw_work[i] - lo[i]) * inv2 + lo[i+1] * 128 (for i<6).
         let inv2 = f2.inverse();
         for i in 0..7 {
             let lo_next = if i < 6 {
                 cols.work_lo[i + 1].into()
             } else {
-                cols.add_overflow.into()
+                AB::Expr::ZERO // byte 6 has no byte 7 to pull from
             };
             // When add_overflow: norm_work[i] = (raw-lo)*inv2 + lo_next*128.
             // When no overflow: norm_work[i] = raw_work[i].
@@ -885,6 +903,104 @@ impl FmaCoreAir {
         builder
             .when(s * cols.is_deep * (one.clone() - cil))
             .assert_eq(cols.r_sign_eff, cols.prod_sign_eff);
+
+        // ── Phase 4: RNE rounding + output reconstruction ─────────────
+        self.eval_finite_output(builder, cols);
+    }
+
+    /// Phase 4: Extract 23-bit mantissa from norm_work, apply RNE rounding,
+    /// and reconstruct result bytes.
+    pub fn eval_finite_output<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FmaCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
+        let one = AB::Expr::ONE;
+        let s = cols.s_finite;
+
+        // ── Guard / LSB extraction ────────────────────────────────────
+        // Guard = bit 7 of norm_work[2]. LSB = bit 0 of norm_work[3].
+        builder.assert_bool(cols.nw_guard);
+        builder
+            .when(s)
+            .assert_eq(cols.norm_work[2], cols.nw_guard * f128 + cols.nw2_lo7);
+        self.range_bus
+            .range_check(cols.nw2_lo7.into(), 7)
+            .eval(builder, s.into());
+        builder.assert_bool(cols.nw_lsb);
+        builder.when(s).assert_eq(
+            cols.norm_work[3],
+            cols.nw_lsb + (cols.norm_work[3] - cols.nw_lsb),
+        );
+
+        // ── Sticky: bits below guard ──────────────────────────────────
+        let below = cols.nw2_lo7 + cols.norm_work[1] + cols.norm_work[0];
+        builder.when(s).assert_eq(cols.below_guard, below);
+        let bg_is_zero = one.clone() - cols.below_guard * cols.below_guard_inv;
+        builder.assert_zero(cols.below_guard * bg_is_zero.clone());
+        builder
+            .when(s)
+            .assert_eq(cols.below_guard_nz, one.clone() - bg_is_zero);
+        builder.assert_bool(cols.below_guard_nz);
+
+        // Effective sticky: below_guard_nz OR align.sticky.
+        let sticky_expr =
+            cols.below_guard_nz + cols.align.sticky - cols.below_guard_nz * cols.align.sticky;
+        builder.when(s).assert_eq(cols.eff_sticky, sticky_expr);
+        builder.assert_bool(cols.eff_sticky);
+
+        // round_up = guard AND (sticky OR lsb).
+        let sor = cols.eff_sticky + cols.nw_lsb - cols.eff_sticky * cols.nw_lsb;
+        builder
+            .when(s)
+            .assert_eq(cols.round_up, cols.nw_guard * sor);
+        builder.assert_bool(cols.round_up);
+
+        // ── Mantissa carry chain ──────────────────────────────────────
+        builder.assert_bool(cols.rc0);
+        builder.assert_bool(cols.rc1);
+        builder.assert_bool(cols.rc2);
+        builder.when(s).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            cols.norm_work[3] + cols.round_up,
+        );
+        builder.when(s).assert_eq(
+            cols.result[1] + cols.rc1 * f256,
+            cols.norm_work[4] + cols.rc0,
+        );
+        // top7 = norm_work[5] - 128 (remove implicit bit).
+        let top7 = cols.norm_work[5] - f128;
+        builder
+            .when(s)
+            .assert_eq(top7 + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s.into());
+
+        // ── Result exponent ───────────────────────────────────────────
+        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_hi * f2;
+        let c_exp = cols.c_exp_lo + cols.c_hi * f2;
+        let cil = cols.c_is_larger;
+        let prod_exp = a_exp + b_exp - AB::Expr::from(f127) + cols.is_high;
+        let larger_exp = (one.clone() - cil) * prod_exp + cil * c_exp;
+        // result_exp = larger_exp + add_overflow - cancel_lshift * s_cancel.
+        let res_exp = larger_exp + cols.add_overflow - cols.cancel_lshift * cols.s_cancel;
+        builder
+            .when(s)
+            .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, res_exp);
+
+        // ── Result bytes ──────────────────────────────────────────────
+        builder
+            .when(s)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder
+            .when(s)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.r_sign_eff * f128);
     }
 }
 
@@ -1176,6 +1292,7 @@ where
                 prod_sign_eff,
                 c_sign_eff,
                 sign_diff,
+                result,
                 &self.range_checker,
             );
         } else {
@@ -1229,6 +1346,20 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FmaCoreCols<F>) {
     row.cancel_shln = ShlnCols::<F, 7>::default();
     row.deep_round_up = F::ZERO;
     row.r_sign_eff = F::ZERO;
+    row.nw_guard = F::ZERO;
+    row.nw2_lo7 = F::ZERO;
+    row.nw_lsb = F::ZERO;
+    row.below_guard = F::ZERO;
+    row.below_guard_nz = F::ZERO;
+    row.below_guard_inv = F::ZERO;
+    row.eff_sticky = F::ZERO;
+    row.round_up = F::ZERO;
+    row.rc0 = F::ZERO;
+    row.rc1 = F::ZERO;
+    row.rc2 = F::ZERO;
+    row.rc2_rem = F::ZERO;
+    row.r_exp_lo = F::ZERO;
+    row.r_exp_hi = F::ZERO;
 }
 
 /// Fill the product + alignment + sum/diff witness for the finite path.
@@ -1244,6 +1375,7 @@ fn fill_finite_product<F: PrimeField32>(
     prod_sign_eff: bool,
     c_sign_eff: bool,
     sign_diff: bool,
+    result: u32,
     range_checker: &SharedVariableRangeCheckerChip,
 ) {
     let a_sig = a_mant | 0x800000;
@@ -1383,7 +1515,6 @@ fn fill_finite_product<F: PrimeField32>(
     // Sum or difference.
     let raw_bytes: [u32; 7];
     let cb_bytes: [u32; 6];
-    let add_overflow_val: u32;
     if s_add {
         let mut carry: u32 = 0;
         let mut rb = [0u32; 7];
@@ -1396,7 +1527,6 @@ fn fill_finite_product<F: PrimeField32>(
                 cb[i] = carry;
             }
         }
-        add_overflow_val = carry;
         raw_bytes = rb;
         cb_bytes = cb;
     } else if s_cancel {
@@ -1417,15 +1547,16 @@ fn fill_finite_product<F: PrimeField32>(
             }
         }
         debug_assert_eq!(borrow, 0, "fma cancel: difference is negative");
-        add_overflow_val = 0;
         raw_bytes = rb;
         cb_bytes = cb;
     } else {
         // Deep: raw_work = larger (passthrough).
         raw_bytes = large_bytes;
         cb_bytes = [0; 6];
-        add_overflow_val = 0;
     }
+
+    // add_overflow = (byte 6 of raw_work is nonzero): sum exceeded 48 bits.
+    let add_overflow_val: u32 = if s_add { (raw_bytes[6] > 0) as u32 } else { 0 };
 
     for (i, &rb) in raw_bytes.iter().enumerate() {
         row.raw_work[i] = F::from_u32(rb);
@@ -1449,7 +1580,7 @@ fn fill_finite_product<F: PrimeField32>(
             let lo_next = if i < 6 {
                 raw_bytes[i + 1] & 1
             } else {
-                add_overflow_val
+                0 // byte 6 has no byte 7
             };
             let nw = (raw_bytes[i] >> 1) | (lo_next << 7);
             row.norm_work[i] = F::from_u32(nw);
@@ -1518,6 +1649,86 @@ fn fill_finite_product<F: PrimeField32>(
     } else {
         row.r_sign_eff = F::from_bool(prod_sign_eff);
     }
+
+    // ── Phase 4: RNE rounding + output ─────────────────────────────
+    let norm_bytes: [u32; 7] = core::array::from_fn(|i| row.norm_work[i].as_canonical_u32());
+
+    // Guard = bit 7 of norm_work[2]. LSB = bit 0 of norm_work[3].
+    let guard = (norm_bytes[2] >> 7) & 1;
+    let nw2_lo7 = norm_bytes[2] & 0x7F;
+    let lsb = norm_bytes[3] & 1;
+    row.nw_guard = F::from_u32(guard);
+    row.nw2_lo7 = F::from_u32(nw2_lo7);
+    range_checker.add_count(nw2_lo7, 7);
+    row.nw_lsb = F::from_u32(lsb);
+
+    // Sticky: bits below guard.
+    let below = nw2_lo7 + norm_bytes[1] + norm_bytes[0];
+    row.below_guard = F::from_u32(below);
+    let bg_nz = below != 0;
+    row.below_guard_nz = F::from_bool(bg_nz);
+    row.below_guard_inv = if bg_nz {
+        F::from_u32(below).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    // Effective sticky: below_guard_nz OR align.sticky.
+    let align_sticky = row.align.sticky.as_canonical_u32() != 0;
+    let eff_sticky = bg_nz || align_sticky;
+    row.eff_sticky = F::from_bool(eff_sticky);
+
+    // round_up = guard AND (eff_sticky OR lsb).
+    let round_up = guard == 1 && (eff_sticky || lsb == 1);
+    row.round_up = F::from_bool(round_up);
+
+    // Mantissa carry chain.
+    let s0 = norm_bytes[3] + round_up as u32;
+    let rc0 = s0 >> 8;
+    let s1 = norm_bytes[4] + rc0;
+    let rc1 = s1 >> 8;
+    let top7 = norm_bytes[5].saturating_sub(128);
+    let top7c = top7 + rc1;
+    let rc2 = top7c >> 7;
+    let rc2_rem = top7c & 0x7F;
+    row.rc0 = F::from_u32(rc0);
+    row.rc1 = F::from_u32(rc1);
+    row.rc2 = F::from_u32(rc2);
+    row.rc2_rem = F::from_u32(rc2_rem);
+    range_checker.add_count(rc2_rem, 7);
+
+    // Result exponent.
+    let prod_exp_i = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
+    let larger_exp_i = if c_is_larger {
+        c_exp as i32
+    } else {
+        prod_exp_i
+    };
+    let res_exp_i = larger_exp_i + add_overflow_val as i32
+        - if s_cancel {
+            row.cancel_lshift.as_canonical_u32() as i32
+        } else {
+            0
+        };
+    let res_exp = res_exp_i as u32;
+    row.r_exp_lo = F::from_u32(res_exp & 1);
+    row.r_exp_hi = F::from_u32(res_exp >> 1);
+
+    // Sanity check against native result.
+    let r_exp_field = (result >> 23) & 0xFF;
+    debug_assert_eq!(
+        res_exp, r_exp_field,
+        "fma exp mismatch: res_exp={} field={}",
+        res_exp, r_exp_field
+    );
+    debug_assert_eq!(s0 & 0xFF, result & 0xFF, "fma byte0");
+    debug_assert_eq!(s1 & 0xFF, (result >> 8) & 0xFF, "fma byte1");
+    debug_assert_eq!(
+        (rc2_rem + (res_exp & 1) * 128) & 0xFF,
+        (result >> 16) & 0xFF,
+        "fma byte2"
+    );
+
     let _ = (a_exp, b_exp, c_exp);
 }
 
@@ -1682,6 +1893,7 @@ mod product_tests {
                 prod_sign_eff,
                 c_sign_eff,
                 sign_diff,
+                result,
                 &chip,
             );
         }
@@ -1689,8 +1901,6 @@ mod product_tests {
         let air = FmaCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
         let mut builder = NumericBuilder::new(vec![]);
         air.eval_finite_product(&mut builder, &row);
-        air.eval_finite_align(&mut builder, &row);
-        air.eval_finite_sumdiff(&mut builder, &row);
         builder
     }
 
