@@ -21,7 +21,9 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
-use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+use crate::fp_shift::{
+    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+};
 
 /// Which fused multiply-add variant an instruction performs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,6 +179,19 @@ pub struct FmaCoreCols<T> {
     pub is_deep: T,
     pub align_lt_decomp: [T; 1],
     pub align: ShrnCols<T, 7>,
+
+    // === Phase 3: sum / difference ===
+    pub s_add: T,
+    pub s_cancel: T,
+    pub raw_work: [T; 7],
+    pub work_cb: [T; 6],
+    pub add_overflow: T,
+    pub work_lo: [T; 7],
+    pub cancel_lshift: T,
+    pub cancel_shln: ShlnCols<T, 7>,
+    pub norm_work: [T; 7],
+    pub deep_round_up: T,
+    pub r_sign_eff: T,
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -700,6 +715,176 @@ impl FmaCoreAir {
         builder.assert_eq(cols.align.enable, s);
         let shrn = ShrnGadget::new(self.range_bus);
         shrn.eval_shrn(builder, &cols.align);
+
+        // ── Phase 3: sum / difference ──────────────────────────────────
+        self.eval_finite_sumdiff(builder, cols);
+    }
+
+    /// Phase 3: Compute the sum (sign_diff=0) or difference (sign_diff=1)
+    /// of the larger operand and the aligned smaller operand, then normalize.
+    pub fn eval_finite_sumdiff<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FmaCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
+        let one = AB::Expr::ONE;
+        let s = cols.s_finite;
+        let cil = cols.c_is_larger;
+
+        // ── Path selectors ─────────────────────────────────────────────
+        builder.when(s).assert_eq(
+            cols.s_add,
+            (one.clone() - cols.sign_diff) * (one.clone() - cols.is_deep),
+        );
+        builder
+            .when(s)
+            .assert_eq(cols.s_cancel, cols.sign_diff * (one.clone() - cols.is_deep));
+        builder.assert_bool(cols.s_add);
+        builder.assert_bool(cols.s_cancel);
+
+        // ── Larger operand bytes (mux product vs c) ────────────────────
+        // c_is_larger=0: larger = [norm_prod[0..5], 0].
+        // c_is_larger=1: larger = [0,0,0, c_sig[0], c_sig[1], c_sig[2], 0].
+        let large = |i: usize| -> AB::Expr {
+            let p_val = if i < 6 {
+                cols.norm_prod[i].into()
+            } else {
+                AB::Expr::ZERO
+            };
+            let c_val = match i {
+                3 => cols.c_sig[0].into(),
+                4 => cols.c_sig[1].into(),
+                5 => cols.c_sig[2].into(),
+                _ => AB::Expr::ZERO,
+            };
+            (one.clone() - cil) * p_val + cil * c_val
+        };
+
+        // ── Sum/difference carry/borrow chain (7 bytes) ─────────────────
+        let s_add = cols.s_add;
+        let s_cancel = cols.s_cancel;
+        for i in 0..7 {
+            let cb_in = if i == 0 {
+                AB::Expr::ZERO
+            } else {
+                cols.work_cb[i - 1].into()
+            };
+            let cb_out = if i < 6 {
+                cols.work_cb[i].into()
+            } else {
+                cols.add_overflow.into()
+            };
+            // Add path: raw_work[i] + carry_out*256 = large[i] + align.y[i] + carry_in.
+            builder.when(s_add).assert_eq(
+                cols.raw_work[i] + cb_out.clone() * f256,
+                large(i) + cols.align.y[i] + cb_in.clone(),
+            );
+            // Cancel path: raw_work[i] = large[i] - align.y[i] - borrow_in + borrow_out*256.
+            builder.when(s_cancel).assert_eq(
+                cols.raw_work[i],
+                large(i) - cols.align.y[i] - cb_in + cb_out * f256,
+            );
+            self.range_bus
+                .range_check(cols.raw_work[i].into(), LIMB_BITS as usize)
+                .eval(builder, s.into());
+            if i < 6 {
+                builder.assert_bool(cols.work_cb[i]);
+                self.range_bus
+                    .range_check(cols.work_cb[i].into(), LIMB_BITS as usize)
+                    .eval(builder, s.into());
+            }
+        }
+        // Add overflow: add_overflow is boolean; final borrow for cancel must be 0.
+        builder.assert_bool(cols.add_overflow);
+        builder.when(s_cancel).assert_zero(cols.add_overflow);
+
+        // ── Byte decomposition for add-overflow right-shift ────────────
+        for i in 0..7 {
+            builder.assert_bool(cols.work_lo[i]);
+            // raw_work[i] = work_lo[i] + h7*2 where h7 is range-checked via norm constraint.
+        }
+
+        // ── Add normalization: if add_overflow, shift right by 1 ────────
+        // norm_work[6] = (raw_work[6] - lo[6]) * inv2 + add_overflow * 128.
+        // norm_work[i] = (raw_work[i] - lo[i]) * inv2 + lo[i+1] * 128 (for i<6).
+        let inv2 = f2.inverse();
+        for i in 0..7 {
+            let lo_next = if i < 6 {
+                cols.work_lo[i + 1].into()
+            } else {
+                cols.add_overflow.into()
+            };
+            // When add_overflow: norm_work[i] = (raw-lo)*inv2 + lo_next*128.
+            // When no overflow: norm_work[i] = raw_work[i].
+            // Mux on add_overflow, gated on s_add.
+            let shifted = (cols.raw_work[i] - cols.work_lo[i]) * inv2 + lo_next * f128;
+            builder
+                .when(s_add * cols.add_overflow)
+                .assert_eq(cols.norm_work[i], shifted);
+            builder
+                .when(s_add * (one.clone() - cols.add_overflow))
+                .assert_eq(cols.norm_work[i], cols.raw_work[i]);
+            // Range-check (raw_work[i] - lo[i]) * inv2 to 7 bits (= work_hi7).
+            let hi7 = (cols.raw_work[i] - cols.work_lo[i]) * inv2;
+            self.range_bus
+                .range_check(hi7, 7)
+                .eval(builder, s_add.into());
+        }
+
+        // ── Cancel normalization via ShlnGadget<7> ──────────────────────
+        for i in 0..7 {
+            builder
+                .when(s_cancel)
+                .assert_eq(cols.cancel_shln.x[i], cols.raw_work[i]);
+        }
+        builder
+            .when(s_cancel)
+            .assert_eq(cols.cancel_shln.shift, cols.cancel_lshift);
+        builder.assert_eq(cols.cancel_shln.enable, s_cancel);
+        let shln = ShlnGadget::new(self.range_bus);
+        shln.eval_shln(builder, &cols.cancel_shln);
+        for i in 0..7 {
+            builder
+                .when(s_cancel)
+                .assert_eq(cols.norm_work[i], cols.cancel_shln.y[i]);
+            self.range_bus
+                .range_check(cols.norm_work[i].into(), LIMB_BITS as usize)
+                .eval(builder, s_cancel.into());
+        }
+
+        // ── Deep path: norm_work = larger operand ──────────────────────
+        for i in 0..7 {
+            builder
+                .when(s * cols.is_deep)
+                .assert_eq(cols.norm_work[i], large(i));
+            self.range_bus
+                .range_check(cols.norm_work[i].into(), LIMB_BITS as usize)
+                .eval(builder, s * cols.is_deep);
+        }
+
+        // ── Result sign ────────────────────────────────────────────────
+        // Add/deep: sign = prod_sign_eff.
+        // Cancel: sign = prod_sign_eff if product >= c, else c_sign_eff.
+        // When c_is_larger: result sign = c_sign_eff (c was larger in cancellation).
+        // When !c_is_larger: result sign = prod_sign_eff.
+        builder
+            .when(s * (one.clone() - cols.sign_diff))
+            .assert_eq(cols.r_sign_eff, cols.prod_sign_eff);
+        builder
+            .when(s_cancel * cil)
+            .assert_eq(cols.r_sign_eff, cols.c_sign_eff);
+        builder
+            .when(s_cancel * (one.clone() - cil))
+            .assert_eq(cols.r_sign_eff, cols.prod_sign_eff);
+        builder
+            .when(s * cols.is_deep * cil)
+            .assert_eq(cols.r_sign_eff, cols.c_sign_eff);
+        builder
+            .when(s * cols.is_deep * (one.clone() - cil))
+            .assert_eq(cols.r_sign_eff, cols.prod_sign_eff);
     }
 }
 
@@ -988,6 +1173,9 @@ where
                 b_mant,
                 c_exp,
                 _c_mant,
+                prod_sign_eff,
+                c_sign_eff,
+                sign_diff,
                 &self.range_checker,
             );
         } else {
@@ -1026,9 +1214,24 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FmaCoreCols<F>) {
     row.is_deep = F::ZERO;
     row.align_lt_decomp = [F::ZERO];
     row.align = ShrnCols::<F, 7>::default();
+    row.s_add = F::ZERO;
+    row.s_cancel = F::ZERO;
+    for i in 0..7 {
+        row.raw_work[i] = F::ZERO;
+        row.norm_work[i] = F::ZERO;
+        row.work_lo[i] = F::ZERO;
+    }
+    for i in 0..6 {
+        row.work_cb[i] = F::ZERO;
+    }
+    row.add_overflow = F::ZERO;
+    row.cancel_lshift = F::ZERO;
+    row.cancel_shln = ShlnCols::<F, 7>::default();
+    row.deep_round_up = F::ZERO;
+    row.r_sign_eff = F::ZERO;
 }
 
-/// Fill the product + normalization witness for the finite path.
+/// Fill the product + alignment + sum/diff witness for the finite path.
 #[allow(clippy::too_many_arguments)]
 fn fill_finite_product<F: PrimeField32>(
     row: &mut FmaCoreCols<F>,
@@ -1038,6 +1241,9 @@ fn fill_finite_product<F: PrimeField32>(
     b_mant: u32,
     c_exp: u32,
     c_mant: u32,
+    prod_sign_eff: bool,
+    c_sign_eff: bool,
+    sign_diff: bool,
     range_checker: &SharedVariableRangeCheckerChip,
 ) {
     let a_sig = a_mant | 0x800000;
@@ -1149,6 +1355,170 @@ fn fill_finite_product<F: PrimeField32>(
     };
 
     row.align = make_shrn_cols7::<F>(align_x, cshift as usize, range_checker);
+
+    // ── Phase 3: sum / difference ──────────────────────────────────
+    let s_add = !sign_diff && !is_deep;
+    let s_cancel = sign_diff && !is_deep;
+    row.s_add = F::from_bool(s_add);
+    row.s_cancel = F::from_bool(s_cancel);
+
+    // Larger operand bytes.
+    let large_bytes: [u32; 7] = if c_is_larger {
+        [0, 0, 0, csig_bytes[0], csig_bytes[1], csig_bytes[2], 0]
+    } else {
+        let norm_arr: [u32; 6] = core::array::from_fn(|i| ((norm >> (i * 8)) & 0xFF) as u32);
+        [
+            norm_arr[0],
+            norm_arr[1],
+            norm_arr[2],
+            norm_arr[3],
+            norm_arr[4],
+            norm_arr[5],
+            0,
+        ]
+    };
+    // Aligned smaller operand bytes.
+    let align_y: [u32; 7] = core::array::from_fn(|i| row.align.y[i].as_canonical_u32());
+
+    // Sum or difference.
+    let raw_bytes: [u32; 7];
+    let cb_bytes: [u32; 6];
+    let add_overflow_val: u32;
+    if s_add {
+        let mut carry: u32 = 0;
+        let mut rb = [0u32; 7];
+        let mut cb = [0u32; 6];
+        for i in 0..7 {
+            let val = large_bytes[i] + align_y[i] + carry;
+            rb[i] = val & 0xFF;
+            carry = val >> 8;
+            if i < 6 {
+                cb[i] = carry;
+            }
+        }
+        add_overflow_val = carry;
+        raw_bytes = rb;
+        cb_bytes = cb;
+    } else if s_cancel {
+        let mut borrow: i64 = 0;
+        let mut rb = [0u32; 7];
+        let mut cb = [0u32; 6];
+        for i in 0..7 {
+            let d = large_bytes[i] as i64 - align_y[i] as i64 - borrow;
+            if d < 0 {
+                rb[i] = (d + 256) as u32;
+                borrow = 1;
+            } else {
+                rb[i] = d as u32;
+                borrow = 0;
+            }
+            if i < 6 {
+                cb[i] = borrow as u32;
+            }
+        }
+        debug_assert_eq!(borrow, 0, "fma cancel: difference is negative");
+        add_overflow_val = 0;
+        raw_bytes = rb;
+        cb_bytes = cb;
+    } else {
+        // Deep: raw_work = larger (passthrough).
+        raw_bytes = large_bytes;
+        cb_bytes = [0; 6];
+        add_overflow_val = 0;
+    }
+
+    for (i, &rb) in raw_bytes.iter().enumerate() {
+        row.raw_work[i] = F::from_u32(rb);
+        range_checker.add_count(rb, 8);
+        row.work_lo[i] = F::from_u32(rb & 1);
+    }
+    for (i, &cb) in cb_bytes.iter().enumerate() {
+        row.work_cb[i] = F::from_u32(cb);
+        range_checker.add_count(cb, 8);
+    }
+    row.add_overflow = F::from_u32(add_overflow_val);
+
+    // Initialize cancel columns to default (overwritten if cancel path).
+    row.cancel_lshift = F::ZERO;
+    row.cancel_shln = ShlnCols::<F, 7>::default();
+
+    // Normalization.
+    if s_add && add_overflow_val == 1 {
+        // Right-shift by 1. AIR sends hi7 range check (count=s_add).
+        for i in 0..7 {
+            let lo_next = if i < 6 {
+                raw_bytes[i + 1] & 1
+            } else {
+                add_overflow_val
+            };
+            let nw = (raw_bytes[i] >> 1) | (lo_next << 7);
+            row.norm_work[i] = F::from_u32(nw);
+            range_checker.add_count(raw_bytes[i] >> 1, 7);
+        }
+    } else if s_cancel {
+        // Left-shift by leading zeros to normalize (MSB to bit 47).
+        let raw_val: u64 = (0..7).fold(0u64, |acc, i| acc | ((raw_bytes[i] as u64) << (i * 8)));
+        let lshift = if raw_val == 0 {
+            0
+        } else {
+            ((raw_val.leading_zeros() - 8) as usize).min(55)
+        };
+        row.cancel_lshift = F::from_u32(lshift as u32);
+        let shifted = raw_val << lshift;
+        let norm_arr: [u32; 7] = core::array::from_fn(|i| ((shifted >> (i * 8)) & 0xFF) as u32);
+        // Build ShlnCols.
+        row.cancel_shln = ShlnCols::<F, 7>::default();
+        for (i, (&rb, &nb)) in raw_bytes.iter().zip(norm_arr.iter()).enumerate() {
+            row.cancel_shln.x[i] = F::from_u32(rb);
+            row.norm_work[i] = F::from_u32(nb);
+            range_checker.add_count(nb, 8);
+        }
+        let (y_shl, q_shl, r_shl) = run_shln(&raw_bytes, lshift);
+        debug_assert_eq!(norm_arr, core::array::from_fn(|i| y_shl[i]));
+        let mut lsm = [F::ZERO; 7];
+        let mut bsm = [F::ZERO; SHLIMB_BITS];
+        lsm[q_shl] = F::ONE;
+        bsm[r_shl] = F::ONE;
+        let cv = |v: u32| {
+            if r_shl == 0 {
+                0
+            } else {
+                v >> (SHLIMB_BITS - r_shl)
+            }
+        };
+        row.cancel_shln.shift = F::from_u32(lshift as u32);
+        row.cancel_shln.enable = F::ONE;
+        row.cancel_shln.limb_shift_marker = lsm;
+        row.cancel_shln.bit_shift_marker = bsm;
+        row.cancel_shln.bit_mult = F::from_u32(1u32 << r_shl);
+        row.cancel_shln.bit_shift_carry = core::array::from_fn(|i| F::from_u32(cv(raw_bytes[i])));
+        row.cancel_shln.y = core::array::from_fn(|i| F::from_u32(y_shl[i]));
+        for i in 0..7 {
+            range_checker.add_count(cv(raw_bytes[i]), r_shl);
+            range_checker.add_count(y_shl[i], 8);
+        }
+    } else {
+        // Deep or add-no-overflow: norm_work = raw_work.
+        for (i, &rb) in raw_bytes.iter().enumerate() {
+            row.norm_work[i] = F::from_u32(rb);
+            if is_deep {
+                range_checker.add_count(rb, 8);
+            }
+        }
+        if s_add {
+            for &rb in &raw_bytes {
+                range_checker.add_count(rb >> 1, 7);
+            }
+        }
+    }
+
+    // Result sign.
+    if s_cancel && c_is_larger {
+        row.r_sign_eff = F::from_bool(c_sign_eff);
+    } else {
+        row.r_sign_eff = F::from_bool(prod_sign_eff);
+    }
+    let _ = (a_exp, b_exp, c_exp);
 }
 
 /// Build a `ShrnCols<7>` witness and register range-checker counts.
@@ -1284,14 +1654,34 @@ mod product_tests {
         row.ab_normal = F::from_bool(a_normal && b_normal);
         row.c_finite_ok = F::from_bool(c_normal || c_zero_v);
 
+        let prod_sign_eff = a_sign != b_sign;
+        let c_sign_eff = c_sign == 1;
+        let sign_diff = prod_sign_eff != c_sign_eff;
+        row.prod_sign_eff = F::from_bool(prod_sign_eff);
+        row.c_sign_eff = F::from_bool(c_sign_eff);
+        row.sign_diff = F::from_bool(sign_diff);
+
         if s_finite {
-            fill_finite_product(&mut row, a_exp, b_exp, a_mant, b_mant, c_exp, c_mant, &chip);
+            fill_finite_product(
+                &mut row,
+                a_exp,
+                b_exp,
+                a_mant,
+                b_mant,
+                c_exp,
+                c_mant,
+                prod_sign_eff,
+                c_sign_eff,
+                sign_diff,
+                &chip,
+            );
         }
 
         let air = FmaCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
         let mut builder = NumericBuilder::new(vec![]);
         air.eval_finite_product(&mut builder, &row);
         air.eval_finite_align(&mut builder, &row);
+        air.eval_finite_sumdiff(&mut builder, &row);
         builder
     }
 
@@ -1307,6 +1697,7 @@ mod product_tests {
                 1.0f32.to_bits(),
             ),
             (0x3F800000u32, 0x3F800000, 0x3F800000), // 1*1+1
+            (0x7224d4c8u32, 0xe7aeaf61, 0x58d80a7f), // prove test case 1
         ] {
             let builder = run(a, b, c);
             assert!(

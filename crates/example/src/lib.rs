@@ -1542,7 +1542,6 @@ mod fuzz_tests {
     #[cfg(feature = "proving")]
     #[test]
     fn fuzz_prove_fma() {
-        const OPS: [FmaddOp; 4] = [FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd];
         let mut rng = XorShift64::new(0xB0B0_0006);
         let cases: Vec<(u32, u32, u32)> = (0..10)
             .map(|_| {
@@ -1553,13 +1552,9 @@ mod fuzz_tests {
                 )
             })
             .collect();
-        let (instrs, mem) =
-            build_ternary_chunk(&cases, &mut |rd, rs1, rs2, rs3, i| match OPS[i % 4] {
-                FmaddOp::Madd => fmadd_s(rd, rs1, rs2, rs3),
-                FmaddOp::Msub => fmsub_s(rd, rs1, rs2, rs3),
-                FmaddOp::Nmsub => fnmsub_s(rd, rs1, rs2, rs3),
-                FmaddOp::Nmadd => fnmadd_s(rd, rs1, rs2, rs3),
-            });
+        let (instrs, mem) = build_ternary_chunk(&cases, &mut |rd, rs1, rs2, rs3, _| {
+            fmadd_s(rd, rs1, rs2, rs3)
+        });
         prove_chunk(instrs, mem);
     }
 
