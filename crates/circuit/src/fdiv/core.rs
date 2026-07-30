@@ -5,8 +5,10 @@ use openvm_circuit::{
     system::memory::{online::TracingMemory, MemoryAuxColsFactory},
 };
 use openvm_circuit_primitives::{
+    is_less_than::{IsLessThanIo, IsLtSubAir},
     var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
-    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper,
+    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper, SubAir,
+    TraceSubRowGenerator,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
 use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, LocalOpcode};
@@ -18,6 +20,8 @@ use openvm_stark_backend::{
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
     BaseAirWithPublicValues,
 };
+
+use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget};
 
 /// IEEE 754 / RISC-V FDIV.S: correctly-rounded (RNE) division.
 /// Per the RISC-V spec, the canonical NaN is returned when any input is NaN,
@@ -119,6 +123,17 @@ pub struct FdivCoreCols<T> {
     pub s_finite: T,
     pub s_normal: T,
     pub s_overflow: T,
+    pub s_subnormal: T,
+    pub sub_efz: T,
+    pub sub_capped: T,
+    pub sub_lt_decomp: [T; 1],
+    pub sub_shift: T,
+    pub sub_shrn: ShrnCols<T, 7>,
+    pub sub_y0_high7: T,
+    pub sub_lsb: T,
+    pub sub_round_up: T,
+    pub sub_rc0: T,
+    pub sub_rc1: T,
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -334,10 +349,7 @@ where
 
         // ── Finite result: long-division verification ───────────────────
         self.eval_finite_div(builder, cols);
-
-        // TODO: verify the finite (non-special) result — correctly-rounded
-        // division needs 24-bit long division, normalization, and RNE
-        // rounding machinery (similar to fmul normalization).
+        self.eval_finite_subnormal(builder, cols);
 
         let expected_opcode = VmCoreAir::<AB, I>::opcode_to_global_expr(self, FpOpcode::FDIV_S);
 
@@ -679,6 +691,122 @@ impl FdivCoreAir {
             .when(cols.s_overflow)
             .assert_eq(cols.result[2], f128);
     }
+
+    /// Constrain the subnormal / underflow result (result exponent field == 0).
+    ///
+    /// The quotient q (26-bit) is extended to 7 bytes and right-shifted by
+    /// `cshift = min(b_exp - a_exp - 124, 55)` via `ShrnGadget<7>`. The low
+    /// 23 bits of the shifted result become the subnormal mantissa, with RNE
+    /// rounding from the gadget's guard/sticky + the mantissa LSB. If rounding
+    /// carries into bit 23, the result becomes the smallest normal (exp field 1).
+    pub fn eval_finite_subnormal<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FdivCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f55: AB::F = AB::F::from_u32(55);
+        let f124: AB::F = AB::F::from_u32(124);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_hi * f2;
+
+        // s_subnormal = s_finite AND exp_field_zero.
+        let s_finite = cols.s_finite;
+        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
+        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.sub_efz, exp_field_zero);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.s_subnormal, s_finite * cols.sub_efz);
+        builder.assert_bool(cols.s_subnormal);
+        let s = cols.s_subnormal;
+
+        // Shift = b_exp - a_exp - 124 (always >= 3 on subnormal rows).
+        let shift = b_exp - a_exp - AB::Expr::from(f124);
+
+        // sub_capped = (shift >= 56) = (55 < shift).
+        let lt_air = IsLtSubAir::new(self.range_bus, 8);
+        let io = IsLessThanIo::new(
+            AB::Expr::from(f55),
+            shift.clone(),
+            cols.sub_capped.into(),
+            s.into(),
+        );
+        lt_air.eval(builder, (io, &cols.sub_lt_decomp));
+        builder.assert_bool(cols.sub_capped);
+
+        // cshift = capped ? 55 : shift.
+        builder
+            .when(s * (one.clone() - cols.sub_capped))
+            .assert_eq(cols.sub_shift, shift.clone());
+        builder
+            .when(s * cols.sub_capped)
+            .assert_eq(cols.sub_shift, AB::Expr::from(f55));
+        self.range_bus
+            .range_check(cols.sub_shift.into(), 6)
+            .eval(builder, s.into());
+
+        // ShrnGadget<7>: x = q extended to 7 bytes, y = x >> cshift.
+        for i in 0..4 {
+            builder.when(s).assert_eq(cols.sub_shrn.x[i], cols.q[i]);
+        }
+        for i in 4..7 {
+            builder.when(s).assert_zero(cols.sub_shrn.x[i]);
+        }
+        builder
+            .when(s)
+            .assert_eq(cols.sub_shrn.shift, cols.sub_shift);
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.sub_shrn);
+        builder.assert_eq(cols.sub_shrn.enable, s);
+
+        // Since shift >= 3 and q < 2^26, y < 2^23, so bytes [3..7] are zero.
+        for i in 3..7 {
+            builder.when(s).assert_zero(cols.sub_shrn.y[i]);
+        }
+
+        // RNE rounding.
+        builder
+            .when(s)
+            .assert_eq(cols.sub_shrn.y[0], cols.sub_y0_high7 * f2 + cols.sub_lsb);
+        builder.assert_bool(cols.sub_lsb);
+        self.range_bus
+            .range_check(cols.sub_y0_high7.into(), 7)
+            .eval(builder, s.into());
+        builder.assert_bool(cols.sub_shrn.guard);
+        builder.assert_bool(cols.sub_shrn.sticky);
+        let sticky_or_lsb =
+            cols.sub_shrn.sticky + cols.sub_lsb - cols.sub_shrn.sticky * cols.sub_lsb;
+        builder
+            .when(s)
+            .assert_eq(cols.sub_round_up, cols.sub_shrn.guard * sticky_or_lsb);
+        builder.assert_bool(cols.sub_round_up);
+
+        // Output reconstruction.
+        builder.assert_bool(cols.sub_rc0);
+        builder.assert_bool(cols.sub_rc1);
+        builder.when(s).assert_eq(
+            cols.result[0] + cols.sub_rc0 * f256,
+            cols.sub_shrn.y[0] + cols.sub_round_up,
+        );
+        builder.when(s).assert_eq(
+            cols.result[1] + cols.sub_rc1 * f256,
+            cols.sub_shrn.y[1] + cols.sub_rc0,
+        );
+        builder
+            .when(s)
+            .assert_eq(cols.result[2], cols.sub_shrn.y[2] + cols.sub_rc1);
+        builder
+            .when(s)
+            .assert_eq(cols.result[3], cols.r_sign * f128);
+        builder.when(s).assert_eq(cols.r_exp_hi, AB::Expr::ZERO);
+    }
 }
 
 // === Record ===
@@ -880,6 +1008,27 @@ where
         core_row.a_normal = F::from_bool(a_normal);
         core_row.b_normal = F::from_bool(b_normal);
 
+        // Set r_exp_lo/r_exp_hi from the result for ALL rows so that
+        // eval_finite_subnormal's sub_efz constraint holds universally.
+        // (fill_finite_div will override with identical values for finite rows.)
+        let r_exp_field = (result >> 23) & 0xFF;
+        let r_exp_hi_val = r_exp_field >> 1;
+        core_row.r_exp_lo = F::from_u32(r_exp_field & 1);
+        core_row.r_exp_hi = F::from_u32(r_exp_hi_val);
+        core_row.r_exp_hi_zero_inv = if r_exp_hi_val != 0 {
+            F::from_u32(r_exp_hi_val).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        core_row.r_exp_hi_max_inv = if r_exp_hi_val != 127 {
+            (F::from_u32(127) - F::from_u32(r_exp_hi_val))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        core_row.sub_efz = F::from_bool(r_exp_field == 0);
+
         if s_finite {
             fill_finite_div(
                 core_row,
@@ -940,13 +1089,19 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FdivCoreCols<F>) {
     row.rc1 = F::ZERO;
     row.rc2 = F::ZERO;
     row.rc2_rem = F::ZERO;
-    row.r_exp_lo = F::ZERO;
-    row.r_exp_hi = F::ZERO;
-    row.r_exp_hi_zero_inv = F::ZERO;
-    row.r_exp_hi_max_inv = F::ZERO;
     row.result_exp = F::ZERO;
     row.s_normal = F::ZERO;
     row.s_overflow = F::ZERO;
+    row.s_subnormal = F::ZERO;
+    row.sub_capped = F::ZERO;
+    row.sub_lt_decomp = [F::ZERO];
+    row.sub_shift = F::ZERO;
+    row.sub_shrn = ShrnCols::<F, 7>::default();
+    row.sub_y0_high7 = F::ZERO;
+    row.sub_lsb = F::ZERO;
+    row.sub_round_up = F::ZERO;
+    row.sub_rc0 = F::ZERO;
+    row.sub_rc1 = F::ZERO;
 }
 
 /// Fill the finite-division witness columns.
@@ -1124,10 +1279,13 @@ fn fill_finite_div<F: PrimeField32>(
 
     // Result exponent: for normal results, a_exp - b_exp + 126 + is_high + rc2.
     // For overflow (native result is inf), use the native exp field (255).
+    // For subnormal/underflow (native result exp field == 0), use 0.
     let computed_exp = (a_exp as i64) - (b_exp as i64) + 126 + is_high as i64 + rc2 as i64;
     let r_exp_field = (result >> 23) & 0xFF;
     let r_exp = if r_exp_field == 255 {
         255
+    } else if r_exp_field == 0 {
+        0
     } else {
         computed_exp as u32
     };
@@ -1150,13 +1308,15 @@ fn fill_finite_div<F: PrimeField32>(
     row.result_exp = F::from_u32(r_exp);
 
     // Selectors.
-    let r_exp_field = (result >> 23) & 0xFF;
     row.s_normal = F::from_bool((1..=254).contains(&r_exp_field));
     row.s_overflow = F::from_bool(r_exp_field == 255);
+    let s_subnormal = r_exp_field == 0;
+    row.sub_efz = F::from_bool(r_exp_field == 0);
+    row.s_subnormal = F::from_bool(s_subnormal);
 
     // Sanity: computed exponent must match native result for normal results.
     debug_assert!(
-        r_exp_field == 255 || r_exp == computed_exp as u32,
+        r_exp_field == 255 || r_exp_field == 0 || r_exp == computed_exp as u32,
         "fdiv exp mismatch: a_exp={} b_exp={} is_high={} rc2={} computed={} field={}",
         a_exp,
         b_exp,
@@ -1165,6 +1325,135 @@ fn fill_finite_div<F: PrimeField32>(
         computed_exp,
         r_exp_field
     );
+
+    // ── Subnormal / underflow witness ───────────────────────────────
+    if s_subnormal {
+        let true_shift = (b_exp as i32) - (a_exp as i32) - 124;
+        debug_assert!(true_shift >= 2, "fdiv subnormal shift < 2: {}", true_shift);
+        let sub_capped = true_shift >= 56;
+        let lt_air = IsLtSubAir::new(range_checker.bus(), 8);
+        lt_air.generate_subrow(
+            (range_checker.as_ref(), 55u32, true_shift as u32),
+            (&mut row.sub_lt_decomp, &mut row.sub_capped),
+        );
+        debug_assert_eq!(
+            row.sub_capped.as_canonical_u32(),
+            sub_capped as u32,
+            "fdiv sub_capped mismatch"
+        );
+
+        let cshift = if sub_capped { 55u32 } else { true_shift as u32 };
+        row.sub_shift = F::from_u32(cshift);
+        range_checker.add_count(cshift, 6);
+
+        // Extend q to 7 bytes and build ShrnCols.
+        let x: [u32; 7] = core::array::from_fn(|i| if i < 4 { q_bytes[i] } else { 0 });
+        row.sub_shrn = make_shrn_cols7::<F>(x, cshift as usize, range_checker);
+
+        let y0 = row.sub_shrn.y[0].as_canonical_u32();
+        let y1 = row.sub_shrn.y[1].as_canonical_u32();
+        let y2 = row.sub_shrn.y[2].as_canonical_u32();
+        row.sub_y0_high7 = F::from_u32(y0 >> 1);
+        row.sub_lsb = F::from_u32(y0 & 1);
+        range_checker.add_count(y0 >> 1, 7);
+
+        let guard = row.sub_shrn.guard.as_canonical_u32();
+        let sticky = row.sub_shrn.sticky.as_canonical_u32() != 0;
+        let round_up = guard == 1 && (sticky || (y0 & 1) == 1);
+        row.sub_round_up = F::from_bool(round_up);
+
+        let s0 = y0 + round_up as u32;
+        let rc0 = s0 >> 8;
+        let s1 = y1 + rc0;
+        let rc1 = s1 >> 8;
+        row.sub_rc0 = F::from_u32(rc0);
+        row.sub_rc1 = F::from_u32(rc1);
+
+        debug_assert_eq!(s0 & 0xFF, result & 0xFF, "fdiv subnormal byte0");
+        debug_assert_eq!(s1 & 0xFF, (result >> 8) & 0xFF, "fdiv subnormal byte1");
+        debug_assert_eq!(
+            (y2 + rc1) & 0xFF,
+            (result >> 16) & 0xFF,
+            "fdiv subnormal byte2"
+        );
+    } else {
+        row.sub_capped = F::ZERO;
+        row.sub_shift = F::ZERO;
+        row.sub_shrn = ShrnCols::<F, 7>::default();
+        row.sub_y0_high7 = F::ZERO;
+        row.sub_lsb = F::ZERO;
+        row.sub_round_up = F::ZERO;
+        row.sub_rc0 = F::ZERO;
+        row.sub_rc1 = F::ZERO;
+    }
+}
+
+/// Build a `ShrnCols<7>` witness and register range-checker counts.
+fn make_shrn_cols7<F: PrimeField32>(
+    x: [u32; 7],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 7> {
+    const N: usize = 7;
+    let shift = shift.min(N * crate::fp_shift::SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; crate::fp_shift::SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    for i in 0..N {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
+    }
 }
 
 #[cfg(test)]
@@ -1222,8 +1511,8 @@ mod finite_numeric_tests {
         }
         let air = FdivCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0);
         let mut builder = NumericBuilder::new(vec![]);
-        // Run eval_finite_div only.
         air.eval_finite_div(&mut builder, &row);
+        air.eval_finite_subnormal(&mut builder, &row);
         builder
     }
 
@@ -1237,6 +1526,8 @@ mod finite_numeric_tests {
             (5.0f32.to_bits(), 7.0f32.to_bits()),
             (1.5f32.to_bits(), 1.5f32.to_bits()),     // 1.0
             (f32::MAX.to_bits(), f32::MIN.to_bits()), // overflow -> -inf
+            (0x3F800000u32, 0x7F7FFFFF),              // 1/MAX -> subnormal
+            (0x00800000u32, 0x7F7FFFFF),              // MIN_NORMAL/MAX -> deep underflow
         ] {
             let builder = run(a, b);
             assert!(
@@ -1261,18 +1552,13 @@ mod finite_numeric_tests {
             let b_exp = (next() % 254) + 1;
             let a = ((next() & 1) << 31) | (a_exp << 23) | (next() & 0x7FFFFF);
             let b = ((next() & 1) << 31) | (b_exp << 23) | (next() & 0x7FFFFF);
-            let r = fdiv_s(a, b);
-            let r_exp = (r >> 23) & 0xFF;
-            // Skip subnormal/underflow results (deferred).
-            if r_exp == 0 {
-                continue;
-            }
             let builder = run(a, b);
             if !builder.ok() {
-                let is_overflow = r_exp == 255;
+                let r = fdiv_s(a, b);
+                let r_exp = (r >> 23) & 0xFF;
                 panic!(
-                    "fdiv finite failed: {:?}\n a={:08x} b={:08x} result={:08x} overflow={}",
-                    builder.failures, a, b, r, is_overflow
+                    "fdiv finite failed: {:?}\n a={:08x} b={:08x} result={:08x} exp_field={}",
+                    builder.failures, a, b, r, r_exp
                 );
             }
         }

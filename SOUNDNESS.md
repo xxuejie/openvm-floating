@@ -31,7 +31,7 @@ Per-chip soundness of the **result**:
 | fmul        | ✅                   | ✅ fully sound (normal + overflow + subnormal/underflow) |
 | fadd        | ✅                   | ✅ fully sound (all finite + subnormal inputs + zero) |
 | fsub        | ✅                   | ✅ fully sound (all finite + subnormal inputs + zero) |
-| fdiv        | ✅ (pre-existing)    | 🔨 normal + overflow (subnormal deferred) |
+| fdiv        | ✅ (pre-existing)    | ✅ fully sound (normal + overflow + subnormal/underflow) |
 | fma         | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fsqrt       | ✅ (pre-existing)    | ❌ finite unconstrained           |
 | fcvt_f2i    | ✅                   | ✅ in-range RTZ truncation (shift + two's-complement) |
