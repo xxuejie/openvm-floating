@@ -1600,6 +1600,10 @@ mod product_tests {
     type F = BabyBear;
 
     fn run(a: u32, b: u32, c: u32) -> NumericBuilder<F> {
+        run_op(a, b, c, FmaddOp::Madd)
+    }
+
+    fn run_op(a: u32, b: u32, c: u32, op: FmaddOp) -> NumericBuilder<F> {
         let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
             0, 16,
         )));
@@ -1654,12 +1658,17 @@ mod product_tests {
         row.ab_normal = F::from_bool(a_normal && b_normal);
         row.c_finite_ok = F::from_bool(c_normal || c_zero_v);
 
-        let prod_sign_eff = a_sign != b_sign;
-        let c_sign_eff = c_sign == 1;
+        let (neg_p, neg_c) = op.negations();
+        let prod_sign_eff = (a_sign != b_sign) != neg_p;
+        let c_sign_eff = (c_sign == 1) != neg_c;
         let sign_diff = prod_sign_eff != c_sign_eff;
         row.prod_sign_eff = F::from_bool(prod_sign_eff);
         row.c_sign_eff = F::from_bool(c_sign_eff);
         row.sign_diff = F::from_bool(sign_diff);
+        row.madd_flag = F::from_bool(op == FmaddOp::Madd);
+        row.msub_flag = F::from_bool(op == FmaddOp::Msub);
+        row.nmsub_flag = F::from_bool(op == FmaddOp::Nmsub);
+        row.nmadd_flag = F::from_bool(op == FmaddOp::Nmadd);
 
         if s_finite {
             fill_finite_product(
@@ -1707,6 +1716,16 @@ mod product_tests {
                 a,
                 b,
                 c
+            );
+        }
+        // Test all opcodes with prove test case 3.
+        for &op in &[FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd] {
+            let builder = run_op(0x3922dfc8, 0x34f06877, 0xbb437567, op);
+            assert!(
+                builder.ok(),
+                "fma op {:?} failed: {:?}",
+                op,
+                builder.failures
             );
         }
         // Fuzz.
