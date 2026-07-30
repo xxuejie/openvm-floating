@@ -40,7 +40,7 @@ pub fn fdiv_s(a: u32, b: u32) -> u32 {
 }
 
 #[repr(C)]
-#[derive(AlignedBorrow, StructReflection, Debug)]
+#[derive(AlignedBorrow, StructReflection, Debug, Default)]
 pub struct FdivCoreCols<T> {
     pub a: [T; 4],
     pub b: [T; 4],
@@ -82,6 +82,43 @@ pub struct FdivCoreCols<T> {
     pub zero_res: T,  // +-0: b_inf && !a_inf, excluding NaN
     pub is_special: T,
     pub r_sign: T, // a_sign ^ b_sign
+
+    // === Finite division (long-division verification) ===
+    pub a_sig: [T; 3],     // a significand (mant | implicit)
+    pub b_sig: [T; 3],     // b significand (divisor)
+    pub a_sig_hi: [T; 3],  // bit 7 of each a_sig byte (for a_sig << 25 target)
+    pub q: [T; 4],         // quotient bytes (a_sig*2^25 / b_sig)
+    pub r: [T; 3],         // remainder bytes (< b_sig)
+    pub div_carry: [T; 6], // carry chain for q*b_sig + r = a_sig<<25
+    pub lt_borrow: [T; 3], // borrow chain for r < b_sig verification
+    pub diff: [T; 3],      // b_sig - r - 1 byte decomposition (proves r < b_sig)
+    pub q_lo2: [T; 4],     // q[i] & 3 (for is_high mantissa extraction)
+    pub q_hi6: [T; 4],     // q[i] >> 2 (for is_high mantissa extraction)
+    pub lo_bit0: [T; 4],   // q_lo2[i] & 1 (for !is_high extraction)
+    pub lo_bit1: [T; 4],   // q_lo2[i] >> 1 (for !is_high extraction)
+    pub is_high: T,        // bool: q >= 2^25 (a_sig >= b_sig)
+    pub qh6_lo: T,         // q_hi6[0] & 1 (is_high mantissa LSB)
+    pub qh6_rest: T,       // q_hi6[0] >> 1
+    pub guard: T,
+    pub lsb: T,
+    pub sticky: T,
+    pub r_nz: T, // bool: r != 0
+    pub r_nz_inv: T,
+    pub round_up: T,
+    pub rc0: T,
+    pub rc1: T,
+    pub rc2: T,
+    pub rc2_rem: T,
+    pub r_exp_lo: T,
+    pub r_exp_hi: T,
+    pub r_exp_hi_zero_inv: T,
+    pub r_exp_hi_max_inv: T,
+    pub result_exp: T,
+    pub a_normal: T,
+    pub b_normal: T, // both-normal indicators (degree 1)
+    pub s_finite: T,
+    pub s_normal: T,
+    pub s_overflow: T,
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -295,6 +332,9 @@ where
             .when(cols.zero_res)
             .assert_eq(cols.result[3], cols.r_sign * AB::F::from_u32(128));
 
+        // ── Finite result: long-division verification ───────────────────
+        self.eval_finite_div(builder, cols);
+
         // TODO: verify the finite (non-special) result — correctly-rounded
         // division needs 24-bit long division, normalization, and RNE
         // rounding machinery (similar to fmul normalization).
@@ -315,6 +355,329 @@ where
 
     fn start_offset(&self) -> usize {
         self.offset
+    }
+}
+
+impl FdivCoreAir {
+    /// Constrain the finite division result via long-division verification.
+    ///
+    /// Verifies `q * b_sig + r = a_sig << 25` (product carry chain), `0 <= r < b_sig`
+    /// (borrow chain), then extracts the correctly-rounded mantissa from q and r.
+    /// Handles both normal and overflow results; subnormal results are deferred.
+    pub fn eval_finite_div<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FdivCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f4: AB::F = AB::F::from_u32(4);
+        let f64: AB::F = AB::F::from_u32(64);
+        let f127: AB::F = AB::F::from_u32(127);
+        let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
+        let one = AB::Expr::ONE;
+
+        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_hi * f2;
+
+        // ── Sound selector: finite AND both normal AND a nonzero ──────────
+        // (subnormal inputs deferred; b=0 is special-cased above).
+        let not_special = one.clone() - cols.is_special;
+        let a_normal_expr = (one.clone() - cols.a_exp_is_zero) * (one.clone() - cols.a_exp_is_max);
+        let b_normal_expr = (one.clone() - cols.b_exp_is_zero) * (one.clone() - cols.b_exp_is_max);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.a_normal, a_normal_expr);
+        builder
+            .when(cols.is_valid)
+            .assert_eq(cols.b_normal, b_normal_expr);
+        builder.when(cols.is_valid).assert_eq(
+            cols.s_finite,
+            not_special.clone() * cols.a_normal * cols.b_normal,
+        );
+        builder.assert_bool(cols.s_finite);
+        let s = cols.s_finite;
+
+        // ── Significand construction ────────────────────────────────────
+        builder.when(s).assert_eq(cols.a_sig[0], cols.a[0]);
+        builder.when(s).assert_eq(cols.a_sig[1], cols.a[1]);
+        builder
+            .when(s)
+            .assert_eq(cols.a_sig[2], cols.a_mant2 + f128); // implicit bit
+        builder.when(s).assert_eq(cols.b_sig[0], cols.b[0]);
+        builder.when(s).assert_eq(cols.b_sig[1], cols.b[1]);
+        builder
+            .when(s)
+            .assert_eq(cols.b_sig[2], cols.b_mant2 + f128);
+
+        // a_sig bit-7 decomposition (for a_sig << 25 target).
+        for i in 0..3 {
+            builder.assert_bool(cols.a_sig_hi[i]);
+            let lo7 = cols.a_sig[i] - cols.a_sig_hi[i] * f128;
+            builder
+                .when(s)
+                .assert_eq(cols.a_sig[i], lo7 + cols.a_sig_hi[i] * f128);
+            self.range_bus
+                .range_check(cols.a_sig[i].into(), 8)
+                .eval(builder, s.into());
+        }
+        for i in 0..3 {
+            self.range_bus
+                .range_check(cols.b_sig[i].into(), 8)
+                .eval(builder, s.into());
+        }
+        for i in 0..4 {
+            self.range_bus
+                .range_check(cols.q[i].into(), 8)
+                .eval(builder, s.into());
+        }
+        for i in 0..3 {
+            self.range_bus
+                .range_check(cols.r[i].into(), 8)
+                .eval(builder, s.into());
+        }
+
+        // ── Product carry chain: q * b_sig + r = a_sig << 25 ────────────
+        // target bytes for a_sig << 25:
+        //   target[0..2] = 0
+        //   target[3] = lo7_a0 * 2
+        //   target[4] = a_sig_hi[0] + lo7_a1 * 2
+        //   target[5] = a_sig_hi[1] + lo7_a2 * 2
+        //   target[6] = a_sig_hi[2]
+        let lo7_a = |i: usize| cols.a_sig[i] - cols.a_sig_hi[i] * f128;
+        let target = |i: usize| -> AB::Expr {
+            match i {
+                0..=2 => AB::Expr::ZERO,
+                3 => lo7_a(0) * f2,
+                4 => cols.a_sig_hi[0].into() + lo7_a(1) * f2,
+                5 => cols.a_sig_hi[1].into() + lo7_a(2) * f2,
+                6 => cols.a_sig_hi[2].into(),
+                _ => unreachable!(),
+            }
+        };
+        let carry_divide = AB::F::from_u32(256).inverse();
+        for i in 0..7 {
+            // Convolution: sum of q[k] * b_sig[j] for k+j = i.
+            let mut conv = AB::Expr::ZERO;
+            for k in 0..4usize {
+                let j = i as isize - k as isize;
+                if j >= 0 && (j as usize) < 3 {
+                    conv += cols.q[k] * cols.b_sig[j as usize];
+                }
+            }
+            let r_byte = if i < 3 {
+                cols.r[i].into()
+            } else {
+                AB::Expr::ZERO
+            };
+            let carry_in = if i == 0 {
+                AB::Expr::ZERO
+            } else {
+                cols.div_carry[i - 1].into()
+            };
+            let expected = carry_in + conv + r_byte;
+            // expected = target[i] + carry_out * 256
+            let carry_out = (expected.clone() - target(i)) * carry_divide;
+            if i < 6 {
+                builder.when(s).assert_eq(cols.div_carry[i], carry_out);
+                self.range_bus
+                    .range_check(cols.div_carry[i].into(), 10)
+                    .eval(builder, s.into());
+            } else {
+                // Final carry must be 0 (a_sig << 25 fits in 49 bits = 7 bytes).
+                builder.when(s).assert_zero(carry_out);
+            }
+        }
+
+        // ── Remainder range check: r < b_sig ────────────────────────────
+        // Verify b_sig - r - 1 >= 0 via a borrow chain with diff bytes.
+        for i in 0..3 {
+            builder.assert_bool(cols.lt_borrow[i]);
+            self.range_bus
+                .range_check(cols.diff[i].into(), 8)
+                .eval(builder, s.into());
+        }
+        // byte 0: b_sig[0] - r[0] - 1 + borrow_out*256 = diff[0]
+        builder.when(s).assert_eq(
+            cols.b_sig[0] - cols.r[0] - AB::Expr::ONE + cols.lt_borrow[0] * f256,
+            cols.diff[0].into(),
+        );
+        // bytes 1..2: b_sig[i] - r[i] - borrow_in + borrow_out*256 = diff[i]
+        for i in 1..3 {
+            builder.when(s).assert_eq(
+                cols.b_sig[i] - cols.r[i] - cols.lt_borrow[i - 1] + cols.lt_borrow[i] * f256,
+                cols.diff[i].into(),
+            );
+        }
+        // Final borrow must be 0 (b_sig > r).
+        builder.when(s).assert_zero(cols.lt_borrow[2]);
+
+        // ── Quotient decomposition for mantissa extraction ──────────────
+        // q[i] = q_lo2[i] + q_hi6[i] * 4; q_lo2[i] = lo_bit0[i] + lo_bit1[i] * 2.
+        for i in 0..4 {
+            builder
+                .when(s)
+                .assert_eq(cols.q[i], cols.q_lo2[i] + cols.q_hi6[i] * f4);
+            self.range_bus
+                .range_check(cols.q_lo2[i].into(), 2)
+                .eval(builder, s.into());
+            self.range_bus
+                .range_check(cols.q_hi6[i].into(), 6)
+                .eval(builder, s.into());
+            builder.assert_bool(cols.lo_bit0[i]);
+            builder.assert_bool(cols.lo_bit1[i]);
+            builder
+                .when(s)
+                .assert_eq(cols.q_lo2[i], cols.lo_bit0[i] + cols.lo_bit1[i] * f2);
+        }
+
+        // is_high = (q >= 2^25) = q_hi6[3] >= 2 = lo_bit1[3] (bit 1 of q3).
+        // Actually q3 = q_lo2[3] + q_hi6[3]*4. Bit 25 of q = bit 1 of q3 = lo_bit1[3]... wait.
+        // q3 byte has bits [31..24] of q. Bit 25 = bit 1 of q3.
+        // q3 = lo_bit0[3] + lo_bit1[3]*2 + q_hi6[3]*4.
+        // Bit 1 of q3 = lo_bit1[3]. Bit 0 of q3 = lo_bit0[3]. Bits 2..7 = q_hi6[3].
+        // is_high = bit 25 set = lo_bit1[3] (since q3 occupies bits 24..31).
+        // Wait: bit 24 = q3 bit 0 = lo_bit0[3]. bit 25 = q3 bit 1 = lo_bit1[3].
+        // For is_high, bit 25 is the leading bit. So is_high = lo_bit1[3].
+        // But q3 < 64 (since q < 2^26), so q_hi6[3] < 16. And lo_bit1[3] is bit 1 of q3.
+        // For q >= 2^25: q3 >= 2, i.e., bit 1 of q3 is set OR q_hi6[3] >= 1.
+        // Actually: q >= 2^25 means bit 25 is set. Bit 25 = q3 bit 1 = lo_bit1[3].
+        // So is_high = lo_bit1[3]. ✓
+        builder.assert_bool(cols.is_high);
+        builder.when(s).assert_eq(cols.is_high, cols.lo_bit1[3]);
+
+        // ── RNE rounding + mantissa extraction ──────────────────────────
+        // q_hi6[0] bit decomposition (for is_high mantissa LSB).
+        builder.assert_bool(cols.qh6_lo);
+        builder
+            .when(s)
+            .assert_eq(cols.q_hi6[0], cols.qh6_lo + cols.qh6_rest * f2);
+        self.range_bus
+            .range_check(cols.qh6_rest.into(), 5)
+            .eval(builder, s.into());
+
+        // r_nz = (r != 0).
+        let r_sum = cols.r[0] + cols.r[1] + cols.r[2];
+        let r_is_zero = one.clone() - r_sum.clone() * cols.r_nz_inv;
+        builder.assert_zero(r_sum * r_is_zero.clone());
+        builder
+            .when(s)
+            .assert_eq(cols.r_nz, one.clone() - r_is_zero);
+        builder.assert_bool(cols.r_nz);
+
+        // Guard: is_high → lo_bit1[0]; !is_high → lo_bit0[0].
+        builder
+            .when(s * cols.is_high)
+            .assert_eq(cols.guard, cols.lo_bit1[0]);
+        builder
+            .when(s * (one.clone() - cols.is_high))
+            .assert_eq(cols.guard, cols.lo_bit0[0]);
+        builder.assert_bool(cols.guard);
+
+        // Lsb: is_high → qh6_lo; !is_high → lo_bit1[0].
+        builder
+            .when(s * cols.is_high)
+            .assert_eq(cols.lsb, cols.qh6_lo);
+        builder
+            .when(s * (one.clone() - cols.is_high))
+            .assert_eq(cols.lsb, cols.lo_bit1[0]);
+        builder.assert_bool(cols.lsb);
+
+        // Sticky: is_high → lo_bit0[0] OR r_nz; !is_high → r_nz. Stored as column.
+        let sticky_ih = cols.lo_bit0[0] + cols.r_nz - cols.lo_bit0[0] * cols.r_nz;
+        builder
+            .when(s * cols.is_high)
+            .assert_eq(cols.sticky, sticky_ih);
+        builder
+            .when(s * (one.clone() - cols.is_high))
+            .assert_eq(cols.sticky, cols.r_nz);
+        builder.assert_bool(cols.sticky);
+
+        // round_up = guard AND (sticky OR lsb).
+        let sticky_or_lsb = cols.sticky + cols.lsb - cols.sticky * cols.lsb;
+        builder
+            .when(s)
+            .assert_eq(cols.round_up, cols.guard * sticky_or_lsb);
+        builder.assert_bool(cols.round_up);
+
+        // ── Mantissa extraction + carry chain ───────────────────────────
+        // is_high: mant0 = q_hi6[0] + q_lo2[1]*64, mant1 = q_hi6[1] + q_lo2[2]*64,
+        //          top7 = q_hi6[2] + lo_bit0[3]*64.
+        // !is_high: mant0 = lo_bit1[0] + q_hi6[0]*2 + lo_bit0[1]*128,
+        //           mant1 = lo_bit1[1] + q_hi6[1]*2 + lo_bit0[2]*128,
+        //           top7 = lo_bit1[2] + q_hi6[2]*2.
+        let ih = cols.is_high;
+        let nih = one.clone() - ih;
+        let f64e = AB::Expr::from(f64);
+
+        let mant0 = ih * (cols.q_hi6[0] + cols.q_lo2[1] * f64e.clone())
+            + nih.clone() * (cols.lo_bit1[0] + cols.q_hi6[0] * f2 + cols.lo_bit0[1] * f128);
+        let mant1 = ih * (cols.q_hi6[1] + cols.q_lo2[2] * f64e.clone())
+            + nih.clone() * (cols.lo_bit1[1] + cols.q_hi6[1] * f2 + cols.lo_bit0[2] * f128);
+        let top7 = ih * (cols.q_hi6[2] + cols.lo_bit0[3] * f64e)
+            + nih * (cols.lo_bit1[2] + cols.q_hi6[2] * f2);
+
+        // Carry chain: mant0 + round_up → rc0; mant1 + rc0 → rc1; top7 + rc1 → rc2/rem.
+        builder.assert_bool(cols.rc0);
+        builder.assert_bool(cols.rc1);
+        builder.assert_bool(cols.rc2);
+        builder.when(cols.s_normal).assert_eq(
+            cols.result[0] + cols.rc0 * f256,
+            mant0.clone() + cols.round_up,
+        );
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result[1] + cols.rc1 * f256, mant1.clone() + cols.rc0);
+        builder
+            .when(s)
+            .assert_eq(top7.clone() + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s.into());
+
+        // Result exponent: a_exp - b_exp + 126 + is_high + rc2. Only for normal results.
+        let result_exp_expr = a_exp.clone() - b_exp.clone()
+            + AB::Expr::from(AB::F::from_u32(126))
+            + cols.is_high
+            + cols.rc2;
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, result_exp_expr);
+
+        // Result sign = a_sign ^ b_sign (r_sign). Only for normal results.
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.r_sign * f128);
+
+        // s_normal / s_overflow selectors.
+        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
+        builder.when(s).assert_zero(cols.r_exp_hi * he0.clone());
+        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
+        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
+        builder.when(s).assert_zero(delta127 * he127.clone());
+        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
+        let exp_field_max = cols.r_exp_lo * he127;
+        builder.assert_eq(
+            cols.s_normal,
+            s * (one.clone() - exp_field_zero.clone() - exp_field_max.clone()),
+        );
+        builder.assert_eq(cols.s_overflow, s * exp_field_max.clone());
+        builder.assert_bool(cols.s_normal);
+        builder.assert_bool(cols.s_overflow);
+
+        // Normal result: tie result bytes (redundant with above for s_normal ⊆ s).
+        builder
+            .when(cols.s_normal)
+            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        // Overflow result: +-inf.
+        builder.when(cols.s_overflow).assert_zero(cols.result[0]);
+        builder.when(cols.s_overflow).assert_zero(cols.result[1]);
+        builder
+            .when(cols.s_overflow)
+            .assert_eq(cols.result[2], f128);
     }
 }
 
@@ -508,6 +871,29 @@ where
         core_row.zero_res = F::from_bool(zero_res);
         core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
         core_row.r_sign = F::from_bool(a_sign != b_sign);
+
+        // ── Finite division witness ──────────────────────────────────────
+        let a_normal = (1..=254).contains(&a_exp);
+        let b_normal = (1..=254).contains(&b_exp);
+        let s_finite = !canon_sel && !inf_res && !zero_res && a_normal && b_normal;
+        core_row.s_finite = F::from_bool(s_finite);
+        core_row.a_normal = F::from_bool(a_normal);
+        core_row.b_normal = F::from_bool(b_normal);
+
+        if s_finite {
+            fill_finite_div(
+                core_row,
+                a_exp,
+                b_exp,
+                a_mant,
+                b_mant,
+                result,
+                &self.range_checker,
+            );
+        } else {
+            zero_finite_columns(core_row);
+        }
+
         core_row.is_valid = F::ONE;
     }
 }
@@ -519,4 +905,376 @@ fn decompose(bits: u32) -> (u32, u32, u32) {
     let exp = (bits >> 23) & 0xFF;
     let mant = bits & 0x7FFFFF;
     (sign, exp, mant)
+}
+
+/// Zero all finite-path columns (for non-finite rows).
+fn zero_finite_columns<F: PrimeField32>(row: &mut FdivCoreCols<F>) {
+    for i in 0..3 {
+        row.a_sig[i] = F::ZERO;
+        row.b_sig[i] = F::ZERO;
+        row.a_sig_hi[i] = F::ZERO;
+        row.r[i] = F::ZERO;
+        row.lt_borrow[i] = F::ZERO;
+        row.diff[i] = F::ZERO;
+    }
+    for i in 0..4 {
+        row.q[i] = F::ZERO;
+        row.q_lo2[i] = F::ZERO;
+        row.q_hi6[i] = F::ZERO;
+        row.lo_bit0[i] = F::ZERO;
+        row.lo_bit1[i] = F::ZERO;
+    }
+    for i in 0..6 {
+        row.div_carry[i] = F::ZERO;
+    }
+    row.qh6_lo = F::ZERO;
+    row.qh6_rest = F::ZERO;
+    row.is_high = F::ZERO;
+    row.guard = F::ZERO;
+    row.lsb = F::ZERO;
+    row.sticky = F::ZERO;
+    row.r_nz = F::ZERO;
+    row.r_nz_inv = F::ZERO;
+    row.round_up = F::ZERO;
+    row.rc0 = F::ZERO;
+    row.rc1 = F::ZERO;
+    row.rc2 = F::ZERO;
+    row.rc2_rem = F::ZERO;
+    row.r_exp_lo = F::ZERO;
+    row.r_exp_hi = F::ZERO;
+    row.r_exp_hi_zero_inv = F::ZERO;
+    row.r_exp_hi_max_inv = F::ZERO;
+    row.result_exp = F::ZERO;
+    row.s_normal = F::ZERO;
+    row.s_overflow = F::ZERO;
+}
+
+/// Fill the finite-division witness columns.
+fn fill_finite_div<F: PrimeField32>(
+    row: &mut FdivCoreCols<F>,
+    a_exp: u32,
+    b_exp: u32,
+    a_mant: u32,
+    b_mant: u32,
+    result: u32,
+    range_checker: &SharedVariableRangeCheckerChip,
+) {
+    let a_sig = a_mant | 0x800000;
+    let b_sig = b_mant | 0x800000;
+
+    // Significand bytes.
+    let asig_bytes: [u32; 3] = [a_sig & 0xFF, (a_sig >> 8) & 0xFF, (a_sig >> 16) & 0xFF];
+    let bsig_bytes: [u32; 3] = [b_sig & 0xFF, (b_sig >> 8) & 0xFF, (b_sig >> 16) & 0xFF];
+    for i in 0..3 {
+        row.a_sig[i] = F::from_u32(asig_bytes[i]);
+        row.b_sig[i] = F::from_u32(bsig_bytes[i]);
+        row.a_sig_hi[i] = F::from_u32(asig_bytes[i] >> 7);
+        range_checker.add_count(asig_bytes[i], 8);
+        range_checker.add_count(bsig_bytes[i], 8);
+    }
+
+    // Long division: q = a_sig * 2^25 / b_sig, r = remainder.
+    let a_ext = (a_sig as u64) << 25;
+    let q_val = a_ext / (b_sig as u64);
+    let r_val = a_ext % (b_sig as u64);
+    debug_assert!(q_val < (1 << 26), "fdiv quotient overflow");
+    debug_assert!(r_val < b_sig as u64, "fdiv remainder >= divisor");
+
+    let q_bytes: [u32; 4] = core::array::from_fn(|i| ((q_val >> (i * 8)) & 0xFF) as u32);
+    let r_bytes: [u32; 3] = core::array::from_fn(|i| ((r_val >> (i * 8)) & 0xFF) as u32);
+
+    for (i, &qb) in q_bytes.iter().enumerate() {
+        row.q[i] = F::from_u32(qb);
+        range_checker.add_count(qb, 8);
+    }
+    for (i, &rb) in r_bytes.iter().enumerate() {
+        row.r[i] = F::from_u32(rb);
+        range_checker.add_count(rb, 8);
+    }
+
+    // Target bytes: a_sig << 25.
+    let lo7 = |i: usize| asig_bytes[i] & 0x7F;
+    let target: [u32; 7] = [
+        0,
+        0,
+        0,
+        lo7(0) * 2,
+        (asig_bytes[0] >> 7) + lo7(1) * 2,
+        (asig_bytes[1] >> 7) + lo7(2) * 2,
+        asig_bytes[2] >> 7,
+    ];
+
+    // Carry chain: verify q * b_sig + r = target.
+    let mut carry_in: u64 = 0;
+    for i in 0..7 {
+        let mut conv: u64 = 0;
+        for k in 0..4usize {
+            if k <= i && (i - k) < 3 {
+                conv += (q_bytes[k] as u64) * (bsig_bytes[i - k] as u64);
+            }
+        }
+        let r_byte: u64 = if i < 3 { r_bytes[i] as u64 } else { 0 };
+        let expected = carry_in + conv + r_byte;
+        let carry_out = (expected - target[i] as u64) / 256;
+        debug_assert_eq!(
+            expected - target[i] as u64,
+            carry_out * 256,
+            "fdiv carry mismatch at byte {}",
+            i
+        );
+        if i < 6 {
+            row.div_carry[i] = F::from_u32(carry_out as u32);
+            range_checker.add_count(carry_out as u32, 10);
+        } else {
+            debug_assert_eq!(carry_out, 0, "fdiv final carry nonzero");
+        }
+        carry_in = carry_out;
+    }
+
+    // Remainder range check: r < b_sig.
+    let b_minus_r_minus1: i64 = (b_sig as i64) - (r_val as i64) - 1;
+    debug_assert!(b_minus_r_minus1 >= 0, "fdiv remainder >= divisor");
+    let mut borrow: i64 = 1; // subtract 1 from byte 0
+    for i in 0..3 {
+        let d = (bsig_bytes[i] as i64) - (r_bytes[i] as i64) - borrow;
+        let (byte_val, new_borrow) = if d < 0 { (d + 256, 1) } else { (d, 0) };
+        row.lt_borrow[i] = F::from_u32(new_borrow as u32);
+        row.diff[i] = F::from_u32(byte_val as u32);
+        range_checker.add_count(byte_val as u32, 8);
+        borrow = new_borrow;
+    }
+    debug_assert_eq!(borrow, 0, "fdiv r >= b_sig");
+
+    // Quotient byte decomposition.
+    for (i, &qb) in q_bytes.iter().enumerate() {
+        let lo2 = qb & 0x3;
+        let hi6 = qb >> 2;
+        row.q_lo2[i] = F::from_u32(lo2);
+        row.q_hi6[i] = F::from_u32(hi6);
+        row.lo_bit0[i] = F::from_u32(lo2 & 1);
+        row.lo_bit1[i] = F::from_u32(lo2 >> 1);
+        range_checker.add_count(lo2, 2);
+        range_checker.add_count(hi6, 6);
+    }
+
+    // is_high: bit 25 of q = bit 1 of q_bytes[3] = lo_bit1[3].
+    let is_high = (q_bytes[3] >> 1) & 1 == 1;
+    row.is_high = F::from_bool(is_high);
+
+    // q_hi6[0] decomposition for is_high lsb.
+    let qh6_lo_val = q_bytes[0] >> 2 & 1;
+    let qh6_rest_val = (q_bytes[0] >> 2) >> 1;
+    row.qh6_lo = F::from_u32(qh6_lo_val);
+    row.qh6_rest = F::from_u32(qh6_rest_val);
+    range_checker.add_count(qh6_rest_val, 5);
+
+    // r_nz: use byte sum (matches the AIR's r_sum = r[0]+r[1]+r[2]).
+    let r_sum_val = r_bytes[0] + r_bytes[1] + r_bytes[2];
+    let r_nz = r_sum_val != 0;
+    row.r_nz = F::from_bool(r_nz);
+    row.r_nz_inv = if r_nz {
+        F::from_u32(r_sum_val).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    // Rounding metadata.
+    let (guard, lsb) = if is_high {
+        ((q_bytes[0] >> 1) & 1, (q_bytes[0] >> 2) & 1)
+    } else {
+        (q_bytes[0] & 1, (q_bytes[0] >> 1) & 1)
+    };
+    let sticky = if is_high {
+        (q_bytes[0] & 1 != 0) || r_nz
+    } else {
+        r_nz
+    };
+    let round_up = guard == 1 && (sticky || lsb == 1);
+    row.guard = F::from_u32(guard);
+    row.lsb = F::from_u32(lsb);
+    row.sticky = F::from_bool(sticky);
+    row.round_up = F::from_bool(round_up);
+
+    // Mantissa extraction + carry chain.
+    let (mant0, mant1, top7) = if is_high {
+        (
+            q_bytes[0] >> 2 | ((q_bytes[1] & 3) << 6),
+            q_bytes[1] >> 2 | ((q_bytes[2] & 3) << 6),
+            q_bytes[2] >> 2 | ((q_bytes[3] & 1) << 6),
+        )
+    } else {
+        (
+            q_bytes[0] >> 1 | ((q_bytes[1] & 1) << 7),
+            q_bytes[1] >> 1 | ((q_bytes[2] & 1) << 7),
+            q_bytes[2] >> 1,
+        )
+    };
+    let s0 = mant0 + round_up as u32;
+    let rc0 = s0 >> 8;
+    let s1 = mant1 + rc0;
+    let rc1 = s1 >> 8;
+    let top7c = top7 + rc1;
+    let rc2 = top7c >> 7;
+    let rc2_rem = top7c & 0x7F;
+    row.rc0 = F::from_u32(rc0);
+    row.rc1 = F::from_u32(rc1);
+    row.rc2 = F::from_u32(rc2);
+    row.rc2_rem = F::from_u32(rc2_rem);
+    range_checker.add_count(rc2_rem, 7);
+
+    // Result exponent: for normal results, a_exp - b_exp + 126 + is_high + rc2.
+    // For overflow (native result is inf), use the native exp field (255).
+    let computed_exp = (a_exp as i64) - (b_exp as i64) + 126 + is_high as i64 + rc2 as i64;
+    let r_exp_field = (result >> 23) & 0xFF;
+    let r_exp = if r_exp_field == 255 {
+        255
+    } else {
+        computed_exp as u32
+    };
+    let r_exp_lo = r_exp & 1;
+    let r_exp_hi = r_exp >> 1;
+    row.r_exp_lo = F::from_u32(r_exp_lo);
+    row.r_exp_hi = F::from_u32(r_exp_hi);
+    row.r_exp_hi_zero_inv = if r_exp_hi != 0 {
+        F::from_u32(r_exp_hi).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.r_exp_hi_max_inv = if r_exp_hi != 127 {
+        (F::from_u32(127) - F::from_u32(r_exp_hi))
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    row.result_exp = F::from_u32(r_exp);
+
+    // Selectors.
+    let r_exp_field = (result >> 23) & 0xFF;
+    row.s_normal = F::from_bool((1..=254).contains(&r_exp_field));
+    row.s_overflow = F::from_bool(r_exp_field == 255);
+
+    // Sanity: computed exponent must match native result for normal results.
+    debug_assert!(
+        r_exp_field == 255 || r_exp == computed_exp as u32,
+        "fdiv exp mismatch: a_exp={} b_exp={} is_high={} rc2={} computed={} field={}",
+        a_exp,
+        b_exp,
+        is_high,
+        rc2,
+        computed_exp,
+        r_exp_field
+    );
+}
+
+#[cfg(test)]
+mod finite_numeric_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+
+    fn run(a: u32, b: u32) -> NumericBuilder<F> {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let mut row = FdivCoreCols::<F>::default();
+        let result = fdiv_s(a, b);
+        // Reuse the filler's witness computation by calling fill_finite_div directly
+        // for normal inputs.
+        let (a_sign, a_exp, a_mant) = decompose(a);
+        let (b_sign, b_exp, b_mant) = decompose(b);
+        let a_normal = (1..=254).contains(&a_exp);
+        let b_normal = (1..=254).contains(&b_exp);
+        let any_nan = (a_exp == 255 && a_mant != 0) || (b_exp == 255 && b_mant != 0);
+        let a_inf = a_exp == 255 && a_mant == 0;
+        let b_inf = b_exp == 255 && b_mant == 0;
+        let a_zero = a_exp == 0 && a_mant == 0;
+        let b_zero = b_exp == 0 && b_mant == 0;
+        let canon_sel = any_nan || (a_inf && b_inf) || (a_zero && b_zero);
+        let inf_res = !any_nan && ((a_inf && !b_inf) || (b_zero && !a_inf && !a_zero));
+        let zero_res = b_inf && !a_inf && !any_nan;
+        let s_finite = !canon_sel && !inf_res && !zero_res && a_normal && b_normal;
+        row.s_finite = F::from_bool(s_finite);
+        row.a_normal = F::from_bool(a_normal);
+        row.b_normal = F::from_bool(b_normal);
+        row.is_valid = F::ONE;
+        row.r_sign = F::from_bool(a_sign != b_sign);
+        row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
+        for i in 0..4 {
+            row.a[i] = F::from_u32((a >> (i * 8)) & 0xFF);
+            row.b[i] = F::from_u32((b >> (i * 8)) & 0xFF);
+            row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        }
+        row.a_sign = F::from_u32(a_sign);
+        row.a_exp_lo = F::from_u32(a_exp & 1);
+        row.a_hi = F::from_u32(a_exp >> 1);
+        row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+        row.b_sign = F::from_u32(b_sign);
+        row.b_exp_lo = F::from_u32(b_exp & 1);
+        row.b_hi = F::from_u32(b_exp >> 1);
+        row.b_mant2 = F::from_u32((b_mant >> 16) & 0x7F);
+        if s_finite {
+            fill_finite_div(&mut row, a_exp, b_exp, a_mant, b_mant, result, &chip);
+        }
+        let air = FdivCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0);
+        let mut builder = NumericBuilder::new(vec![]);
+        // Run eval_finite_div only.
+        air.eval_finite_div(&mut builder, &row);
+        builder
+    }
+
+    #[test]
+    fn fdiv_finite_numeric_passes() {
+        // Test specific known values first.
+        for &(a, b) in &[
+            (3.0f32.to_bits(), 2.0f32.to_bits()), // 1.5
+            (7.0f32.to_bits(), 3.0f32.to_bits()), // 2.333...
+            (1.0f32.to_bits(), 3.0f32.to_bits()), // 0.333...
+            (5.0f32.to_bits(), 7.0f32.to_bits()),
+            (1.5f32.to_bits(), 1.5f32.to_bits()),     // 1.0
+            (f32::MAX.to_bits(), f32::MIN.to_bits()), // overflow -> -inf
+        ] {
+            let builder = run(a, b);
+            assert!(
+                builder.ok(),
+                "fdiv failed: {:?}\n a={:08x} b={:08x} result={:08x}",
+                builder.failures,
+                a,
+                b,
+                fdiv_s(a, b)
+            );
+        }
+        // Fuzz.
+        let mut rng = 0xB0B0_000Du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u32
+        };
+        for _ in 0..2000 {
+            let a_exp = (next() % 254) + 1;
+            let b_exp = (next() % 254) + 1;
+            let a = ((next() & 1) << 31) | (a_exp << 23) | (next() & 0x7FFFFF);
+            let b = ((next() & 1) << 31) | (b_exp << 23) | (next() & 0x7FFFFF);
+            let r = fdiv_s(a, b);
+            let r_exp = (r >> 23) & 0xFF;
+            // Skip subnormal/underflow results (deferred).
+            if r_exp == 0 {
+                continue;
+            }
+            let builder = run(a, b);
+            if !builder.ok() {
+                let is_overflow = r_exp == 255;
+                panic!(
+                    "fdiv finite failed: {:?}\n a={:08x} b={:08x} result={:08x} overflow={}",
+                    builder.failures, a, b, r, is_overflow
+                );
+            }
+        }
+    }
 }

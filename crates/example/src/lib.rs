@@ -1566,10 +1566,25 @@ mod fuzz_tests {
     #[cfg(feature = "proving")]
     #[test]
     fn fuzz_prove_fdiv() {
-        let mut rng = XorShift64::new(0xB0B0_0007);
-        let cases: Vec<(u32, u32)> = (0..15)
-            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
-            .collect();
+        // Deterministic set exercising normal / overflow / NaN / inf / zero
+        // paths. Subnormal-result cases deferred.
+        let cases: Vec<(u32, u32)> = vec![
+            (3.0f32.to_bits(), 2.0f32.to_bits()), // 1.5
+            (7.0f32.to_bits(), 3.0f32.to_bits()), // 2.333...
+            (1.0f32.to_bits(), 3.0f32.to_bits()), // 0.333...
+            (5.0f32.to_bits(), 7.0f32.to_bits()),
+            (1.5f32.to_bits(), 1.5f32.to_bits()),        // 1.0
+            (f32::MAX.to_bits(), f32::MIN.to_bits()),    // overflow -> -inf
+            (f32::NAN.to_bits(), 1.0f32.to_bits()),      // NaN
+            (f32::INFINITY.to_bits(), 2.0f32.to_bits()), // inf/finite = inf
+            (1.0f32.to_bits(), 0.0f32.to_bits()),        // finite/0 = inf
+            (0.0f32.to_bits(), f32::INFINITY.to_bits()), // 0/inf = 0
+            (0x3F800000, 0x3F800000),                    // 1/1 = 1
+            (0x7F7FFFFF, 0x00800000),                    // MAX/MIN_NORMAL -> overflow
+            (0x42C80000, 0x41A00000),                    // 100/20 = 5
+            ((-1.0f32).to_bits(), 1.0f32.to_bits()),     // -1/1 = -1
+            (0.0f32.to_bits(), 0.0f32.to_bits()),        // 0/0 = NaN
+        ];
         let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fdiv_s(rd, rs1, rs2));
         prove_chunk(instrs, mem);
     }

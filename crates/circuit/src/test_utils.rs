@@ -73,8 +73,10 @@ where
         self.num_asserts += 1;
         let v = x.into();
         if !v.is_zero() {
-            self.failures
-                .push("assert_zero failed: non-zero value".to_string());
+            self.failures.push(format!(
+                "assert #{} failed: non-zero value {}",
+                self.num_asserts, v
+            ));
         }
     }
 }
