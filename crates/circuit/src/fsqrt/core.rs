@@ -19,7 +19,9 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
-use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+use crate::fp_shift::{
+    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+};
 
 /// IEEE 754 / RISC-V FSQRT.S: correctly-rounded (RNE) square root.
 /// For all nonnegative inputs (including -0.0 and +inf) the result is the
@@ -71,6 +73,13 @@ pub struct FsqrtCoreCols<T> {
     // === Finite square root (normal positive inputs) ===
     pub s_finite: T,
     pub a_normal: T,
+    pub a_subnormal: T,
+    pub eff_exp_odd: T,
+    pub eff_exp_hi: T,
+    pub norm_shift: T,
+    pub ns_lo: T,
+    pub ns_half: T,
+    pub norm_shln: ShlnCols<T, 4>,
     pub a_sig: [T; 3],    // significand bytes (mant | implicit)
     pub a_sig_hi: [T; 3], // bit 7 of each a_sig byte (for odd-exp left shift)
     pub q: [T; 5],        // floor(sqrt(n)) bytes
@@ -273,44 +282,77 @@ impl FsqrtCoreAir {
         let f256: AB::F = AB::F::from_u32(256);
         let one = AB::Expr::ONE;
 
-        // ── Selector: positive finite AND normal AND not special ────────
+        // ── Selector: positive finite AND (normal OR subnormal) ─────────
         let not_special = one.clone() - cols.is_special;
         let a_normal_expr = (one.clone() - cols.a_exp_is_zero) * (one.clone() - cols.a_exp_is_max);
         builder
             .when(cols.is_valid)
             .assert_eq(cols.a_normal, a_normal_expr);
         builder.when(cols.is_valid).assert_eq(
+            cols.a_subnormal,
+            cols.a_exp_is_zero * (one.clone() - cols.a_mant_is_zero),
+        );
+        builder.when(cols.is_valid).assert_eq(
             cols.s_finite,
-            not_special * cols.a_normal * (one.clone() - cols.a_sign),
+            not_special * (cols.a_normal + cols.a_subnormal) * (one.clone() - cols.a_sign),
         );
         builder.assert_bool(cols.s_finite);
         let s = cols.s_finite;
+        let is_sub = cols.a_subnormal;
 
-        // ── Significand construction ────────────────────────────────────
-        builder.when(s).assert_eq(cols.a_sig[0], cols.a[0]);
-        builder.when(s).assert_eq(cols.a_sig[1], cols.a[1]);
+        // ── Subnormal normalization via ShlnGadget<4> ──────────────────
+        builder.when(s).assert_eq(cols.norm_shln.x[0], cols.a[0]);
+        builder.when(s).assert_eq(cols.norm_shln.x[1], cols.a[1]);
+        builder.when(s).assert_eq(cols.norm_shln.x[2], cols.a_mant2);
+        builder.when(s).assert_zero(cols.norm_shln.x[3]);
         builder
             .when(s)
+            .assert_eq(cols.norm_shln.shift, cols.norm_shift);
+        builder.assert_eq(cols.norm_shln.enable, is_sub);
+        let shln = ShlnGadget::new(self.range_bus);
+        shln.eval_shln(builder, &cols.norm_shln);
+
+        // ── Significand construction ────────────────────────────────────
+        // Normal: a_sig = mant | implicit. Subnormal: a_sig = norm_shln.y[0..3].
+        builder
+            .when(s * (one.clone() - is_sub))
+            .assert_eq(cols.a_sig[0], cols.a[0]);
+        builder
+            .when(s * (one.clone() - is_sub))
+            .assert_eq(cols.a_sig[1], cols.a[1]);
+        builder
+            .when(s * (one.clone() - is_sub))
             .assert_eq(cols.a_sig[2], cols.a_mant2 + f128);
+        builder
+            .when(s * is_sub)
+            .assert_eq(cols.a_sig[0], cols.norm_shln.y[0]);
+        builder
+            .when(s * is_sub)
+            .assert_eq(cols.a_sig[1], cols.norm_shln.y[1]);
+        builder
+            .when(s * is_sub)
+            .assert_eq(cols.a_sig[2], cols.norm_shln.y[2]);
+        builder.when(s * is_sub).assert_zero(cols.norm_shln.y[3]);
         for i in 0..3 {
             builder.assert_bool(cols.a_sig_hi[i]);
-            builder.when(s).assert_eq(
-                cols.a_sig[i],
-                (cols.a_sig[i] - cols.a_sig_hi[i] * f128) + cols.a_sig_hi[i] * f128,
-            );
             self.range_bus
                 .range_check(cols.a_sig[i].into(), 8)
                 .eval(builder, s.into());
         }
 
-        // ── n = sig << (48 + exp_odd) ───────────────────────────────────
-        // exp_odd = a_exp_lo. When exp is odd, sig is shifted left by 1.
-        // n has 10 bytes: n[0..6] = 0, n[6..10] from shifted sig.
-        // sig_ext[i] (4 bytes):
-        //   exp even: [a_sig[0], a_sig[1], a_sig[2], 0]
-        //   exp odd:  [lo7[0]*2, lo7[1]*2+hi[0], lo7[2]*2+hi[1], hi[2]]
+        // ── Effective exp_odd and exp_hi ────────────────────────────────
+        builder.when(s).assert_eq(
+            cols.eff_exp_odd,
+            (one.clone() - is_sub) * cols.a_exp_lo + is_sub * (one.clone() - cols.ns_lo),
+        );
+        builder.when(s).assert_eq(
+            cols.eff_exp_hi,
+            (one.clone() - is_sub) * cols.a_hi - is_sub * cols.ns_half,
+        );
+
+        // ── n = sig << (48 + eff_exp_odd) ───────────────────────────────
         let lo7 = |i: usize| cols.a_sig[i] - cols.a_sig_hi[i] * f128;
-        let exp_odd = cols.a_exp_lo;
+        let exp_odd = cols.eff_exp_odd;
 
         // ── q range checks ──────────────────────────────────────────────
         for i in 0..5 {
@@ -498,7 +540,7 @@ impl FsqrtCoreAir {
             .eval(builder, s.into());
 
         // Result exponent: a_hi + 63 + is_hi + rc2.
-        let res_exp = cols.a_hi + AB::Expr::from(f63) + cols.is_hi + cols.rc2;
+        let res_exp = cols.eff_exp_hi + AB::Expr::from(f63) + cols.is_hi + cols.rc2;
         builder
             .when(s)
             .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, res_exp);
@@ -656,9 +698,11 @@ where
         core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
 
         let a_normal = (1..=254).contains(&a_exp);
-        let s_finite = !canon_sel && !inf_res && !zero_res && a_normal && a_sign == 0;
+        let a_subnormal = a_exp == 0 && a_mant != 0 && a_sign == 0;
+        let s_finite = !canon_sel && !inf_res && !zero_res && (a_normal || a_subnormal);
         core_row.s_finite = F::from_bool(s_finite);
         core_row.a_normal = F::from_bool(a_normal);
+        core_row.a_subnormal = F::from_bool(a_subnormal);
 
         if s_finite {
             fill_finite_sqrt(core_row, a_exp, a_mant, result, &self.range_checker);
@@ -704,6 +748,13 @@ fn isqrt_u128(n: u128) -> u128 {
 /// Zero all finite-path columns (for non-finite rows).
 fn zero_finite_columns<F: PrimeField32>(row: &mut FsqrtCoreCols<F>) {
     row.s_finite = F::ZERO;
+    row.a_subnormal = F::ZERO;
+    row.eff_exp_odd = F::ZERO;
+    row.eff_exp_hi = F::ZERO;
+    row.norm_shift = F::ZERO;
+    row.ns_lo = F::ZERO;
+    row.ns_half = F::ZERO;
+    row.norm_shln = ShlnCols::<F, 4>::default();
     for i in 0..3 {
         row.a_sig[i] = F::ZERO;
         row.a_sig_hi[i] = F::ZERO;
@@ -746,9 +797,49 @@ fn fill_finite_sqrt<F: PrimeField32>(
     result: u32,
     range_checker: &SharedVariableRangeCheckerChip,
 ) {
-    let a_sig = a_mant | 0x800000;
+    let is_sub = a_exp == 0;
+
+    // ── Normalize significand ───────────────────────────────────────
+    let (a_sig, eff_exp_odd_u32, res_exp_base) = if is_sub {
+        let msb = 31 - a_mant.leading_zeros();
+        let ns = 23 - msb; // norm_shift ∈ [1, 23]
+        let sig = a_mant << ns;
+        let ns_lo = ns & 1;
+        let eo = 1 - ns_lo;
+        let reb = 63i32 - (ns >> 1) as i32; // res_exp = reb + is_hi + rc2
+        (sig, eo, reb)
+    } else {
+        (a_mant | 0x800000, a_exp & 1, (a_exp >> 1) as i32 + 63)
+    };
+
+    // ── Set normalization columns ───────────────────────────────────
+    row.eff_exp_odd = F::from_u32(eff_exp_odd_u32);
+    if is_sub {
+        let ns = 23 - (31 - a_mant.leading_zeros());
+        row.norm_shift = F::from_u32(ns);
+        row.ns_lo = F::from_u32(ns & 1);
+        row.ns_half = F::from_u32(ns >> 1);
+        row.eff_exp_hi = F::ZERO - F::from_u32(ns >> 1);
+    } else {
+        row.norm_shift = F::ZERO;
+        row.ns_lo = F::ZERO;
+        row.ns_half = F::ZERO;
+        row.eff_exp_hi = F::from_u32(a_exp >> 1);
+    }
+
+    // ── ShlnGadget columns ──────────────────────────────────────────
+    // x = mantissa bytes [a_mant&0xFF, (a_mant>>8)&0xFF, (a_mant>>16)&0x7F, 0].
+    row.norm_shln = ShlnCols::<F, 4>::default();
+    row.norm_shln.x[0] = F::from_u32(a_mant & 0xFF);
+    row.norm_shln.x[1] = F::from_u32((a_mant >> 8) & 0xFF);
+    row.norm_shln.x[2] = F::from_u32((a_mant >> 16) & 0x7F);
+    row.norm_shln.x[3] = F::ZERO;
+    if is_sub {
+        let ns = row.norm_shift.as_canonical_u32() as usize;
+        fill_shln_cols(&mut row.norm_shln, ns, range_checker);
+    }
+
     let asig_bytes: [u32; 3] = [a_sig & 0xFF, (a_sig >> 8) & 0xFF, (a_sig >> 16) & 0xFF];
-    let exp_odd = a_exp & 1;
 
     for (i, &sb) in asig_bytes.iter().enumerate() {
         row.a_sig[i] = F::from_u32(sb);
@@ -756,8 +847,8 @@ fn fill_finite_sqrt<F: PrimeField32>(
         range_checker.add_count(sb, 8);
     }
 
-    // sig_shifted = a_sig << exp_odd. n = sig_shifted << 48.
-    let sig_shifted = (a_sig as u64) << exp_odd;
+    // sig_shifted = a_sig << eff_exp_odd. n = sig_shifted << 48.
+    let sig_shifted = (a_sig as u64) << eff_exp_odd_u32;
     let n = (sig_shifted as u128) << 48;
 
     // q = floor(sqrt(n)), rem = n - q².
@@ -789,7 +880,7 @@ fn fill_finite_sqrt<F: PrimeField32>(
     let lo7 = |i: usize| asig_bytes[i] & 0x7F;
     let n_bytes: [u32; 10] = {
         let mut nb = [0u32; 10];
-        if exp_odd == 0 {
+        if eff_exp_odd_u32 == 0 {
             nb[6] = asig_bytes[0];
             nb[7] = asig_bytes[1];
             nb[8] = asig_bytes[2];
@@ -910,7 +1001,7 @@ fn fill_finite_sqrt<F: PrimeField32>(
     row.rc2_rem = F::from_u32(rc2_rem);
     range_checker.add_count(rc2_rem, 7);
 
-    let res_exp = (a_exp >> 1) + 63 + is_hi_val as u32 + rc2;
+    let res_exp = (res_exp_base + is_hi_val as i32 + rc2 as i32) as u32;
     row.r_exp_lo = F::from_u32(res_exp & 1);
     row.r_exp_hi = F::from_u32(res_exp >> 1);
 
@@ -997,6 +1088,34 @@ fn make_shrn_cols7<F: PrimeField32>(
         lost_combined: F::from_u32(lost_combined),
         combined_inv,
     }
+}
+
+/// Fill ShlnCols<4> witness for subnormal normalization.
+fn fill_shln_cols<F: PrimeField32>(
+    cols: &mut ShlnCols<F, 4>,
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) {
+    const N: usize = 4;
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let x: [u32; N] = core::array::from_fn(|i| cols.x[i].as_canonical_u32());
+    let (y, q, r) = run_shln(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+    let carry_val = |v: u32| if r == 0 { 0 } else { v >> (SHLIMB_BITS - r) };
+    for i in 0..N {
+        range_checker.add_count(carry_val(x[i]), r);
+        range_checker.add_count(y[i], 8);
+    }
+    cols.shift = F::from_u32(shift as u32);
+    cols.enable = F::ONE;
+    cols.limb_shift_marker = limb_shift_marker;
+    cols.bit_shift_marker = bit_shift_marker;
+    cols.bit_mult = F::from_u32(1u32 << r);
+    cols.bit_shift_carry = core::array::from_fn(|i| F::from_u32(carry_val(x[i])));
+    cols.y = core::array::from_fn(|i| F::from_u32(y[i]));
 }
 
 #[cfg(test)]
