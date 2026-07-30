@@ -32,7 +32,7 @@ Per-chip soundness of the **result**:
 | fadd        | ✅                   | ✅ fully sound (all finite + subnormal inputs + zero) |
 | fsub        | ✅                   | ✅ fully sound (all finite + subnormal inputs + zero) |
 | fdiv        | ✅ (pre-existing)    | ✅ fully sound (normal + overflow + subnormal/underflow) |
-| fma         | ✅ (pre-existing)    | ❌ finite unconstrained           |
+| fma         | ✅ (pre-existing)    | 🔨 in progress (product+align+sumdiff+rounding; non-Madd opcodes + overflow pending) |
 | fsqrt       | ✅ (pre-existing)    | ✅ fully sound (normal + subnormal inputs) |
 | fcvt_f2i    | ✅                   | ✅ in-range RTZ truncation (shift + two's-complement) |
 | fcvt_i2f    | ✅ (zero only)       | ✅ RNE rounding (normalize + round) |
