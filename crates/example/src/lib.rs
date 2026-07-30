@@ -1608,16 +1608,16 @@ mod fuzz_tests {
             (-0.0f32).to_bits(),
             (-1.0f32).to_bits(),
             f32::MIN.to_bits(),
-            0x00800000,              // MIN_NORMAL
-            0x7F7FFFFF,              // MAX
-            0x00000001,              // min subnormal
-            0x007FFFFF,              // max subnormal
-            0x00400000,              // mid subnormal
-            0x3FA00000,              // 1.25
-            0x40A00000,              // 5.0
-            0x00200000,              // subnormal
-            (-100.0f32).to_bits(),   // negative -> NaN
-            0x00100000,              // subnormal
+            0x00800000,            // MIN_NORMAL
+            0x7F7FFFFF,            // MAX
+            0x00000001,            // min subnormal
+            0x007FFFFF,            // max subnormal
+            0x00400000,            // mid subnormal
+            0x3FA00000,            // 1.25
+            0x40A00000,            // 5.0
+            0x00200000,            // subnormal
+            (-100.0f32).to_bits(), // negative -> NaN
+            0x00100000,            // subnormal
         ];
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fsqrt_s(rd, rs1));
         prove_chunk(instrs, mem);
