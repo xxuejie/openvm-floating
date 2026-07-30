@@ -5,8 +5,10 @@ use openvm_circuit::{
     system::memory::{online::TracingMemory, MemoryAuxColsFactory},
 };
 use openvm_circuit_primitives::{
+    is_less_than::{IsLessThanIo, IsLtSubAir},
     var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
-    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper,
+    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper, SubAir,
+    TraceSubRowGenerator,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
 use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, LocalOpcode};
@@ -18,6 +20,8 @@ use openvm_stark_backend::{
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
     BaseAirWithPublicValues,
 };
+
+use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
 
 /// Which fused multiply-add variant an instruction performs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,6 +170,13 @@ pub struct FmaCoreCols<T> {
     pub is_high: T,
     pub p5_lo: T,
     pub norm_prod: [T; 6],
+
+    // === Phase 2: addend alignment ===
+    pub ediff: T,
+    pub c_is_larger: T,
+    pub is_deep: T,
+    pub align_lt_decomp: [T; 1],
+    pub align: ShrnCols<T, 7>,
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -613,6 +624,82 @@ impl FmaCoreAir {
                 .range_check(cols.norm_prod[i].into(), LIMB_BITS as usize)
                 .eval(builder, s.into());
         }
+
+        // ── Phase 2: Addend alignment ──────────────────────────────────
+        self.eval_finite_align(builder, cols);
+    }
+
+    /// Phase 2: Align the smaller operand (c or product) into a 7-byte field
+    /// using ShrnGadget<7>. Computes ediff = |prod_exp - c_exp|, determines
+    /// which operand is larger, and shifts the smaller one right by ediff.
+    pub fn eval_finite_align<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        cols: &FmaCoreCols<AB::Var>,
+    ) {
+        let f2: AB::F = AB::F::from_u32(2);
+        let f55: AB::F = AB::F::from_u32(55);
+        let f127: AB::F = AB::F::from_u32(127);
+        let one = AB::Expr::ONE;
+        let s = cols.s_finite;
+
+        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_hi * f2;
+        let c_exp = cols.c_exp_lo + cols.c_hi * f2;
+        let prod_exp = a_exp + b_exp - AB::Expr::from(f127) + cols.is_high;
+
+        // ── ediff = |prod_exp - c_exp| ─────────────────────────────────
+        builder.assert_bool(cols.c_is_larger);
+        let diff = prod_exp - c_exp;
+        let ediff_expr =
+            (one.clone() - cols.c_is_larger) * diff.clone() + cols.c_is_larger * (-diff);
+        builder.when(s).assert_eq(cols.ediff, ediff_expr);
+        self.range_bus
+            .range_check(cols.ediff.into(), 9)
+            .eval(builder, s.into());
+
+        // ── Deep alignment: ediff >= 56 ────────────────────────────────
+        builder.assert_bool(cols.is_deep);
+        let lt_air = IsLtSubAir::new(self.range_bus, 9);
+        let io = IsLessThanIo::new(
+            AB::Expr::from(f55),
+            cols.ediff.into(),
+            cols.is_deep.into(),
+            s.into(),
+        );
+        lt_air.eval(builder, (io, &cols.align_lt_decomp));
+
+        // ── ShrnGadget<7>: shift the smaller operand right ─────────────
+        // Input mux: c_is_larger=0 → c at [3..6]; c_is_larger=1 → product at [0..6].
+        let cil = cols.c_is_larger;
+        for i in 0..7 {
+            let c_val = match i {
+                0..=2 => AB::Expr::ZERO,
+                3 => cols.c_sig[0].into(),
+                4 => cols.c_sig[1].into(),
+                5 => cols.c_sig[2].into(),
+                _ => AB::Expr::ZERO,
+            };
+            let p_val = if i < 6 {
+                cols.norm_prod[i].into()
+            } else {
+                AB::Expr::ZERO
+            };
+            let ncil = one.clone() - cil;
+            builder
+                .when(s)
+                .assert_eq(cols.align.x[i], ncil * c_val + cil * p_val);
+        }
+        // Shift: clamp to 55 if deep.
+        builder
+            .when(s * (one.clone() - cols.is_deep))
+            .assert_eq(cols.align.shift, cols.ediff);
+        builder
+            .when(s * cols.is_deep)
+            .assert_eq(cols.align.shift, AB::Expr::from(f55));
+        builder.assert_eq(cols.align.enable, s);
+        let shrn = ShrnGadget::new(self.range_bus);
+        shrn.eval_shrn(builder, &cols.align);
     }
 }
 
@@ -934,6 +1021,11 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FmaCoreCols<F>) {
     }
     row.is_high = F::ZERO;
     row.p5_lo = F::ZERO;
+    row.ediff = F::ZERO;
+    row.c_is_larger = F::ZERO;
+    row.is_deep = F::ZERO;
+    row.align_lt_decomp = [F::ZERO];
+    row.align = ShrnCols::<F, 7>::default();
 }
 
 /// Fill the product + normalization witness for the finite path.
@@ -1019,6 +1111,112 @@ fn fill_finite_product<F: PrimeField32>(
     }
 
     let _ = (a_exp, b_exp, c_exp);
+
+    // ── Phase 2: Addend alignment ──────────────────────────────────
+    let prod_exp_i = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
+    let c_exp_i = c_exp as i32;
+    let diff_i = prod_exp_i - c_exp_i;
+    let c_is_larger = diff_i < 0;
+    let ediff = diff_i.unsigned_abs();
+    let is_deep = ediff >= 56;
+    let cshift = if is_deep { 55u32 } else { ediff };
+
+    row.ediff = F::from_u32(ediff);
+    range_checker.add_count(ediff, 9);
+    row.c_is_larger = F::from_bool(c_is_larger);
+    row.is_deep = F::from_bool(is_deep);
+
+    let lt_air = IsLtSubAir::new(range_checker.bus(), 9);
+    lt_air.generate_subrow(
+        (range_checker.as_ref(), 55u32, ediff),
+        (&mut row.align_lt_decomp, &mut row.is_deep),
+    );
+
+    // ShrnGadget input: smaller operand placed in 7-byte field.
+    let align_x: [u32; 7] = if c_is_larger {
+        // Product is smaller: [norm_prod[0..5], 0].
+        let norm = if is_high { prod } else { prod << 1 };
+        core::array::from_fn(|i| {
+            if i < 6 {
+                ((norm >> (i * 8)) & 0xFF) as u32
+            } else {
+                0
+            }
+        })
+    } else {
+        // C is smaller: [0, 0, 0, c_sig[0], c_sig[1], c_sig[2], 0].
+        [0, 0, 0, csig_bytes[0], csig_bytes[1], csig_bytes[2], 0]
+    };
+
+    row.align = make_shrn_cols7::<F>(align_x, cshift as usize, range_checker);
+}
+
+/// Build a `ShrnCols<7>` witness and register range-checker counts.
+fn make_shrn_cols7<F: PrimeField32>(
+    x: [u32; 7],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShrnCols<F, 7> {
+    const N: usize = 7;
+    let shift = shift.min(N * SHLIMB_BITS - 1);
+    let (y, q, r) = run_shrn(&x, shift);
+    let (guard, sticky) = run_shrn_round(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+
+    let pc = x[q] & ((1u32 << r) - 1);
+    let pmsb = if r >= 1 { (pc >> (r - 1)) & 1 } else { 0 };
+    let prest = if r >= 1 {
+        pc - pmsb * (1u32 << (r - 1))
+    } else {
+        0
+    };
+    let hf = if q >= 1 { x[q - 1] } else { 0 };
+    let hmsb = if r == 0 { (hf >> 7) & 1 } else { 0 };
+    let hrest = if r == 0 { hf - hmsb * 128 } else { 0 };
+    let full_rge1: u32 = (0..q).map(|k| x[k]).sum();
+    let full_r0: u32 = (0..q.saturating_sub(1)).map(|k| x[k]).sum();
+    let lost_combined = if r >= 1 {
+        prest + full_rge1
+    } else {
+        hrest + full_r0
+    };
+    let combined_inv = if lost_combined != 0 {
+        F::from_u32(lost_combined).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    for i in 0..N {
+        range_checker.add_count(x[i] & ((1u32 << r) - 1), r);
+        range_checker.add_count(y[i], 8);
+    }
+    if r >= 1 {
+        range_checker.add_count(prest, r - 1);
+    } else {
+        range_checker.add_count(hrest, 7);
+    }
+
+    ShrnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(x[i] & ((1u32 << r) - 1))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+        guard: F::from_u32(guard),
+        sticky: F::from_bool(sticky),
+        pmsb: F::from_u32(pmsb),
+        prest: F::from_u32(prest),
+        hmsb: F::from_u32(hmsb),
+        hrest: F::from_u32(hrest),
+        lost_combined: F::from_u32(lost_combined),
+        combined_inv,
+    }
 }
 
 #[cfg(test)]
@@ -1093,6 +1291,7 @@ mod product_tests {
         let air = FmaCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
         let mut builder = NumericBuilder::new(vec![]);
         air.eval_finite_product(&mut builder, &row);
+        air.eval_finite_align(&mut builder, &row);
         builder
     }
 
