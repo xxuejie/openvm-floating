@@ -108,6 +108,7 @@ pub struct FsubCoreCols<T> {
     // input is `small_sig << 8` (4 bytes), `shift` = ediff, `y` = aligned significand.
     pub align: ShrnCols<T, WORK_LIMBS>,
     pub is_deep: T, // bool: ediff >= 25 (smaller operand < 0.5 ULP ⇒ result = larger)
+    pub deep_sign: T, // deep-path result sign (a_sign or its flip; witness col for degree)
     pub deep_delta: T, // byte witness used to soundly derive is_deep
     pub lost_sticky: T, // OR of align.guard / align.sticky (bits lost during alignment)
     pub align_enable: T, // bool: s_sub AND !is_deep (gates the ShrnGadget)
@@ -550,7 +551,10 @@ impl FsubCoreAir {
         builder.assert_eq(cols.align_enable, cols.s_sub * (one.clone() - cols.is_deep));
         builder.assert_bool(cols.align_enable);
         let s_shallow = cols.align_enable;
-        let s_deep = cols.s_sub * cols.is_deep;
+        // Deep path (ediff >= 25): result magnitude = larger operand for any
+        // effective operation — the smaller operand is strictly below half a
+        // ULP, so cancellation also rounds to the larger operand exactly.
+        let s_deep = cols.s_bn * cols.is_deep;
 
         // ── Alignment via ShrnGadget (shallow path) ─────────────────────
         builder.when(cols.is_valid).assert_zero(cols.align.x[0]);
@@ -565,6 +569,7 @@ impl FsubCoreAir {
             .assert_eq(cols.align.x[3], cols.small_sig[2]);
         let shrn = ShrnGadget::new(self.range_bus);
         shrn.eval_shrn(builder, &cols.align);
+        builder.assert_eq(cols.align.enable, cols.align_enable);
         builder
             .when(cols.align_enable)
             .assert_eq(cols.align.shift, cols.ediff);
@@ -574,15 +579,21 @@ impl FsubCoreAir {
         );
         builder.assert_bool(cols.lost_sticky);
 
-        // ── Deep path: result = larger operand magnitude, sign = a_sign ───
-        // (opposite signs ⇒ the result's magnitude is the larger operand's, but
-        // its sign is the minuend's, a_sign, which differs from the larger
-        // operand's sign when b is the larger operand).
+        // ── Deep path: result = larger operand magnitude ────────────────
+        // Sign: opposite signs (magnitude add) → a_sign always. Same sign
+        // (subtraction) → a_sign when a is larger, else !a_sign (the result
+        // is -(b - tiny)).
         let large_b0 = sel.clone() * cols.a_mant0 + notsel.clone() * cols.b_mant0;
         let large_b1 = sel.clone() * cols.a_mant1 + notsel.clone() * cols.b_mant1;
         let large_b2 = sel.clone() * (cols.a_mant2 + cols.a_exp_lo * f128)
             + notsel.clone() * (cols.b_mant2 + cols.b_exp_lo * f128);
         let large_exp_hi = sel.clone() * cols.a_exp_hi + notsel.clone() * cols.b_exp_hi;
+        let sub_sign = sel.clone() * cols.a_sign + notsel.clone() * (one.clone() - cols.a_sign);
+        builder.when(cols.s_bn).assert_eq(
+            cols.deep_sign,
+            (one.clone() - cols.is_add) * cols.a_sign + cols.is_add * sub_sign.clone(),
+        );
+        builder.assert_bool(cols.deep_sign);
         builder
             .when(s_deep.clone())
             .assert_eq(cols.result[0], large_b0.clone());
@@ -594,10 +605,10 @@ impl FsubCoreAir {
             .assert_eq(cols.result[2], large_b2.clone());
         builder
             .when(s_deep.clone())
-            .assert_eq(cols.result[3], large_exp_hi + cols.a_sign * f128);
+            .assert_eq(cols.result[3], large_exp_hi + cols.deep_sign * f128);
         builder
             .when(s_deep.clone())
-            .assert_eq(cols.result_sign, cols.a_sign);
+            .assert_eq(cols.result_sign, cols.deep_sign);
         builder
             .when(s_deep)
             .assert_eq(cols.result_exp, large_exp.clone());
@@ -1305,6 +1316,14 @@ fn fill_fsub_witness<F: PrimeField32>(
     };
     let s_cancel = s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep;
     row.s_bn = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    // Deep-path result sign: a_sign for magnitude add, flipped when b is the
+    // larger operand in same-sign subtraction.
+    let deep_sign = if same_sign && !a_is_larger {
+        a_sign == 0
+    } else {
+        a_sign == 1
+    };
+    row.deep_sign = F::from_bool(deep_sign);
     row.s_fb = F::from_bool(s_finite_bool && !a_is_zero && !b_is_zero);
     row.s_one_zero = F::from_bool(s_finite_bool && (a_is_zero != b_is_zero));
     row.s_cancel = F::from_bool(s_cancel);

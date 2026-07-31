@@ -1801,8 +1801,16 @@ mod fuzz_tests {
         }
         // Heavy cancellation (close magnitudes).
         cases.push((0x3f800000, 0x3f800001)); // 1.0 - (1.0+tiny)
-        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fsub_s(rd, rs1, rs2));
-        prove_chunk(instrs, mem);
+                                              // Deep same-sign (ediff >= 25): result is the larger operand.
+        cases.push((0x74800000, 0x04800000)); // 2^100 - tiny
+        cases.push((0x04800000, 0x74800000)); // tiny - 2^100 (negative result)
+        cases.push((0x3F800000, 0x00800000)); // 1.0 - min_normal
+                                              // 15 rows per chunk: the register file has only 32 entries.
+        for chunk in cases.chunks(15) {
+            let (instrs, mem) =
+                build_binary_chunk(chunk, &mut |rd, rs1, rs2, _| fsub_s(rd, rs1, rs2));
+            prove_chunk(instrs, mem);
+        }
     }
 }
 
