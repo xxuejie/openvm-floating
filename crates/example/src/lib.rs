@@ -1701,6 +1701,12 @@ mod fuzz_tests {
             (0x3C << 23, 0x3C << 23), // exp 60*60 → subnormal result
             (0x43 << 23, 0x43 << 23), // tiny → underflow 0
             (1.5f32.to_bits(), 1.5f32.to_bits()),
+            (0x00000001, 0x3F800000), // min subnormal * 1.0
+            (0x00000001, 0x00000001), // min subnormal^2 -> +0
+            (0x007FFFFF, 0x3F800000), // max subnormal * 1.0
+            (0x00400000, 0x40000000), // subnormal * 2.0
+            (0x80400000, 0x40000000), // negative subnormal * 2.0
+            (0x00000001, 0x7F7FFFFF), // min subnormal * MAX
         ];
         let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fmul_s(rd, rs1, rs2));
         prove_chunk(instrs, mem);

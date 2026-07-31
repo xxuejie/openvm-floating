@@ -22,7 +22,9 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
-use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget, SHLIMB_BITS};
+use crate::fp_shift::{
+    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+};
 
 pub const SIG_NUM_LIMBS: usize = 3;
 pub const PRODUCT_NUM_LIMBS: usize = 6;
@@ -86,6 +88,17 @@ pub struct FmulCoreCols<T> {
     // Significand construction (stored as columns to keep carry chain degree low)
     pub a_sig: [T; SIG_NUM_LIMBS],
     pub b_sig: [T; SIG_NUM_LIMBS],
+
+    // Subnormal operand pre-normalization (leading-zeros left shift; the
+    // exponent absorbs the shift, so the downstream pipeline is unchanged).
+    pub a_sub: T,
+    pub b_sub: T,
+    pub a_lshift: T,
+    pub b_lshift: T,
+    pub a_shln: ShlnCols<T, 3>,
+    pub b_shln: ShlnCols<T, 3>,
+    pub a_y2_lo7: T,
+    pub b_y2_lo7: T,
 
     // Product
     pub product: [T; PRODUCT_NUM_LIMBS],
@@ -280,16 +293,83 @@ where
         // at degree 2. Verify: a_sig[2] = a_mant2 + is_normal * 128.
         // Gated on is_valid: on padding rows a/b_is_normal evaluate to 1 (all
         // classification columns are zero), so the implicit-bit term must not fire.
-        builder.assert_eq(cols.a_sig[0], cols.a_mant0);
-        builder.assert_eq(cols.a_sig[1], cols.a_mant1);
-        builder
-            .when(cols.is_valid)
-            .assert_eq(cols.a_sig[2], cols.a_mant2 + a_is_normal.clone() * f128);
-        builder.assert_eq(cols.b_sig[0], cols.b_mant0);
-        builder.assert_eq(cols.b_sig[1], cols.b_mant1);
-        builder
-            .when(cols.is_valid)
-            .assert_eq(cols.b_sig[2], cols.b_mant2 + b_is_normal.clone() * f128);
+        // Subnormal operands are pre-normalized (leading-zeros left shift); the
+        // exponent absorbs the shift (see eval_finite_output etc.).
+        builder.assert_eq(
+            cols.a_sub,
+            cols.a_exp_is_zero * (one.clone() - cols.a_mant_is_zero),
+        );
+        builder.assert_eq(
+            cols.b_sub,
+            cols.b_exp_is_zero * (one.clone() - cols.b_mant_is_zero),
+        );
+        builder.assert_bool(cols.a_sub);
+        builder.assert_bool(cols.b_sub);
+        let shln = ShlnGadget::new(self.range_bus);
+        let mut eval_op_norm = |x_sub: AB::Var,
+                                lshift: AB::Var,
+                                m0v: AB::Var,
+                                m1v: AB::Var,
+                                m2v: AB::Var,
+                                shln_cols: &ShlnCols<AB::Var, 3>,
+                                y2_lo7: AB::Var| {
+            builder.assert_eq(shln_cols.x[0], x_sub * m0v);
+            builder.assert_eq(shln_cols.x[1], x_sub * m1v);
+            builder.assert_eq(shln_cols.x[2], x_sub * m2v);
+            builder.assert_eq(shln_cols.shift, lshift);
+            builder.assert_eq(shln_cols.enable, x_sub);
+            shln.eval_shln(builder, shln_cols);
+            // MSB must land at bit 23 (forces the maximal shift).
+            builder.when(x_sub).assert_eq(shln_cols.y[2], y2_lo7 + f128);
+            self.range_bus
+                .range_check(y2_lo7.into(), 7)
+                .eval(builder, x_sub.into());
+        };
+        eval_op_norm(
+            cols.a_sub,
+            cols.a_lshift,
+            cols.a_mant0,
+            cols.a_mant1,
+            cols.a_mant2,
+            &cols.a_shln,
+            cols.a_y2_lo7,
+        );
+        eval_op_norm(
+            cols.b_sub,
+            cols.b_lshift,
+            cols.b_mant0,
+            cols.b_mant1,
+            cols.b_mant2,
+            &cols.b_shln,
+            cols.b_y2_lo7,
+        );
+
+        let a_ns = one.clone() - cols.a_sub;
+        let b_ns = one.clone() - cols.b_sub;
+        builder.assert_eq(
+            cols.a_sig[0],
+            a_ns.clone() * cols.a_mant0 + cols.a_sub * cols.a_shln.y[0],
+        );
+        builder.assert_eq(
+            cols.a_sig[1],
+            a_ns.clone() * cols.a_mant1 + cols.a_sub * cols.a_shln.y[1],
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.a_sig[2],
+            a_ns * (cols.a_mant2 + a_is_normal.clone() * f128) + cols.a_sub * cols.a_shln.y[2],
+        );
+        builder.assert_eq(
+            cols.b_sig[0],
+            b_ns.clone() * cols.b_mant0 + cols.b_sub * cols.b_shln.y[0],
+        );
+        builder.assert_eq(
+            cols.b_sig[1],
+            b_ns.clone() * cols.b_mant1 + cols.b_sub * cols.b_shln.y[1],
+        );
+        builder.when(cols.is_valid).assert_eq(
+            cols.b_sig[2],
+            b_ns * (cols.b_mant2 + b_is_normal.clone() * f128) + cols.b_sub * cols.b_shln.y[2],
+        );
 
         let a_sig: [AB::Var; SIG_NUM_LIMBS] = [cols.a_sig[0], cols.a_sig[1], cols.a_sig[2]];
         let b_sig: [AB::Var; SIG_NUM_LIMBS] = [cols.b_sig[0], cols.b_sig[1], cols.b_sig[2]];
@@ -548,7 +628,11 @@ impl FmulCoreAir {
 
         let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
         let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
-        let exp_normal = a_exp + b_exp - f127 + cols.is_high;
+        // Effective exponents: subnormal operands absorb their normalization
+        // shift (value = sig * 2^(exp_eff - 127 - 23) in all cases).
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp);
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp);
+        let exp_normal = a_exp_eff + b_exp_eff - f127 + cols.is_high;
 
         // Carry / decomposition flags.
         builder.assert_bool(cols.c0);
@@ -623,7 +707,9 @@ impl FmulCoreAir {
 
         let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
         let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
-        let exp_normal = a_exp + b_exp - f127 + cols.is_high;
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp);
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp);
+        let exp_normal = a_exp_eff + b_exp_eff - f127 + cols.is_high;
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
 
         // eq_i = (norm_sig[i] == 255) via is-zero on (255 - norm_sig[i]).
@@ -691,9 +777,8 @@ impl FmulCoreAir {
         cols: &FmulCoreCols<AB::Var>,
     ) {
         let f2: AB::F = AB::F::from_u32(2);
-        let f97: AB::F = AB::F::from_u32(97);
+        let f64: AB::F = AB::F::from_u32(64);
         let f128: AB::F = AB::F::from_u32(128);
-        let f152: AB::F = AB::F::from_u32(152);
         let f256: AB::F = AB::F::from_u32(1 << LIMB_BITS);
         let one = AB::Expr::ONE;
 
@@ -715,23 +800,29 @@ impl FmulCoreAir {
         builder.assert_bool(cols.s_subnormal);
         let s = cols.s_subnormal;
 
-        // sub_capped = (true shift >= 56) = (a_exp + b_exp + is_high < 97). On
-        // s_subnormal rows exp_normal <= 0, so the sum <= 127 (< 2^8).
-        let sum = a_exp.clone() + b_exp.clone() + cols.is_high;
+        // Effective exponents (subnormal operands absorb their normalization
+        // shift). Biased by +64 so the sum stays non-negative for the
+        // less-than gadget: sub_capped = (true shift >= 56) <=>
+        // (sum_eff < 97) <=> (sum_b < 161). On s_subnormal rows exp_normal
+        // <= 0, so sum_b <= 191 (< 2^8).
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp);
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp);
+        let sum = a_exp_eff + b_exp_eff + cols.is_high + AB::Expr::from(f64);
         let lt_air = IsLtSubAir::new(self.range_bus, 8);
         let io = IsLessThanIo::new(
             sum.clone(),
-            AB::Expr::from(f97),
+            AB::Expr::from(AB::F::from_u32(161)),
             cols.sub_capped.into(),
             s.into(),
         );
         lt_air.eval(builder, (io, &cols.sub_lt_decomp));
         builder.assert_bool(cols.sub_capped);
 
-        // cshift = !capped ? (152 - sum) : 55.  (152 - sum = 25 - exp_normal.)
-        builder
-            .when(s * (one.clone() - cols.sub_capped))
-            .assert_eq(cols.sub_shift, AB::Expr::from(f152) - sum.clone());
+        // cshift = !capped ? (216 - sum_b) : 55.  (216 - sum_b = 25 - exp_normal.)
+        builder.when(s * (one.clone() - cols.sub_capped)).assert_eq(
+            cols.sub_shift,
+            AB::Expr::from(AB::F::from_u32(216)) - sum.clone(),
+        );
         builder
             .when(s * cols.sub_capped)
             .assert_eq(cols.sub_shift, AB::F::from_u32(55));
@@ -916,6 +1007,42 @@ where
     }
 }
 
+/// Build a `ShlnCols<3>` witness (subnormal operand normalization) and
+/// register range-checker counts.
+fn make_shln_cols3<F: PrimeField32>(
+    x: [u32; 3],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShlnCols<F, 3> {
+    const N: usize = 3;
+    let (y, q, r) = run_shln(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+    let cv = |v: u32| {
+        if r == 0 {
+            0
+        } else {
+            v >> (SHLIMB_BITS - r)
+        }
+    };
+    for i in 0..N {
+        range_checker.add_count(cv(x[i]), r);
+        range_checker.add_count(y[i], 8);
+    }
+    ShlnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(cv(x[i]))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+    }
+}
+
 fn decompose(bits: u32) -> (u32, u32, u32, u32, u32, u32, u32) {
     // Returns: sign, exp_lo, exp_hi, mant0, mant1, mant2, exp
     let sign = (bits >> 31) & 1;
@@ -1023,16 +1150,47 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.b_is_inf = F::from_bool(b_is_inf);
     row.b_is_zero = F::from_bool(b_is_zero);
 
-    // Product computation
-    let a_sig = if a_is_normal {
-        a_mant0 | (a_mant1 << 8) | ((a_mant2 | 0x80) << 16)
+    // Product computation. Subnormal operands are pre-normalized
+    // (leading-zeros left shift); the exponent absorbs the shift.
+    let a_sub = a_exp == 0 && (a_mant0 + a_mant1 + a_mant2) != 0;
+    let b_sub = b_exp == 0 && (b_mant0 + b_mant1 + b_mant2) != 0;
+    row.a_sub = F::from_bool(a_sub);
+    row.b_sub = F::from_bool(b_sub);
+    let a_mant = a_mant0 | (a_mant1 << 8) | (a_mant2 << 16);
+    let b_mant = b_mant0 | (b_mant1 << 8) | (b_mant2 << 16);
+    let (a_sig, a_exp_eff) = if a_sub {
+        let lz = 24 - (32 - a_mant.leading_zeros());
+        let bytes = [a_mant & 0xFF, (a_mant >> 8) & 0xFF, (a_mant >> 16) & 0xFF];
+        row.a_shln = make_shln_cols3::<F>(bytes, lz as usize, range_chip);
+        row.a_lshift = F::from_u32(lz);
+        let sig = a_mant << lz;
+        row.a_y2_lo7 = F::from_u32(((sig >> 16) & 0xFF) - 128);
+        range_chip.add_count(((sig >> 16) & 0xFF) - 128, 7);
+        (sig, 1 - lz as i32)
     } else {
-        a_mant0 | (a_mant1 << 8) | (a_mant2 << 16)
+        let sig = if a_is_normal {
+            a_mant | 0x800000
+        } else {
+            a_mant
+        };
+        (sig, a_exp as i32)
     };
-    let b_sig = if b_is_normal {
-        b_mant0 | (b_mant1 << 8) | ((b_mant2 | 0x80) << 16)
+    let (b_sig, b_exp_eff) = if b_sub {
+        let lz = 24 - (32 - b_mant.leading_zeros());
+        let bytes = [b_mant & 0xFF, (b_mant >> 8) & 0xFF, (b_mant >> 16) & 0xFF];
+        row.b_shln = make_shln_cols3::<F>(bytes, lz as usize, range_chip);
+        row.b_lshift = F::from_u32(lz);
+        let sig = b_mant << lz;
+        row.b_y2_lo7 = F::from_u32(((sig >> 16) & 0xFF) - 128);
+        range_chip.add_count(((sig >> 16) & 0xFF) - 128, 7);
+        (sig, 1 - lz as i32)
     } else {
-        b_mant0 | (b_mant1 << 8) | (b_mant2 << 16)
+        let sig = if b_is_normal {
+            b_mant | 0x800000
+        } else {
+            b_mant
+        };
+        (sig, b_exp as i32)
     };
 
     // Fill significand columns
@@ -1229,19 +1387,19 @@ fn fill_fmul_witness<F: PrimeField32>(
     // Register the overflow exponent-check key on the tuple range bus so the
     // corresponding lookup in eval_finite_overflow balances.
     if s_overflow {
-        let exp_check = a_exp + b_exp - 127 + is_high as u32 + c2;
+        let exp_check = (a_exp_eff + b_exp_eff - 127 + is_high as i32 + c2 as i32) as u32;
         range_chip.add_count(exp_check - 255, LIMB_BITS);
     }
 
     // The reconstruction is only meaningful for normal results; sanity-check
     // the exponent carry there so any witness drift surfaces immediately.
     debug_assert!(
-        !s_normal || r_exp == a_exp + b_exp - 127 + is_high as u32 + c2,
+        !s_normal || r_exp as i32 == a_exp_eff + b_exp_eff - 127 + is_high as i32 + c2 as i32,
         "fmul normal-result exponent reconstruction mismatch"
     );
     // Overflow exponent sanity check.
     debug_assert!(
-        !s_overflow || a_exp + b_exp - 127 + is_high as u32 + c2 >= 255,
+        !s_overflow || a_exp_eff + b_exp_eff - 127 + is_high as i32 + c2 as i32 >= 255,
         "fmul overflow exponent mismatch"
     );
 
@@ -1250,13 +1408,13 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.s_subnormal = F::from_bool(s_subnormal);
     row.sub_efz = F::from_bool(r_exp == 0);
     if s_subnormal {
-        let exp_normal = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
-        let sum = a_exp + b_exp + is_high as u32;
-        let true_shift = 25 - exp_normal; // = 152 - sum
+        let exp_normal = a_exp_eff + b_exp_eff - 127 + is_high as i32;
+        let sum_b = (a_exp_eff + b_exp_eff + is_high as i32 + 64) as u32;
+        let true_shift = 25 - exp_normal; // = 216 - sum_b
         let sub_capped = true_shift >= 56;
         row.sub_capped = F::from_bool(sub_capped);
         lt_air.generate_subrow(
-            (range_chip.as_ref(), sum, 97),
+            (range_chip.as_ref(), sum_b, 161),
             (&mut row.sub_lt_decomp, &mut row.sub_capped),
         );
         let cshift = if sub_capped { 55u32 } else { true_shift as u32 };
@@ -1901,5 +2059,38 @@ mod full_eval_tests {
         let _ = trials;
         assert!(sub_seen, "never exercised a (non-deep) subnormal result");
         assert!(deep_seen, "never exercised a deep-underflow result");
+    }
+
+    #[test]
+    fn full_eval_subnormal_inputs_pass() {
+        // Subnormal operands are pre-normalized; every result class must be
+        // provable (this was the unprovable class before the fix).
+        type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+        for &(a, b) in &[
+            (0x00000001, 0x3F800000), // min subnormal * 1.0
+            (0x00000001, 0x00000001), // min subnormal^2 -> +0
+            (0x007FFFFF, 0x3F800000), // max subnormal * 1.0
+            (0x00800000, 0x00400000), // min normal * subnormal
+            (0x00400000, 0x40000000), // subnormal * 2.0 -> normal
+            (0x80400000, 0x40000000), // negative subnormal * 2.0
+            (0x00000001, 0x7F7FFFFF), // min subnormal * MAX
+        ] {
+            let (cols, _chip) = filler_cols(a, b);
+            let air = air();
+            let mut b0 = NumericBuilder::new(vec![]);
+            // SAFETY: FmulCoreCols is #[repr(C)] and contains only F fields.
+            let slice: &[F] = unsafe {
+                std::slice::from_raw_parts(
+                    &cols as *const FmulCoreCols<F> as *const F,
+                    FmulCoreCols::<F>::width(),
+                )
+            };
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air, &mut b0, slice, F::ZERO);
+            assert!(
+                b0.ok(),
+                "fmul subnormal-input a={a:08x} b={b:08x}: {:?}",
+                b0.failures
+            );
+        }
     }
 }
