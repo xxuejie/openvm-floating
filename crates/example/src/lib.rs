@@ -1542,20 +1542,64 @@ mod fuzz_tests {
     #[cfg(feature = "proving")]
     #[test]
     fn fuzz_prove_fma() {
+        const OPS: [FmaddOp; 4] = [FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd];
         let mut rng = XorShift64::new(0xB0B0_0006);
-        let cases: Vec<(u32, u32, u32)> = (0..10)
-            .map(|_| {
-                (
-                    rand_bits(&mut rng),
-                    rand_bits(&mut rng),
-                    rand_bits(&mut rng),
-                )
-            })
-            .collect();
-        let (instrs, mem) = build_ternary_chunk(&cases, &mut |rd, rs1, rs2, rs3, _| {
-            fmadd_s(rd, rs1, rs2, rs3)
-        });
-        prove_chunk(instrs, mem);
+        // Curated finite-path cases: ediff=0 cancellation, c=+-0, overflow ->
+        // inf (add overflow and rounding carry), alignment sticky loss, deep
+        // alignment, plus specials. (Op, a, b, c) — results must stay outside
+        // the deferred bucket (subnormal/zero).
+        let m = FmaddOp::Madd;
+        let s = FmaddOp::Msub;
+        let mut cases: Vec<(FmaddOp, u32, u32, u32)> = vec![
+            (m, 0x3F800000, 0x3F800000, 0xBFC00000), // 1*1 + (-1.5) = -0.5
+            (s, 0x40400000, 0x3F800000, 0xC0000000), // 3*1 - (-2) = 5
+            (m, 0x25800000, 0x25800000, 0x00000000), // tiny product + 0
+            (m, 0x25800000, 0x25800000, 0x80000000), // tiny product + (-0)
+            (m, 0x7F7FFFFF, 0x40000000, 0x00000000), // MAX * 2 = inf
+            (m, 0x7F7FFFFF, 0x3F800000, 0x7F7FFFFF), // MAX + MAX = inf
+            (m, 0x7F7FFFFF, 0x3F800000, 0x73000000), // MAX + 2^103: tie -> inf
+            (m, 0x3F801000, 0x3F801000, 0xBF800000), // (1+2^-12)^2 - 1
+            (m, 0x3F800000, 0x3F800000, 0x0C800000), // 1 + tiny (deep)
+            (s, 0x3F800000, 0x3F800000, 0x8C800000), // 1 - (-tiny) (deep)
+            (m, 0x7F800000, 0x40000000, 0x3F800000), // inf * 2 + 1 = inf
+            (m, 0x7F800000, 0x40000000, 0xFF800000), // inf * 2 + (-inf) = NaN
+            (m, 0x7FC00000, 0x3F800000, 0x3F800000), // NaN
+            (m, 0x00000000, 0x3F800000, 0x3F800000), // +0 * 1 + 1
+            (m, 0x80000000, 0x3F800000, 0x3F800000), // -0 * 1 + 1
+            (m, 0x00400000, 0x3F800000, 0x3F800000), // subnormal a
+        ];
+        // Random normal-range operands with random signs; keep only cases
+        // whose results are outside the deferred bucket (subnormal/zero).
+        while cases.len() < 40 {
+            let a = ((rng.next_u32() % 254) + 1) << 23
+                | (rng.next_u32() & 0x7FFFFF)
+                | ((rng.next_u32() & 1) << 31);
+            let b = ((rng.next_u32() % 254) + 1) << 23
+                | (rng.next_u32() & 0x7FFFFF)
+                | ((rng.next_u32() & 1) << 31);
+            let c = ((rng.next_u32() % 254) + 1) << 23
+                | (rng.next_u32() & 0x7FFFFF)
+                | ((rng.next_u32() & 1) << 31);
+            let op = OPS[rng.next_u32() as usize % 4];
+            let r = fmadd_result(a, b, c, op);
+            if (r >> 23) & 0xFF == 0 {
+                continue; // deferred: subnormal/zero results
+            }
+            cases.push((op, a, b, c));
+        }
+        // 10 rows per chunk: the register file has only 32 entries.
+        for chunk in cases.chunks(10) {
+            let triples: Vec<(u32, u32, u32)> =
+                chunk.iter().map(|&(_, a, b, c)| (a, b, c)).collect();
+            let (instrs, mem) =
+                build_ternary_chunk(&triples, &mut |rd, rs1, rs2, rs3, i| match chunk[i].0 {
+                    FmaddOp::Madd => fmadd_s(rd, rs1, rs2, rs3),
+                    FmaddOp::Msub => fmsub_s(rd, rs1, rs2, rs3),
+                    FmaddOp::Nmsub => fnmsub_s(rd, rs1, rs2, rs3),
+                    FmaddOp::Nmadd => fnmadd_s(rd, rs1, rs2, rs3),
+                });
+            prove_chunk(instrs, mem);
+        }
     }
 
     #[cfg(feature = "proving")]

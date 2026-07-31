@@ -32,7 +32,7 @@ Per-chip soundness of the **result**:
 | fadd        | ✅                   | ✅ fully sound (all finite + subnormal inputs + zero) |
 | fsub        | ✅                   | ✅ fully sound (all finite + subnormal inputs + zero) |
 | fdiv        | ✅ (pre-existing)    | ✅ fully sound (normal + overflow + subnormal/underflow) |
-| fma         | ✅ (pre-existing)    | 🔨 in progress (product+align+sumdiff+rounding; non-Madd opcodes + overflow pending) |
+| fma         | ✅ (pre-existing)    | ✅ normal results + overflow→inf fully sound (normal a/b, c normal-or-±0). Deferred: subnormal/zero results, exact-zero cancellation, zero/subnormal a/b, subnormal c |
 | fsqrt       | ✅ (pre-existing)    | ✅ fully sound (normal + subnormal inputs) |
 | fcvt_f2i    | ✅                   | ✅ in-range RTZ truncation (shift + two's-complement) |
 | fcvt_i2f    | ✅ (zero only)       | ✅ RNE rounding (normalize + round) |
@@ -198,8 +198,28 @@ all variable shifts.
    `x = |int| << 24` and `ShrnGadget<7>` (`sig = x >> (exp - 126)`), with the
    leading bit forced to position 23 and RNE rounding from the gadget's
    guard/sticky + mantissa LSB.
-5. **fma finite** — 48-bit product + 3-way alignment + single RNE rounding.
+5. ~~**fma finite**~~ — **MOSTLY DONE.** 48-bit product carry chain +
+   normalization, 3-way alignment via `ShrnGadget<7>`, sum/difference via byte
+   carry/borrow chain, left-shift normalization via `ShlnGadget<7>`, single RNE
+   rounding, output reconstruction, and overflow→±inf (`is_ovf`/`is_sub` via
+   `IsLtSubAir` on a +64-biased result exponent). Repairs on top of the original
+   Phase 3/4 work: `nw_lsb` real decomposition (was a tautology), `norm_work[6]
+   == 0` anchoring the normalization shift, `+ rc2` rounding carry in the result
+   exponent, cancellation tie-rounding (alignment loss is *subtractive*: the
+   loss indicator is `align.guard OR align.sticky` — at an exact tie the cancel
+   path rounds DOWN, and the add path must count `align.guard` as sticky too),
+   ediff=0 cancellation magnitude compare in the filler (the AIR enforces the
+   choice via the borrow chain), c=±0 phantom implicit bit, and deep+cil
+   `r_sign_eff`. Deferred (result bytes unconstrained or unprovable, documented
+   buckets): subnormal/zero results, exact-zero cancellation (`top7` goes
+   negative), zero/subnormal a or b, subnormal c. `fuzz_prove_fma` covers all 4
+   opcodes with curated edge cases + random signed inputs.
 6. **fdiv / fsqrt finite** — long division / integer isqrt (hardest; rarest).
+7. **fma deferred buckets** — subnormal results (shift the rounded mantissa
+   right instead of the implicit-bit reconstruction), exact-zero cancellation
+   (result +0 in RNE; gate `top7` on `s_norm` and add an `is_exact_zero`
+   output), zero/subnormal operands (treat like fadd/fsub's subnormal-input
+   handling via `ShlnGadget` pre-normalization).
 
 ### Concrete next step
 

@@ -197,17 +197,27 @@ pub struct FmaCoreCols<T> {
     pub nw_guard: T,
     pub nw2_lo7: T,
     pub nw_lsb: T,
+    pub nw3_hi7: T,
+    pub nw_lsb_ok: T,
     pub below_guard: T,
     pub below_guard_nz: T,
     pub below_guard_inv: T,
+    pub align_loss: T,
     pub eff_sticky: T,
     pub round_up: T,
+    pub m0: T,
+    pub m1: T,
     pub rc0: T,
     pub rc1: T,
     pub rc2: T,
     pub rc2_rem: T,
     pub r_exp_lo: T,
     pub r_exp_hi: T,
+    pub is_ovf: T,
+    pub is_sub: T,
+    pub s_norm: T,
+    pub ovf_lt_decomp: [T; 1],
+    pub sub_lt_decomp: [T; 1],
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -580,9 +590,11 @@ impl FmaCoreAir {
             .assert_eq(cols.b_sig[2], cols.b_mant2 + f128);
         builder.when(s).assert_eq(cols.c_sig[0], cols.c[0]);
         builder.when(s).assert_eq(cols.c_sig[1], cols.c[1]);
-        builder
-            .when(s)
-            .assert_eq(cols.c_sig[2], cols.c_mant2 + f128);
+        // c = +-0 has no implicit bit (its significand is 0).
+        builder.when(s).assert_eq(
+            cols.c_sig[2],
+            cols.c_mant2 + (one.clone() - cols.c_zero) * f128,
+        );
         for arr in [&cols.a_sig, &cols.b_sig, &cols.c_sig] {
             for &val in arr {
                 self.range_bus
@@ -919,11 +931,56 @@ impl FmaCoreAir {
         cols: &FmaCoreCols<AB::Var>,
     ) {
         let f2: AB::F = AB::F::from_u32(2);
+        let f64: AB::F = AB::F::from_u32(64);
         let f127: AB::F = AB::F::from_u32(127);
         let f128: AB::F = AB::F::from_u32(128);
         let f256: AB::F = AB::F::from_u32(256);
+        let f318: AB::F = AB::F::from_u32(318);
         let one = AB::Expr::ONE;
         let s = cols.s_finite;
+
+        // ── Result class: normal / overflow / subnormal ───────────────
+        // res_exp_b = res_exp + 64 ∈ [10, 447] (always positive, 9 bits).
+        // is_ovf: res_exp >= 255. is_sub: res_exp <= 0 (deferred bucket:
+        // result bytes unconstrained for subnormal/zero results).
+        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
+        let b_exp = cols.b_exp_lo + cols.b_hi * f2;
+        let c_exp = cols.c_exp_lo + cols.c_hi * f2;
+        let cil = cols.c_is_larger;
+        let prod_exp = a_exp + b_exp - AB::Expr::from(f127) + cols.is_high;
+        let larger_exp = (one.clone() - cil) * prod_exp + cil * c_exp;
+        // result_exp = larger_exp + add_overflow - cancel_lshift + rc2.
+        let res_exp =
+            larger_exp + cols.add_overflow - cols.cancel_lshift * cols.s_cancel + cols.rc2;
+        let res_exp_b = res_exp.clone() + AB::Expr::from(f64);
+        self.range_bus
+            .range_check(res_exp_b.clone(), 9)
+            .eval(builder, s.into());
+        builder.assert_bool(cols.is_ovf);
+        builder.assert_bool(cols.is_sub);
+        let lt_air = IsLtSubAir::new(self.range_bus, 9);
+        let ovf_io = IsLessThanIo::new(
+            AB::Expr::from(f318),
+            res_exp_b.clone(),
+            cols.is_ovf.into(),
+            s.into(),
+        );
+        lt_air.eval(builder, (ovf_io, &cols.ovf_lt_decomp));
+        let sub_io = IsLessThanIo::new(
+            res_exp_b,
+            AB::Expr::from(AB::F::from_u32(65)),
+            cols.is_sub.into(),
+            s.into(),
+        );
+        lt_air.eval(builder, (sub_io, &cols.sub_lt_decomp));
+        // is_ovf and is_sub are mutually exclusive.
+        builder.assert_zero(cols.is_ovf * cols.is_sub);
+        builder.when(s).assert_eq(
+            cols.s_norm,
+            (one.clone() - cols.is_ovf) * (one.clone() - cols.is_sub),
+        );
+        builder.assert_bool(cols.s_norm);
+        let sn = cols.s_norm;
 
         // ── Guard / LSB extraction ────────────────────────────────────
         // Guard = bit 7 of norm_work[2]. LSB = bit 0 of norm_work[3].
@@ -935,10 +992,17 @@ impl FmaCoreAir {
             .range_check(cols.nw2_lo7.into(), 7)
             .eval(builder, s.into());
         builder.assert_bool(cols.nw_lsb);
-        builder.when(s).assert_eq(
-            cols.norm_work[3],
-            cols.nw_lsb + (cols.norm_work[3] - cols.nw_lsb),
-        );
+        builder
+            .when(s)
+            .assert_eq(cols.norm_work[3], cols.nw_lsb + cols.nw3_hi7 * f2);
+        self.range_bus
+            .range_check(cols.nw3_hi7.into(), 7)
+            .eval(builder, s.into());
+
+        // Byte 6 of the normalized work value must be zero: together with
+        // the implicit-bit check below this anchors the normalization shift
+        // (a prover cannot over-shift and compensate via the exponent).
+        builder.when(s).assert_zero(cols.norm_work[6]);
 
         // ── Sticky: bits below guard ──────────────────────────────────
         let below = cols.nw2_lo7 + cols.norm_work[1] + cols.norm_work[0];
@@ -950,32 +1014,60 @@ impl FmaCoreAir {
             .assert_eq(cols.below_guard_nz, one.clone() - bg_is_zero);
         builder.assert_bool(cols.below_guard_nz);
 
-        // Effective sticky: below_guard_nz OR align.sticky.
-        let sticky_expr =
-            cols.below_guard_nz + cols.align.sticky - cols.below_guard_nz * cols.align.sticky;
+        // Effective sticky. The alignment-lost fraction is
+        // align.guard*0.5 + align.sticky*(<0.5) working units, so the loss
+        // indicator is align.guard OR align.sticky (witness column
+        // align_loss, kept at degree 1). On the add/deep paths the lost bits
+        // add to the magnitude: sticky = below OR align_loss (a tie with any
+        // loss rounds up). On the cancel path the lost bits are *subtracted*
+        // (true value strictly less than raw << lshift, always by less than
+        // half a ULP), so align_loss must NOT count as sticky — at an exact
+        // tie the result rounds down instead of to-even.
+        builder.when(s).assert_eq(
+            cols.align_loss,
+            cols.align.guard + cols.align.sticky - cols.align.guard * cols.align.sticky,
+        );
+        builder.assert_bool(cols.align_loss);
+        let ast_nc = cols.align_loss * (one.clone() - cols.s_cancel);
+        let sticky_expr = cols.below_guard_nz + ast_nc.clone() - cols.below_guard_nz * ast_nc;
         builder.when(s).assert_eq(cols.eff_sticky, sticky_expr);
         builder.assert_bool(cols.eff_sticky);
 
-        // round_up = guard AND (sticky OR lsb).
-        let sor = cols.eff_sticky + cols.nw_lsb - cols.eff_sticky * cols.nw_lsb;
+        // lsb_ok: the lsb tie-break applies unless this is a cancellation
+        // with subtractive loss (then a tie rounds down).
+        builder.when(s).assert_eq(
+            cols.nw_lsb_ok,
+            cols.nw_lsb * (one.clone() - cols.s_cancel * cols.align_loss),
+        );
+        builder.assert_bool(cols.nw_lsb_ok);
+
+        // round_up = guard AND (eff_sticky OR lsb_ok).
+        let sor = cols.eff_sticky + cols.nw_lsb_ok - cols.eff_sticky * cols.nw_lsb_ok;
         builder
             .when(s)
             .assert_eq(cols.round_up, cols.nw_guard * sor);
         builder.assert_bool(cols.round_up);
 
         // ── Mantissa carry chain ──────────────────────────────────────
+        // m0/m1 are the rounded mantissa low bytes (result bytes only on the
+        // normal path; overflow rows output the inf pattern instead).
         builder.assert_bool(cols.rc0);
         builder.assert_bool(cols.rc1);
         builder.assert_bool(cols.rc2);
-        builder.when(s).assert_eq(
-            cols.result[0] + cols.rc0 * f256,
-            cols.norm_work[3] + cols.round_up,
-        );
-        builder.when(s).assert_eq(
-            cols.result[1] + cols.rc1 * f256,
-            cols.norm_work[4] + cols.rc0,
-        );
-        // top7 = norm_work[5] - 128 (remove implicit bit).
+        builder
+            .when(s)
+            .assert_eq(cols.m0 + cols.rc0 * f256, cols.norm_work[3] + cols.round_up);
+        builder
+            .when(s)
+            .assert_eq(cols.m1 + cols.rc1 * f256, cols.norm_work[4] + cols.rc0);
+        self.range_bus
+            .range_check(cols.m0.into(), 8)
+            .eval(builder, s.into());
+        self.range_bus
+            .range_check(cols.m1.into(), 8)
+            .eval(builder, s.into());
+        // top7 = norm_work[5] - 128 (remove implicit bit). Not satisfiable
+        // for an exact-zero cancellation (deferred bucket, with subnormals).
         let top7 = cols.norm_work[5] - f128;
         builder
             .when(s)
@@ -984,26 +1076,32 @@ impl FmaCoreAir {
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s.into());
 
-        // ── Result exponent ───────────────────────────────────────────
-        let a_exp = cols.a_exp_lo + cols.a_hi * f2;
-        let b_exp = cols.b_exp_lo + cols.b_hi * f2;
-        let c_exp = cols.c_exp_lo + cols.c_hi * f2;
-        let cil = cols.c_is_larger;
-        let prod_exp = a_exp + b_exp - AB::Expr::from(f127) + cols.is_high;
-        let larger_exp = (one.clone() - cil) * prod_exp + cil * c_exp;
-        // result_exp = larger_exp + add_overflow - cancel_lshift * s_cancel.
-        let res_exp = larger_exp + cols.add_overflow - cols.cancel_lshift * cols.s_cancel;
+        // ── Result exponent (normal path only) ────────────────────────
         builder
-            .when(s)
+            .when(sn)
             .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, res_exp);
 
-        // ── Result bytes ──────────────────────────────────────────────
+        // ── Result bytes (normal path) ────────────────────────────────
+        builder.when(sn).assert_eq(cols.result[0], cols.m0);
+        builder.when(sn).assert_eq(cols.result[1], cols.m1);
         builder
-            .when(s)
+            .when(sn)
             .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
         builder
-            .when(s)
+            .when(sn)
             .assert_eq(cols.result[3], cols.r_exp_hi + cols.r_sign_eff * f128);
+
+        // ── Overflow: result = +-inf ──────────────────────────────────
+        let so = s * cols.is_ovf;
+        builder.when(so.clone()).assert_zero(cols.result[0]);
+        builder.when(so.clone()).assert_zero(cols.result[1]);
+        builder
+            .when(so.clone())
+            .assert_eq(cols.result[2], AB::F::from_u32(128));
+        builder.when(so).assert_eq(
+            cols.result[3],
+            AB::Expr::from(f127) + cols.r_sign_eff * f128,
+        );
     }
 }
 
@@ -1352,17 +1450,27 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FmaCoreCols<F>) {
     row.nw_guard = F::ZERO;
     row.nw2_lo7 = F::ZERO;
     row.nw_lsb = F::ZERO;
+    row.nw3_hi7 = F::ZERO;
+    row.nw_lsb_ok = F::ZERO;
     row.below_guard = F::ZERO;
     row.below_guard_nz = F::ZERO;
     row.below_guard_inv = F::ZERO;
+    row.align_loss = F::ZERO;
     row.eff_sticky = F::ZERO;
     row.round_up = F::ZERO;
+    row.m0 = F::ZERO;
+    row.m1 = F::ZERO;
     row.rc0 = F::ZERO;
     row.rc1 = F::ZERO;
     row.rc2 = F::ZERO;
     row.rc2_rem = F::ZERO;
     row.r_exp_lo = F::ZERO;
     row.r_exp_hi = F::ZERO;
+    row.is_ovf = F::ZERO;
+    row.is_sub = F::ZERO;
+    row.s_norm = F::ZERO;
+    row.ovf_lt_decomp = [F::ZERO];
+    row.sub_lt_decomp = [F::ZERO];
 }
 
 /// Fill the product + alignment + sum/diff witness for the finite path.
@@ -1439,8 +1547,9 @@ fn fill_finite_product<F: PrimeField32>(
         range_checker.add_count(norm_bytes[i], 8);
     }
 
-    // c_sig construction (for Phase 2 alignment).
-    let c_sig_val = c_mant | 0x800000;
+    // c_sig construction (for Phase 2 alignment). c = +-0 has no implicit bit.
+    let c_zero_v = c_exp == 0 && c_mant == 0;
+    let c_sig_val = if c_zero_v { 0 } else { c_mant | 0x800000 };
     let csig_bytes: [u32; 3] = [
         c_sig_val & 0xFF,
         (c_sig_val >> 8) & 0xFF,
@@ -1451,13 +1560,14 @@ fn fill_finite_product<F: PrimeField32>(
         range_checker.add_count(csig_bytes[i], 8);
     }
 
-    let _ = (a_exp, b_exp, c_exp);
-
     // ── Phase 2: Addend alignment ──────────────────────────────────
     let prod_exp_i = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
     let c_exp_i = c_exp as i32;
     let diff_i = prod_exp_i - c_exp_i;
-    let c_is_larger = diff_i < 0;
+    // At equal exponents the larger operand is decided by significand
+    // magnitude (the AIR enforces the choice via the borrow chain).
+    let c_placed = (c_sig_val as u64) << 24;
+    let c_is_larger = diff_i < 0 || (diff_i == 0 && c_placed > norm);
     let ediff = diff_i.unsigned_abs();
     let is_deep = ediff >= 56;
     let cshift = if is_deep { 55u32 } else { ediff };
@@ -1646,12 +1756,13 @@ fn fill_finite_product<F: PrimeField32>(
         }
     }
 
-    // Result sign.
-    if s_cancel && c_is_larger {
-        row.r_sign_eff = F::from_bool(c_sign_eff);
+    // Result sign: add path takes the product sign; cancellation/deep take
+    // the larger operand's sign (matches the AIR gating).
+    row.r_sign_eff = if (s_cancel || is_deep) && c_is_larger {
+        F::from_bool(c_sign_eff)
     } else {
-        row.r_sign_eff = F::from_bool(prod_sign_eff);
-    }
+        F::from_bool(prod_sign_eff)
+    };
 
     // ── Phase 4: RNE rounding + output ─────────────────────────────
     let norm_bytes: [u32; 7] = core::array::from_fn(|i| row.norm_work[i].as_canonical_u32());
@@ -1664,6 +1775,8 @@ fn fill_finite_product<F: PrimeField32>(
     row.nw2_lo7 = F::from_u32(nw2_lo7);
     range_checker.add_count(nw2_lo7, 7);
     row.nw_lsb = F::from_u32(lsb);
+    row.nw3_hi7 = F::from_u32(norm_bytes[3] >> 1);
+    range_checker.add_count(norm_bytes[3] >> 1, 7);
 
     // Sticky: bits below guard.
     let below = nw2_lo7 + norm_bytes[1] + norm_bytes[0];
@@ -1676,31 +1789,43 @@ fn fill_finite_product<F: PrimeField32>(
         F::ZERO
     };
 
-    // Effective sticky: below_guard_nz OR align.sticky.
+    // Effective sticky: on add/deep paths the alignment-lost bits (guard or
+    // sticky) count as sticky; on the cancel path they are subtractive.
+    let align_guard = row.align.guard.as_canonical_u32() != 0;
     let align_sticky = row.align.sticky.as_canonical_u32() != 0;
-    let eff_sticky = bg_nz || align_sticky;
+    let align_loss = align_guard || align_sticky;
+    row.align_loss = F::from_bool(align_loss);
+    let eff_sticky = bg_nz || (align_loss && !s_cancel);
     row.eff_sticky = F::from_bool(eff_sticky);
+    let lsb_ok = lsb == 1 && !(s_cancel && align_loss);
+    row.nw_lsb_ok = F::from_bool(lsb_ok);
 
-    // round_up = guard AND (eff_sticky OR lsb).
-    let round_up = guard == 1 && (eff_sticky || lsb == 1);
+    // round_up = guard AND (eff_sticky OR lsb_ok).
+    let round_up = guard == 1 && (eff_sticky || lsb_ok);
     row.round_up = F::from_bool(round_up);
 
     // Mantissa carry chain.
     let s0 = norm_bytes[3] + round_up as u32;
+    let m0 = s0 & 0xFF;
     let rc0 = s0 >> 8;
     let s1 = norm_bytes[4] + rc0;
+    let m1 = s1 & 0xFF;
     let rc1 = s1 >> 8;
     let top7 = norm_bytes[5].saturating_sub(128);
     let top7c = top7 + rc1;
     let rc2 = top7c >> 7;
     let rc2_rem = top7c & 0x7F;
+    row.m0 = F::from_u32(m0);
+    row.m1 = F::from_u32(m1);
+    range_checker.add_count(m0, 8);
+    range_checker.add_count(m1, 8);
     row.rc0 = F::from_u32(rc0);
     row.rc1 = F::from_u32(rc1);
     row.rc2 = F::from_u32(rc2);
     row.rc2_rem = F::from_u32(rc2_rem);
     range_checker.add_count(rc2_rem, 7);
 
-    // Result exponent.
+    // Result exponent (includes the rounding carry).
     let prod_exp_i = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
     let larger_exp_i = if c_is_larger {
         c_exp as i32
@@ -1712,31 +1837,59 @@ fn fill_finite_product<F: PrimeField32>(
             row.cancel_lshift.as_canonical_u32() as i32
         } else {
             0
-        };
-    // Result exponent (clamped for overflow/subnormal).
-    let res_exp_raw = res_exp_i;
-    let res_exp = if res_exp_raw > 254 {
-        255
-    } else if res_exp_raw < 1 {
-        0
-    } else {
-        res_exp_raw as u32
-    };
-    row.r_exp_lo = F::from_u32(res_exp & 1);
-    row.r_exp_hi = F::from_u32(res_exp >> 1);
+        }
+        + rc2 as i32;
+    let res_exp_b = res_exp_i + 64;
+    debug_assert!(
+        (0..512).contains(&res_exp_b),
+        "fma res_exp_b out of range: {res_exp_b}"
+    );
+    range_checker.add_count(res_exp_b as u32, 9);
 
-    // Sanity: allow overflow/subnormal mismatches (TODO: handle properly).
-    let r_exp_field = (result >> 23) & 0xFF;
-    if res_exp != r_exp_field
-        && r_exp_field != 255
-        && r_exp_field != 0
-        && res_exp != 255
-        && res_exp != 0
-    {
-        eprintln!(
-            "fma exp mismatch: res={} field={} prod={} c_exp={} cil={} s_cancel={}",
-            res_exp, r_exp_field, prod_exp_i, c_exp, c_is_larger, s_cancel
+    let is_ovf = res_exp_i >= 255;
+    let is_sub = res_exp_i <= 0;
+    let s_norm = !is_ovf && !is_sub;
+    let lt_air = IsLtSubAir::new(range_checker.bus(), 9);
+    lt_air.generate_subrow(
+        (range_checker.as_ref(), 318u32, res_exp_b as u32),
+        (&mut row.ovf_lt_decomp, &mut row.is_ovf),
+    );
+    lt_air.generate_subrow(
+        (range_checker.as_ref(), res_exp_b as u32, 65u32),
+        (&mut row.sub_lt_decomp, &mut row.is_sub),
+    );
+    debug_assert_eq!(row.is_ovf, F::from_bool(is_ovf));
+    debug_assert_eq!(row.is_sub, F::from_bool(is_sub));
+    row.s_norm = F::from_bool(s_norm);
+
+    if s_norm {
+        row.r_exp_lo = F::from_u32((res_exp_i as u32) & 1);
+        row.r_exp_hi = F::from_u32((res_exp_i as u32) >> 1);
+        // Sanity against the native result.
+        debug_assert_eq!(
+            (result >> 23) & 0xFF,
+            res_exp_i as u32,
+            "fma exponent mismatch: a*b+c result {result:08x}"
         );
+        debug_assert_eq!(result & 0xFF, m0, "fma mantissa byte 0 mismatch");
+        debug_assert_eq!((result >> 8) & 0xFF, m1, "fma mantissa byte 1 mismatch");
+        debug_assert_eq!(
+            (result >> 16) & 0x7F,
+            rc2_rem,
+            "fma mantissa byte 2 mismatch"
+        );
+    } else if is_ovf {
+        debug_assert_eq!(
+            result & 0x7FFF_FFFF,
+            0x7F80_0000,
+            "fma overflow result not inf: {result:08x}"
+        );
+        row.r_exp_lo = F::ZERO;
+        row.r_exp_hi = F::ZERO;
+    } else {
+        // Subnormal/zero results: deferred (result bytes unconstrained).
+        row.r_exp_lo = F::ZERO;
+        row.r_exp_hi = F::ZERO;
     }
 
     let _ = (a_exp, b_exp, c_exp);
@@ -1820,16 +1973,23 @@ mod product_tests {
 
     type F = BabyBear;
 
-    fn run(a: u32, b: u32, c: u32) -> NumericBuilder<F> {
-        run_op(a, b, c, FmaddOp::Madd)
+    fn run_op(a: u32, b: u32, c: u32, op: FmaddOp) -> NumericBuilder<F> {
+        eval_row(&build_row(a, b, c, op))
     }
 
-    fn run_op(a: u32, b: u32, c: u32, op: FmaddOp) -> NumericBuilder<F> {
+    fn eval_row(row: &FmaCoreCols<F>) -> NumericBuilder<F> {
+        let air = FmaCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
+        let mut builder = NumericBuilder::new(vec![]);
+        air.eval_finite_product(&mut builder, row);
+        builder
+    }
+
+    pub(crate) fn build_row(a: u32, b: u32, c: u32, op: FmaddOp) -> FmaCoreCols<F> {
         let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
             0, 16,
         )));
         let mut row = FmaCoreCols::<F>::default();
-        let result = fmadd_result(a, b, c, FmaddOp::Madd);
+        let result = fmadd_result(a, b, c, op);
 
         let (a_sign, a_exp, a_mant) = decompose(a);
         let (b_sign, b_exp, b_mant) = decompose(b);
@@ -1908,10 +2068,24 @@ mod product_tests {
             );
         }
 
-        let air = FmaCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
-        let mut builder = NumericBuilder::new(vec![]);
-        air.eval_finite_product(&mut builder, &row);
-        builder
+        row
+    }
+
+    const OPS: [FmaddOp; 4] = [FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd];
+
+    /// True iff the result is in the deferred bucket (subnormal or zero).
+    fn deferred(a: u32, b: u32, c: u32, op: FmaddOp) -> bool {
+        let r = fmadd_result(a, b, c, op);
+        (r >> 23) & 0xFF == 0
+    }
+
+    fn assert_ok(a: u32, b: u32, c: u32, op: FmaddOp) {
+        let builder = run_op(a, b, c, op);
+        assert!(
+            builder.ok(),
+            "fma {op:?} failed: {:?}\n a={a:08x} b={b:08x} c={c:08x}",
+            builder.failures
+        );
     }
 
     #[test]
@@ -1926,35 +2100,34 @@ mod product_tests {
                 1.0f32.to_bits(),
             ),
             (0x3F800000u32, 0x3F800000, 0x3F800000), // 1*1+1
-            (0x7224d4c8u32, 0xe7aeaf61, 0x58d80a7f), // overflow case (TODO: inf result)
+            // ediff=0 cancellation, c significand larger than product.
+            (0x3F800000, 0x3F800000, 0xBFC00000), // 1*1 + (-1.5) = -0.5
+            // ediff=0 cancellation, product larger.
+            (0x40400000, 0x3F800000, 0xC0000000), // 3*1 + (-2) = 1
+            // c = +-0 with a small product exponent (phantom implicit bit).
+            (0x25800000, 0x25800000, 0x00000000), // 2^-52 * 2^-52 + 0
+            (0x25800000, 0x25800000, 0x80000000), // ... + (-0)
+            // Overflow -> inf.
+            (0x7F7FFFFF, 0x40000000, 0x00000000), // MAX * 2 + 0
+            (0x7F7FFFFF, 0x3F800000, 0x7F7FFFFF), // MAX * 1 + MAX (add overflow)
+            (0x7F7FFFFF, 0x3F800000, 0x73000000), // MAX + 2^103: tie -> rc2 carry
+            // Cancellation with alignment sticky loss (fused single rounding).
+            (0x3F801000, 0x3F801000, 0xBF800000), // (1+2^-12)^2 - 1
+            // Deep alignment (ediff >= 56): result is the larger operand.
+            (0x3F800000, 0x3F800000, 0x0C800000), // 1 + tiny
+            (0x3F800000, 0x3F800000, 0x8C800000), // 1 - tiny
+            (0x0C800000, 0x0C800000, 0x3F800000), // tiny + 1
+            (0x0C800000, 0x0C800000, 0xBF800000), // tiny - 1
         ] {
-            // Skip overflow/subnormal results for now.
-            let r = fmadd_result(a, b, c, FmaddOp::Madd);
-            let r_exp = (r >> 23) & 0xFF;
-            if r_exp == 255 || r_exp == 0 {
-                continue;
+            for &op in &OPS {
+                if deferred(a, b, c, op) {
+                    continue;
+                }
+                assert_ok(a, b, c, op);
             }
-            let builder = run(a, b, c);
-            assert!(
-                builder.ok(),
-                "fma product failed: {:?}\n a={:08x} b={:08x} c={:08x}",
-                builder.failures,
-                a,
-                b,
-                c
-            );
         }
-        // Test all opcodes with prove test case 3.
-        for &op in &[FmaddOp::Madd, FmaddOp::Msub, FmaddOp::Nmsub, FmaddOp::Nmadd] {
-            let builder = run_op(0x3922dfc8, 0x34f06877, 0xbb437567, op);
-            assert!(
-                builder.ok(),
-                "fma op {:?} failed: {:?}",
-                op,
-                builder.failures
-            );
-        }
-        // Fuzz.
+        // Fuzz with random signs and opcodes (overflow -> inf is handled;
+        // only subnormal/zero results are deferred).
         let mut rng = 0xF00D_BEEFu64;
         let mut next = || {
             rng ^= rng << 13;
@@ -1962,19 +2135,124 @@ mod product_tests {
             rng ^= rng << 17;
             rng as u32
         };
-        for _ in 0..500 {
-            let a = ((next() % 254) + 1) << 23 | (next() & 0x7FFFFF);
-            let b = ((next() % 254) + 1) << 23 | (next() & 0x7FFFFF);
-            let c = ((next() % 254) + 1) << 23 | (next() & 0x7FFFFF);
-            let builder = run(a, b, c);
-            assert!(
-                builder.ok(),
-                "fma product fuzz failed: {:?}\n a={:08x} b={:08x} c={:08x}",
-                builder.failures,
-                a,
-                b,
-                c
-            );
+        for i in 0..2000 {
+            let a = ((next() % 254) + 1) << 23 | (next() & 0x7FFFFF) | ((next() & 1) << 31);
+            let b = ((next() % 254) + 1) << 23 | (next() & 0x7FFFFF) | ((next() & 1) << 31);
+            let c = ((next() % 254) + 1) << 23 | (next() & 0x7FFFFF) | ((next() & 1) << 31);
+            let op = OPS[(i + next() as usize) % 4];
+            if deferred(a, b, c, op) {
+                continue;
+            }
+            assert_ok(a, b, c, op);
         }
+    }
+
+    /// Construct a cancellation tie: product aligned right by 1 with a lost
+    /// half-ULP (sticky), landing exactly on a rounding tie. RNE must round
+    /// DOWN (the lost bits are subtractive), not to-even.
+    #[test]
+    fn cancel_tie_rounds_down() {
+        let mut rng = 0xCA4C_E15Eu64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u32
+        };
+        let mut found = 0;
+        for _ in 0..100_000 {
+            let a_sig = 0x800000 | (next() & 0x7FFFFF);
+            let b_sig = 0x800000 | (next() & 0x7FFFFF);
+            let prod = (a_sig as u64) * (b_sig as u64);
+            let is_high = (prod >> 47) & 1 == 1;
+            let norm = if is_high { prod } else { prod << 1 };
+            let low24 = norm & 0xFF_FFFF;
+            let m = norm >> 24;
+            // Want norm - Y = M*2^24 + 2^23 (exact tie, M odd) with
+            // Y = c_sig >> 1 in [2^22, 2^23) and c_sig odd (sticky loss).
+            if !(0xC0_0000..0x100_0000).contains(&low24) || m % 2 == 0 {
+                continue;
+            }
+            let y = low24 - 0x80_0000;
+            let c_sig = 2 * y + 1;
+            debug_assert!((0x80_0000..0x100_0000).contains(&c_sig));
+            // Exponents: prod_exp - c_exp = 25, c_exp in [1, 254].
+            let a_exp = 1 + (next() % 100);
+            let b_exp = 1 + (next() % 100);
+            let prod_exp = a_exp as i32 + b_exp as i32 - 127 + is_high as i32;
+            let c_exp = prod_exp - 25;
+            if !(1..=254).contains(&c_exp) {
+                continue;
+            }
+            let a = (a_exp << 23) | (a_sig & 0x7FFFFF);
+            let b = (b_exp << 23) | (b_sig & 0x7FFFFF);
+            let c = 0x8000_0000 | ((c_exp as u32) << 23) | ((c_sig as u32) & 0x7FFFFF);
+            let r = fmadd_result(a, b, c, FmaddOp::Madd);
+            if (r >> 23) & 0xFF == 0 {
+                continue;
+            }
+            // The tie must round down: result mantissa == M, not M + 1.
+            assert_eq!(
+                r & 0x7F_FFFF,
+                (m as u32) & 0x7F_FFFF,
+                "expected tie to round down: a={a:08x} b={b:08x} c={c:08x} r={r:08x}"
+            );
+            assert_ok(a, b, c, FmaddOp::Madd);
+            found += 1;
+            if found >= 3 {
+                break;
+            }
+        }
+        assert!(found >= 3, "failed to construct tie cases");
+    }
+
+    #[test]
+    fn negative_tests() {
+        // Corrupting the result must fail.
+        let mut row = build_row(
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            1.0f32.to_bits(),
+            FmaddOp::Madd,
+        );
+        assert!(eval_row(&row).ok());
+        row.result[0] += F::ONE;
+        assert!(!eval_row(&row).ok(), "corrupted result accepted");
+
+        // Flipping nw_lsb must fail (it feeds the RNE tie-break).
+        let mut row = build_row(0x3F000001, 0x3F800000, 0x3E800000, FmaddOp::Madd);
+        assert!(eval_row(&row).ok());
+        row.nw_lsb = F::ONE - row.nw_lsb;
+        assert!(!eval_row(&row).ok(), "flipped nw_lsb accepted");
+
+        // Flipping round_up must fail.
+        let mut row = build_row(
+            1.5f32.to_bits(),
+            2.5f32.to_bits(),
+            0.5f32.to_bits(),
+            FmaddOp::Madd,
+        );
+        row.round_up = F::ONE - row.round_up;
+        assert!(!eval_row(&row).ok(), "flipped round_up accepted");
+
+        // norm_work[6] != 0 must fail (anchors the normalization shift).
+        let mut row = build_row(
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            1.0f32.to_bits(),
+            FmaddOp::Madd,
+        );
+        row.norm_work[6] = F::ONE;
+        assert!(!eval_row(&row).ok(), "norm_work[6]=1 accepted");
+
+        // Claiming a normal result is overflow must fail.
+        let mut row = build_row(
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            1.0f32.to_bits(),
+            FmaddOp::Madd,
+        );
+        row.is_ovf = F::ONE;
+        assert!(!eval_row(&row).ok(), "fraudulent is_ovf accepted");
     }
 }
