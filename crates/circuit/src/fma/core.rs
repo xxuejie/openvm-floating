@@ -353,6 +353,20 @@ where
         builder.assert_eq(cols.b[3], cols.b_hi + cols.b_sign * f128);
         builder.assert_eq(cols.c[2], cols.c_mant2 + cols.c_exp_lo * f128);
         builder.assert_eq(cols.c[3], cols.c_hi + cols.c_sign * f128);
+        // Pin the decomposition: the 7-bit pieces must be range-checked, or
+        // exp_lo / sign are free field choices (classification re-routing).
+        for v in [
+            cols.a_mant2,
+            cols.b_mant2,
+            cols.c_mant2,
+            cols.a_hi,
+            cols.b_hi,
+            cols.c_hi,
+        ] {
+            self.range_bus
+                .range_check(v.into(), 7)
+                .eval(builder, cols.is_valid.into());
+        }
 
         // Range check all input bytes (bounds exponent/mantissa sums).
         for i in 0..4 {
@@ -1533,6 +1547,8 @@ where
             *exp_lo = F::from_u32(exp & 1);
             *mant2 = F::from_u32((mant >> 16) & 0x7F);
             *hi = F::from_u32(exp >> 1);
+            self.range_checker.add_count((mant >> 16) & 0x7F, 7);
+            self.range_checker.add_count(exp >> 1, 7);
             let exp_f = F::from_u32(exp);
             *exp_is_zero = F::from_bool(exp == 0);
             *exp_is_max = F::from_bool(exp == 255);
