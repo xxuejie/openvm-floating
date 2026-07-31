@@ -115,8 +115,6 @@ pub struct FdivCoreCols<T> {
     pub rc2_rem: T,
     pub r_exp_lo: T,
     pub r_exp_hi: T,
-    pub r_exp_hi_zero_inv: T,
-    pub r_exp_hi_max_inv: T,
     pub result_exp: T,
     pub a_normal: T,
     pub b_normal: T, // both-normal indicators (degree 1)
@@ -124,13 +122,15 @@ pub struct FdivCoreCols<T> {
     pub s_normal: T,
     pub s_overflow: T,
     pub s_subnormal: T,
-    pub sub_efz: T,
+    pub route_ovf_decomp: [T; 1],
+    pub route_sub_decomp: [T; 1],
     pub sub_capped: T,
     pub sub_lt_decomp: [T; 1],
     pub sub_shift: T,
     pub sub_shrn: ShrnCols<T, 7>,
     pub sub_y0_high7: T,
     pub sub_lsb: T,
+    pub sub_sticky_eff: T,
     pub sub_round_up: T,
     pub sub_rc0: T,
     pub sub_rc1: T,
@@ -315,10 +315,12 @@ where
                 * (cols.a_inf * (one.clone() - cols.b_inf)
                     + cols.b_zero * (one.clone() - cols.a_inf - cols.a_zero)),
         );
-        // +-0 result: finite / inf.
+        // +-0 result: finite / inf, or +-0 / finite-nonzero.
         builder.assert_eq(
             cols.zero_res,
-            cols.b_inf * (one.clone() - cols.a_inf) * (one.clone() - cols.any_nan),
+            (one.clone() - cols.any_nan)
+                * (cols.b_inf * (one.clone() - cols.a_inf)
+                    + cols.a_zero * (one.clone() - cols.b_zero) * (one.clone() - cols.b_inf)),
         );
         builder.assert_eq(
             cols.is_special,
@@ -391,7 +393,6 @@ impl FdivCoreAir {
         let f2: AB::F = AB::F::from_u32(2);
         let f4: AB::F = AB::F::from_u32(4);
         let f64: AB::F = AB::F::from_u32(64);
-        let f127: AB::F = AB::F::from_u32(127);
         let f128: AB::F = AB::F::from_u32(128);
         let f256: AB::F = AB::F::from_u32(256);
         let one = AB::Expr::ONE;
@@ -654,11 +655,12 @@ impl FdivCoreAir {
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s.into());
 
-        // Result exponent: a_exp - b_exp + 126 + is_high + rc2. Only for normal results.
-        let result_exp_expr = a_exp.clone() - b_exp.clone()
-            + AB::Expr::from(AB::F::from_u32(126))
-            + cols.is_high
-            + cols.rc2;
+        // Result exponent: a_exp - b_exp + 126 + is_high + rc2. The
+        // pre-rounding exponent base_exp (without rc2) routes the result class
+        // via less-than gadgets, so the class can never be prover-chosen.
+        let base_exp =
+            a_exp.clone() - b_exp.clone() + AB::Expr::from(AB::F::from_u32(126)) + cols.is_high;
+        let result_exp_expr = base_exp.clone() + cols.rc2;
         builder
             .when(cols.s_normal)
             .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
@@ -671,21 +673,36 @@ impl FdivCoreAir {
             .when(cols.s_normal)
             .assert_eq(cols.result[3], cols.r_exp_hi + cols.r_sign * f128);
 
-        // s_normal / s_overflow selectors.
-        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
-        builder.when(s).assert_zero(cols.r_exp_hi * he0.clone());
-        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
-        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
-        builder.when(s).assert_zero(delta127 * he127.clone());
-        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
-        let exp_field_max = cols.r_exp_lo * he127;
+        // ── Result-class routing (sound, via base_exp) ───────────────────
+        // base_exp in [-127, 380]; base_exp_b = base_exp + 256 fits 10 bits.
+        // s_overflow: base_exp + rc2 >= 255  <=>  510 < base_exp_b + rc2.
+        // s_subnormal: base_exp <= 0  <=>  base_exp_b < 257.
+        let base_exp_b = base_exp + AB::Expr::from(f256);
+        self.range_bus
+            .range_check(base_exp_b.clone(), 10)
+            .eval(builder, s.into());
+        let lt10 = IsLtSubAir::new(self.range_bus, 10);
+        let ovf_io = IsLessThanIo::new(
+            AB::Expr::from(AB::F::from_u32(510)),
+            base_exp_b.clone() + cols.rc2,
+            cols.s_overflow.into(),
+            s.into(),
+        );
+        lt10.eval(builder, (ovf_io, &cols.route_ovf_decomp));
+        let sub_io = IsLessThanIo::new(
+            base_exp_b,
+            AB::Expr::from(AB::F::from_u32(257)),
+            cols.s_subnormal.into(),
+            s.into(),
+        );
+        lt10.eval(builder, (sub_io, &cols.route_sub_decomp));
+        builder.assert_bool(cols.s_overflow);
+        builder.assert_bool(cols.s_subnormal);
         builder.assert_eq(
             cols.s_normal,
-            s * (one.clone() - exp_field_zero.clone() - exp_field_max.clone()),
+            s * (one.clone() - cols.s_overflow) * (one.clone() - cols.s_subnormal),
         );
-        builder.assert_eq(cols.s_overflow, s * exp_field_max.clone());
         builder.assert_bool(cols.s_normal);
-        builder.assert_bool(cols.s_overflow);
 
         // Normal result: tie result bytes (redundant with above for s_normal ⊆ s).
         builder
@@ -697,6 +714,10 @@ impl FdivCoreAir {
         builder
             .when(cols.s_overflow)
             .assert_eq(cols.result[2], f128);
+        builder.when(cols.s_overflow).assert_eq(
+            cols.result[3],
+            AB::Expr::from(AB::F::from_u32(127)) + cols.r_sign * f128,
+        );
     }
 
     /// Constrain the subnormal / underflow result (result exponent field == 0).
@@ -721,17 +742,7 @@ impl FdivCoreAir {
         let a_exp = cols.a_exp_lo + cols.a_hi * f2;
         let b_exp = cols.b_exp_lo + cols.b_hi * f2;
 
-        // s_subnormal = s_finite AND exp_field_zero.
-        let s_finite = cols.s_finite;
-        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
-        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
-        builder
-            .when(cols.is_valid)
-            .assert_eq(cols.sub_efz, exp_field_zero);
-        builder
-            .when(cols.is_valid)
-            .assert_eq(cols.s_subnormal, s_finite * cols.sub_efz);
-        builder.assert_bool(cols.s_subnormal);
+        // s_subnormal is routed soundly in eval_finite_div (base_exp <= 0).
         let s = cols.s_subnormal;
 
         // Shift = b_exp - a_exp - 124 (always >= 3 on subnormal rows).
@@ -778,7 +789,8 @@ impl FdivCoreAir {
             builder.when(s).assert_zero(cols.sub_shrn.y[i]);
         }
 
-        // RNE rounding.
+        // RNE rounding. The sticky must include the division remainder: any
+        // nonzero r means there are magnitude bits below the LSB of q.
         builder
             .when(s)
             .assert_eq(cols.sub_shrn.y[0], cols.sub_y0_high7 * f2 + cols.sub_lsb);
@@ -788,8 +800,12 @@ impl FdivCoreAir {
             .eval(builder, s.into());
         builder.assert_bool(cols.sub_shrn.guard);
         builder.assert_bool(cols.sub_shrn.sticky);
-        let sticky_or_lsb =
-            cols.sub_shrn.sticky + cols.sub_lsb - cols.sub_shrn.sticky * cols.sub_lsb;
+        builder.when(s).assert_eq(
+            cols.sub_sticky_eff,
+            cols.sub_shrn.sticky + cols.r_nz - cols.sub_shrn.sticky * cols.r_nz,
+        );
+        builder.assert_bool(cols.sub_sticky_eff);
+        let sticky_or_lsb = cols.sub_sticky_eff + cols.sub_lsb - cols.sub_sticky_eff * cols.sub_lsb;
         builder
             .when(s)
             .assert_eq(cols.sub_round_up, cols.sub_shrn.guard * sticky_or_lsb);
@@ -996,7 +1012,7 @@ where
         let any_nan = a_nan || b_nan;
         let canon_sel = any_nan || (a_inf && b_inf) || (a_zero && b_zero);
         let inf_res = !any_nan && ((a_inf && !b_inf) || (b_zero && !a_inf && !a_zero));
-        let zero_res = b_inf && !a_inf && !any_nan;
+        let zero_res = !any_nan && ((b_inf && !a_inf) || (a_zero && !b_zero && !b_inf));
 
         core_row.a_nan = F::from_bool(a_nan);
         core_row.b_nan = F::from_bool(b_nan);
@@ -1019,26 +1035,11 @@ where
         core_row.a_normal = F::from_bool(a_normal);
         core_row.b_normal = F::from_bool(b_normal);
 
-        // Set r_exp_lo/r_exp_hi from the result for ALL rows so that
-        // eval_finite_subnormal's sub_efz constraint holds universally.
-        // (fill_finite_div will override with identical values for finite rows.)
+        // Set r_exp_lo/r_exp_hi from the result for ALL rows (fill_finite_div
+        // will override with identical values for finite rows).
         let r_exp_field = (result >> 23) & 0xFF;
-        let r_exp_hi_val = r_exp_field >> 1;
         core_row.r_exp_lo = F::from_u32(r_exp_field & 1);
-        core_row.r_exp_hi = F::from_u32(r_exp_hi_val);
-        core_row.r_exp_hi_zero_inv = if r_exp_hi_val != 0 {
-            F::from_u32(r_exp_hi_val).try_inverse().unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        core_row.r_exp_hi_max_inv = if r_exp_hi_val != 127 {
-            (F::from_u32(127) - F::from_u32(r_exp_hi_val))
-                .try_inverse()
-                .unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        core_row.sub_efz = F::from_bool(r_exp_field == 0);
+        core_row.r_exp_hi = F::from_u32(r_exp_field >> 1);
 
         if s_finite {
             fill_finite_div(
@@ -1104,12 +1105,15 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FdivCoreCols<F>) {
     row.s_normal = F::ZERO;
     row.s_overflow = F::ZERO;
     row.s_subnormal = F::ZERO;
+    row.route_ovf_decomp = [F::ZERO];
+    row.route_sub_decomp = [F::ZERO];
     row.sub_capped = F::ZERO;
     row.sub_lt_decomp = [F::ZERO];
     row.sub_shift = F::ZERO;
     row.sub_shrn = ShrnCols::<F, 7>::default();
     row.sub_y0_high7 = F::ZERO;
     row.sub_lsb = F::ZERO;
+    row.sub_sticky_eff = F::ZERO;
     row.sub_round_up = F::ZERO;
     row.sub_rc0 = F::ZERO;
     row.sub_rc1 = F::ZERO;
@@ -1291,7 +1295,8 @@ fn fill_finite_div<F: PrimeField32>(
     // Result exponent: for normal results, a_exp - b_exp + 126 + is_high + rc2.
     // For overflow (native result is inf), use the native exp field (255).
     // For subnormal/underflow (native result exp field == 0), use 0.
-    let computed_exp = (a_exp as i64) - (b_exp as i64) + 126 + is_high as i64 + rc2 as i64;
+    let base_exp = (a_exp as i64) - (b_exp as i64) + 126 + is_high as i64;
+    let computed_exp = base_exp + rc2 as i64;
     let r_exp_field = (result >> 23) & 0xFF;
     let r_exp = if r_exp_field == 255 {
         255
@@ -1304,26 +1309,28 @@ fn fill_finite_div<F: PrimeField32>(
     let r_exp_hi = r_exp >> 1;
     row.r_exp_lo = F::from_u32(r_exp_lo);
     row.r_exp_hi = F::from_u32(r_exp_hi);
-    row.r_exp_hi_zero_inv = if r_exp_hi != 0 {
-        F::from_u32(r_exp_hi).try_inverse().unwrap_or(F::ZERO)
-    } else {
-        F::ZERO
-    };
-    row.r_exp_hi_max_inv = if r_exp_hi != 127 {
-        (F::from_u32(127) - F::from_u32(r_exp_hi))
-            .try_inverse()
-            .unwrap_or(F::ZERO)
-    } else {
-        F::ZERO
-    };
     row.result_exp = F::from_u32(r_exp);
 
-    // Selectors.
-    row.s_normal = F::from_bool((1..=254).contains(&r_exp_field));
-    row.s_overflow = F::from_bool(r_exp_field == 255);
-    let s_subnormal = r_exp_field == 0;
-    row.sub_efz = F::from_bool(r_exp_field == 0);
+    // Result-class routing (sound, via base_exp + rc2 / base_exp).
+    let is_overflow = base_exp + rc2 as i64 >= 255;
+    let s_subnormal = base_exp <= 0;
+    row.s_normal = F::from_bool(!is_overflow && !s_subnormal);
+    row.s_overflow = F::from_bool(is_overflow);
     row.s_subnormal = F::from_bool(s_subnormal);
+    let base_exp_b = (base_exp + 256) as u32;
+    debug_assert!(base_exp_b < 1024, "fdiv base_exp_b out of range");
+    range_checker.add_count(base_exp_b, 10);
+    let lt10 = IsLtSubAir::new(range_checker.bus(), 10);
+    lt10.generate_subrow(
+        (range_checker.as_ref(), 510u32, base_exp_b + rc2 as u32),
+        (&mut row.route_ovf_decomp, &mut row.s_overflow),
+    );
+    lt10.generate_subrow(
+        (range_checker.as_ref(), base_exp_b, 257u32),
+        (&mut row.route_sub_decomp, &mut row.s_subnormal),
+    );
+    debug_assert_eq!(row.s_overflow, F::from_bool(is_overflow));
+    debug_assert_eq!(row.s_subnormal, F::from_bool(s_subnormal));
 
     // Sanity: computed exponent must match native result for normal results.
     debug_assert!(
@@ -1369,7 +1376,8 @@ fn fill_finite_div<F: PrimeField32>(
         range_checker.add_count(y0 >> 1, 7);
 
         let guard = row.sub_shrn.guard.as_canonical_u32();
-        let sticky = row.sub_shrn.sticky.as_canonical_u32() != 0;
+        let sticky = row.sub_shrn.sticky.as_canonical_u32() != 0 || r_val != 0;
+        row.sub_sticky_eff = F::from_bool(sticky);
         let round_up = guard == 1 && (sticky || (y0 & 1) == 1);
         row.sub_round_up = F::from_bool(round_up);
 

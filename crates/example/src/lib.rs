@@ -1630,7 +1630,7 @@ mod fuzz_tests {
     #[test]
     fn fuzz_prove_fdiv() {
         // Deterministic set exercising normal / overflow / NaN / inf / zero
-        // paths. Subnormal-result cases deferred.
+        // paths, including +-0 / finite and subnormal results.
         let cases: Vec<(u32, u32)> = vec![
             (3.0f32.to_bits(), 2.0f32.to_bits()), // 1.5
             (7.0f32.to_bits(), 3.0f32.to_bits()), // 2.333...
@@ -1647,9 +1647,17 @@ mod fuzz_tests {
             (0x42C80000, 0x41A00000),                    // 100/20 = 5
             ((-1.0f32).to_bits(), 1.0f32.to_bits()),     // -1/1 = -1
             (0.0f32.to_bits(), 0.0f32.to_bits()),        // 0/0 = NaN
+            (0.0f32.to_bits(), 3.0f32.to_bits()),        // +0 / 3 = +0
+            (0x80000000, (-3.0f32).to_bits()),           // -0 / -3 = +0
+            (0x00800000, 0x7F7FFFFF),                    // MIN_NORMAL / MAX -> subnormal result
+            (0x3F800000, 0x7F000000),                    // 1 / huge -> subnormal result
         ];
-        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fdiv_s(rd, rs1, rs2));
-        prove_chunk(instrs, mem);
+        // 15 rows per chunk: the register file has only 32 entries.
+        for chunk in cases.chunks(15) {
+            let (instrs, mem) =
+                build_binary_chunk(chunk, &mut |rd, rs1, rs2, _| fdiv_s(rd, rs1, rs2));
+            prove_chunk(instrs, mem);
+        }
     }
 
     #[cfg(feature = "proving")]
