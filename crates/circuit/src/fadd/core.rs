@@ -586,7 +586,10 @@ impl FaddCoreAir {
         builder.assert_eq(cols.align_enable, cols.s_add * (one.clone() - cols.is_deep));
         builder.assert_bool(cols.align_enable);
         let s_shallow = cols.align_enable;
-        let s_deep = cols.s_add * cols.is_deep;
+        // Deep path (ediff >= 25): result = larger operand for any effective
+        // operation — the smaller operand is strictly below half a ULP, so
+        // both addition and cancellation round to the larger operand exactly.
+        let s_deep = cols.s_bn * cols.is_deep;
 
         // ── Alignment via ShrnGadget (shallow path) ─────────────────────
         // x = small_sig << 8 = [0, small_sig[0], small_sig[1], small_sig[2]].
@@ -602,6 +605,7 @@ impl FaddCoreAir {
             .assert_eq(cols.align.x[3], cols.small_sig[2]);
         let shrn = ShrnGadget::new(self.range_bus);
         shrn.eval_shrn(builder, &cols.align);
+        builder.assert_eq(cols.align.enable, cols.align_enable);
         builder
             .when(cols.align_enable)
             .assert_eq(cols.align.shift, cols.ediff);
@@ -620,6 +624,7 @@ impl FaddCoreAir {
             + notsel.clone() * (cols.b_mant2 + cols.b_exp_lo * f128);
         let large_b3 = sel.clone() * (cols.a_exp_hi + cols.a_sign * f128)
             + notsel.clone() * (cols.b_exp_hi + cols.b_sign * f128);
+        let large_sign = sel.clone() * cols.a_sign + notsel.clone() * cols.b_sign;
         builder
             .when(s_deep.clone())
             .assert_eq(cols.result[0], large_b0.clone());
@@ -634,7 +639,7 @@ impl FaddCoreAir {
             .assert_eq(cols.result[3], large_b3.clone());
         builder
             .when(s_deep.clone())
-            .assert_eq(cols.result_sign, cols.a_sign);
+            .assert_eq(cols.result_sign, large_sign);
         builder
             .when(s_deep.clone())
             .assert_eq(cols.result_exp, large_exp.clone());

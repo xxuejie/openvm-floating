@@ -1759,8 +1759,16 @@ mod fuzz_tests {
         }
         // Heavy cancellation (close magnitudes, large left shift).
         cases.push((0x3f800000, 0xbf800001)); // 1.0 + (-(1.0+tiny))
-        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, _| fadd_s(rd, rs1, rs2));
-        prove_chunk(instrs, mem);
+                                              // Deep opposite-sign (ediff >= 25): result is the larger operand.
+        cases.push((0x74800000, 0x84800000)); // 2^100 + (-2^-5ish... tiny)
+        cases.push((0x3F800000, 0x80800000)); // 1.0 + (-min_normal)
+        cases.push((0x00800000, 0xBF800000)); // min_normal + (-1.0)
+                                              // 15 rows per chunk: the register file has only 32 entries.
+        for chunk in cases.chunks(15) {
+            let (instrs, mem) =
+                build_binary_chunk(chunk, &mut |rd, rs1, rs2, _| fadd_s(rd, rs1, rs2));
+            prove_chunk(instrs, mem);
+        }
     }
 
     #[cfg(feature = "proving")]
