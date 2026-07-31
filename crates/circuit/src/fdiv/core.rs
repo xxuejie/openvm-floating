@@ -21,7 +21,9 @@ use openvm_stark_backend::{
     BaseAirWithPublicValues,
 };
 
-use crate::fp_shift::{run_shrn, run_shrn_round, ShrnCols, ShrnGadget};
+use crate::fp_shift::{
+    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+};
 
 /// IEEE 754 / RISC-V FDIV.S: correctly-rounded (RNE) division.
 /// Per the RISC-V spec, the canonical NaN is returned when any input is NaN,
@@ -88,8 +90,16 @@ pub struct FdivCoreCols<T> {
     pub r_sign: T, // a_sign ^ b_sign
 
     // === Finite division (long-division verification) ===
-    pub a_sig: [T; 3],     // a significand (mant | implicit)
-    pub b_sig: [T; 3],     // b significand (divisor)
+    pub a_sig: [T; 3], // a significand (mant | implicit)
+    pub b_sig: [T; 3], // b significand (divisor)
+    pub a_sub: T,      // a is subnormal (exp 0, mantissa nonzero)
+    pub b_sub: T,      // b is subnormal
+    pub a_lshift: T,   // leading-zeros normalization shift for a
+    pub b_lshift: T,   // ... and b
+    pub a_shln: ShlnCols<T, 3>,
+    pub b_shln: ShlnCols<T, 3>,
+    pub a_y2_lo7: T,
+    pub b_y2_lo7: T,
     pub a_sig_hi: [T; 3],  // bit 7 of each a_sig byte (for a_sig << 25 target)
     pub q: [T; 4],         // quotient bytes (a_sig*2^25 / b_sig)
     pub r: [T; 3],         // remainder bytes (< b_sig)
@@ -400,8 +410,8 @@ impl FdivCoreAir {
         let a_exp = cols.a_exp_lo + cols.a_hi * f2;
         let b_exp = cols.b_exp_lo + cols.b_hi * f2;
 
-        // ── Sound selector: finite AND both normal AND a nonzero ──────────
-        // (subnormal inputs deferred; b=0 is special-cased above).
+        // ── Sound selector: finite AND both operands nonzero finite ─────
+        // (subnormal operands are pre-normalized below; b=0 is special-cased).
         let not_special = one.clone() - cols.is_special;
         let a_normal_expr = (one.clone() - cols.a_exp_is_zero) * (one.clone() - cols.a_exp_is_max);
         let b_normal_expr = (one.clone() - cols.b_exp_is_zero) * (one.clone() - cols.b_exp_is_max);
@@ -411,24 +421,94 @@ impl FdivCoreAir {
         builder
             .when(cols.is_valid)
             .assert_eq(cols.b_normal, b_normal_expr);
+        // Subnormal: exponent field 0 with nonzero mantissa.
+        builder.assert_eq(
+            cols.a_sub,
+            cols.a_exp_is_zero * (one.clone() - cols.a_mant_is_zero),
+        );
+        builder.assert_eq(
+            cols.b_sub,
+            cols.b_exp_is_zero * (one.clone() - cols.b_mant_is_zero),
+        );
+        builder.assert_bool(cols.a_sub);
+        builder.assert_bool(cols.b_sub);
         builder.when(cols.is_valid).assert_eq(
             cols.s_finite,
-            not_special.clone() * cols.a_normal * cols.b_normal,
+            not_special.clone() * (cols.a_normal + cols.a_sub) * (cols.b_normal + cols.b_sub),
         );
         builder.assert_bool(cols.s_finite);
         let s = cols.s_finite;
 
+        // ── Subnormal operand pre-normalization ─────────────────────────
+        // Shift the subnormal significand left so its MSB lands at bit 23
+        // (the implicit-bit position); the exponent absorbs the shift.
+        let shln = ShlnGadget::new(self.range_bus);
+        let mut eval_op_norm = |x_sub: AB::Var,
+                                lshift: AB::Var,
+                                m0v: AB::Var,
+                                m1v: AB::Var,
+                                m2v: AB::Var,
+                                shln_cols: &ShlnCols<AB::Var, 3>,
+                                y2_lo7: AB::Var| {
+            builder.assert_eq(shln_cols.x[0], x_sub * m0v);
+            builder.assert_eq(shln_cols.x[1], x_sub * m1v);
+            builder.assert_eq(shln_cols.x[2], x_sub * m2v);
+            builder.assert_eq(shln_cols.shift, lshift);
+            builder.assert_eq(shln_cols.enable, x_sub);
+            shln.eval_shln(builder, shln_cols);
+            // MSB must land at bit 23 (forces the maximal shift).
+            builder.when(x_sub).assert_eq(shln_cols.y[2], y2_lo7 + f128);
+            self.range_bus
+                .range_check(y2_lo7.into(), 7)
+                .eval(builder, x_sub.into());
+        };
+        eval_op_norm(
+            cols.a_sub,
+            cols.a_lshift,
+            cols.a[0],
+            cols.a[1],
+            cols.a_mant2,
+            &cols.a_shln,
+            cols.a_y2_lo7,
+        );
+        eval_op_norm(
+            cols.b_sub,
+            cols.b_lshift,
+            cols.b[0],
+            cols.b[1],
+            cols.b_mant2,
+            &cols.b_shln,
+            cols.b_y2_lo7,
+        );
+
         // ── Significand construction ────────────────────────────────────
-        builder.when(s).assert_eq(cols.a_sig[0], cols.a[0]);
-        builder.when(s).assert_eq(cols.a_sig[1], cols.a[1]);
-        builder
-            .when(s)
-            .assert_eq(cols.a_sig[2], cols.a_mant2 + f128); // implicit bit
-        builder.when(s).assert_eq(cols.b_sig[0], cols.b[0]);
-        builder.when(s).assert_eq(cols.b_sig[1], cols.b[1]);
-        builder
-            .when(s)
-            .assert_eq(cols.b_sig[2], cols.b_mant2 + f128);
+        // Normal: mantissa + implicit bit. Subnormal: normalized significand.
+        let a_ns = one.clone() - cols.a_sub;
+        let b_ns = one.clone() - cols.b_sub;
+        builder.when(s).assert_eq(
+            cols.a_sig[0],
+            a_ns.clone() * cols.a[0] + cols.a_sub * cols.a_shln.y[0],
+        );
+        builder.when(s).assert_eq(
+            cols.a_sig[1],
+            a_ns.clone() * cols.a[1] + cols.a_sub * cols.a_shln.y[1],
+        );
+        builder.when(s).assert_eq(
+            cols.a_sig[2],
+            a_ns * (cols.a_mant2 + f128) + cols.a_sub * cols.a_shln.y[2],
+        );
+        builder.when(s).assert_eq(
+            cols.b_sig[0],
+            b_ns.clone() * cols.b[0] + cols.b_sub * cols.b_shln.y[0],
+        );
+        builder.when(s).assert_eq(
+            cols.b_sig[1],
+            b_ns.clone() * cols.b[1] + cols.b_sub * cols.b_shln.y[1],
+        );
+        builder.when(s).assert_eq(
+            cols.b_sig[2],
+            b_ns * (cols.b_mant2 + f128) + cols.b_sub * cols.b_shln.y[2],
+        );
 
         // a_sig bit-7 decomposition (for a_sig << 25 target).
         for i in 0..3 {
@@ -654,12 +734,13 @@ impl FdivCoreAir {
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s.into());
-
-        // Result exponent: a_exp - b_exp + 126 + is_high + rc2. The
-        // pre-rounding exponent base_exp (without rc2) routes the result class
-        // via less-than gadgets, so the class can never be prover-chosen.
-        let base_exp =
-            a_exp.clone() - b_exp.clone() + AB::Expr::from(AB::F::from_u32(126)) + cols.is_high;
+        // Result exponent: a_exp_eff - b_exp_eff + 126 + is_high + rc2, where
+        // the effective exponents absorb the subnormal normalization shift.
+        // The pre-rounding exponent base_exp (without rc2) routes the result
+        // class via less-than gadgets, so the class can never be prover-chosen.
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp.clone());
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp.clone());
+        let base_exp = a_exp_eff - b_exp_eff + AB::Expr::from(AB::F::from_u32(126)) + cols.is_high;
         let result_exp_expr = base_exp.clone() + cols.rc2;
         builder
             .when(cols.s_normal)
@@ -745,8 +826,11 @@ impl FdivCoreAir {
         // s_subnormal is routed soundly in eval_finite_div (base_exp <= 0).
         let s = cols.s_subnormal;
 
-        // Shift = b_exp - a_exp - 124 (always >= 3 on subnormal rows).
-        let shift = b_exp - a_exp - AB::Expr::from(f124);
+        // Shift = b_exp_eff - a_exp_eff - 124 (>= 2 on subnormal rows), using
+        // the effective (subnormal-adjusted) exponents.
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp);
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp);
+        let shift = b_exp_eff - a_exp_eff - AB::Expr::from(f124);
 
         // sub_capped = (shift >= 56) = (55 < shift).
         let lt_air = IsLtSubAir::new(self.range_bus, 8);
@@ -1030,10 +1114,15 @@ where
         // ── Finite division witness ──────────────────────────────────────
         let a_normal = (1..=254).contains(&a_exp);
         let b_normal = (1..=254).contains(&b_exp);
-        let s_finite = !canon_sel && !inf_res && !zero_res && a_normal && b_normal;
+        let a_sub = a_exp == 0 && a_mant != 0;
+        let b_sub = b_exp == 0 && b_mant != 0;
+        let s_finite =
+            !canon_sel && !inf_res && !zero_res && (a_normal || a_sub) && (b_normal || b_sub);
         core_row.s_finite = F::from_bool(s_finite);
         core_row.a_normal = F::from_bool(a_normal);
         core_row.b_normal = F::from_bool(b_normal);
+        core_row.a_sub = F::from_bool(a_sub);
+        core_row.b_sub = F::from_bool(b_sub);
 
         // Set r_exp_lo/r_exp_hi from the result for ALL rows (fill_finite_div
         // will override with identical values for finite rows).
@@ -1053,6 +1142,24 @@ where
             );
         } else {
             zero_finite_columns(core_row);
+            // Operand normalization gadgets stay enabled on subnormal inputs
+            // regardless of the path — always fill them.
+            fill_op_norm(
+                a_exp,
+                a_mant,
+                &mut core_row.a_lshift,
+                &mut core_row.a_shln,
+                &mut core_row.a_y2_lo7,
+                &self.range_checker,
+            );
+            fill_op_norm(
+                b_exp,
+                b_mant,
+                &mut core_row.b_lshift,
+                &mut core_row.b_shln,
+                &mut core_row.b_y2_lo7,
+                &self.range_checker,
+            );
         }
 
         core_row.is_valid = F::ONE;
@@ -1068,8 +1175,76 @@ fn decompose(bits: u32) -> (u32, u32, u32) {
     (sign, exp, mant)
 }
 
+/// Pre-normalize a subnormal operand (leading-zeros left shift) and register
+/// range-checker counts. Returns (is_subnormal, effective exponent, 24-bit
+/// significand with the implicit bit at position 23).
+fn fill_op_norm<F: PrimeField32>(
+    exp: u32,
+    mant: u32,
+    lshift: &mut F,
+    shln: &mut ShlnCols<F, 3>,
+    y2_lo7: &mut F,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> (bool, i32, u32) {
+    let sub = exp == 0 && mant != 0;
+    if sub {
+        let lz = 24 - (32 - mant.leading_zeros());
+        let bytes = [mant & 0xFF, (mant >> 8) & 0xFF, (mant >> 16) & 0xFF];
+        *shln = make_shln_cols3::<F>(bytes, lz as usize, range_checker);
+        *lshift = F::from_u32(lz);
+        let sig = mant << lz;
+        *y2_lo7 = F::from_u32(((sig >> 16) & 0xFF) - 128);
+        range_checker.add_count(((sig >> 16) & 0xFF) - 128, 7);
+        (true, 1 - lz as i32, sig)
+    } else {
+        (false, exp as i32, mant | 0x800000)
+    }
+}
+
+/// Build a `ShlnCols<3>` witness (subnormal operand normalization) and
+/// register range-checker counts.
+fn make_shln_cols3<F: PrimeField32>(
+    x: [u32; 3],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShlnCols<F, 3> {
+    const N: usize = 3;
+    let (y, q, r) = run_shln(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+    let cv = |v: u32| {
+        if r == 0 {
+            0
+        } else {
+            v >> (SHLIMB_BITS - r)
+        }
+    };
+    for i in 0..N {
+        range_checker.add_count(cv(x[i]), r);
+        range_checker.add_count(y[i], 8);
+    }
+    ShlnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(cv(x[i]))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+    }
+}
+
 /// Zero all finite-path columns (for non-finite rows).
 fn zero_finite_columns<F: PrimeField32>(row: &mut FdivCoreCols<F>) {
+    row.a_lshift = F::ZERO;
+    row.b_lshift = F::ZERO;
+    row.a_shln = ShlnCols::<F, 3>::default();
+    row.b_shln = ShlnCols::<F, 3>::default();
+    row.a_y2_lo7 = F::ZERO;
+    row.b_y2_lo7 = F::ZERO;
     for i in 0..3 {
         row.a_sig[i] = F::ZERO;
         row.b_sig[i] = F::ZERO;
@@ -1129,8 +1304,23 @@ fn fill_finite_div<F: PrimeField32>(
     result: u32,
     range_checker: &SharedVariableRangeCheckerChip,
 ) {
-    let a_sig = a_mant | 0x800000;
-    let b_sig = b_mant | 0x800000;
+    // Pre-normalize subnormal operands (exponent absorbs the shift).
+    let (_a_sub, a_exp_eff, a_sig) = fill_op_norm(
+        a_exp,
+        a_mant,
+        &mut row.a_lshift,
+        &mut row.a_shln,
+        &mut row.a_y2_lo7,
+        range_checker,
+    );
+    let (_b_sub, b_exp_eff, b_sig) = fill_op_norm(
+        b_exp,
+        b_mant,
+        &mut row.b_lshift,
+        &mut row.b_shln,
+        &mut row.b_y2_lo7,
+        range_checker,
+    );
 
     // Significand bytes.
     let asig_bytes: [u32; 3] = [a_sig & 0xFF, (a_sig >> 8) & 0xFF, (a_sig >> 16) & 0xFF];
@@ -1295,7 +1485,7 @@ fn fill_finite_div<F: PrimeField32>(
     // Result exponent: for normal results, a_exp - b_exp + 126 + is_high + rc2.
     // For overflow (native result is inf), use the native exp field (255).
     // For subnormal/underflow (native result exp field == 0), use 0.
-    let base_exp = (a_exp as i64) - (b_exp as i64) + 126 + is_high as i64;
+    let base_exp = (a_exp_eff as i64) - (b_exp_eff as i64) + 126 + is_high as i64;
     let computed_exp = base_exp + rc2 as i64;
     let r_exp_field = (result >> 23) & 0xFF;
     let r_exp = if r_exp_field == 255 {
@@ -1346,7 +1536,7 @@ fn fill_finite_div<F: PrimeField32>(
 
     // ── Subnormal / underflow witness ───────────────────────────────
     if s_subnormal {
-        let true_shift = (b_exp as i32) - (a_exp as i32) - 124;
+        let true_shift = b_exp_eff - a_exp_eff - 124;
         debug_assert!(true_shift >= 2, "fdiv subnormal shift < 2: {}", true_shift);
         let sub_capped = true_shift >= 56;
         let lt_air = IsLtSubAir::new(range_checker.bus(), 8);
@@ -1497,6 +1687,8 @@ mod finite_numeric_tests {
         let (b_sign, b_exp, b_mant) = decompose(b);
         let a_normal = (1..=254).contains(&a_exp);
         let b_normal = (1..=254).contains(&b_exp);
+        let a_sub = a_exp == 0 && a_mant != 0;
+        let b_sub = b_exp == 0 && b_mant != 0;
         let any_nan = (a_exp == 255 && a_mant != 0) || (b_exp == 255 && b_mant != 0);
         let a_inf = a_exp == 255 && a_mant == 0;
         let b_inf = b_exp == 255 && b_mant == 0;
@@ -1504,11 +1696,20 @@ mod finite_numeric_tests {
         let b_zero = b_exp == 0 && b_mant == 0;
         let canon_sel = any_nan || (a_inf && b_inf) || (a_zero && b_zero);
         let inf_res = !any_nan && ((a_inf && !b_inf) || (b_zero && !a_inf && !a_zero));
-        let zero_res = b_inf && !a_inf && !any_nan;
-        let s_finite = !canon_sel && !inf_res && !zero_res && a_normal && b_normal;
+        let zero_res = !any_nan && ((b_inf && !a_inf) || (a_zero && !b_zero && !b_inf));
+        let s_finite =
+            !canon_sel && !inf_res && !zero_res && (a_normal || a_sub) && (b_normal || b_sub);
         row.s_finite = F::from_bool(s_finite);
         row.a_normal = F::from_bool(a_normal);
         row.b_normal = F::from_bool(b_normal);
+        row.a_sub = F::from_bool(a_sub);
+        row.b_sub = F::from_bool(b_sub);
+        row.a_exp_is_zero = F::from_bool(a_exp == 0);
+        row.b_exp_is_zero = F::from_bool(b_exp == 0);
+        row.a_exp_is_max = F::from_bool(a_exp == 255);
+        row.b_exp_is_max = F::from_bool(b_exp == 255);
+        row.a_mant_is_zero = F::from_bool(a_mant == 0);
+        row.b_mant_is_zero = F::from_bool(b_mant == 0);
         row.is_valid = F::ONE;
         row.r_sign = F::from_bool(a_sign != b_sign);
         row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
@@ -1527,6 +1728,23 @@ mod finite_numeric_tests {
         row.b_mant2 = F::from_u32((b_mant >> 16) & 0x7F);
         if s_finite {
             fill_finite_div(&mut row, a_exp, b_exp, a_mant, b_mant, result, &chip);
+        } else {
+            fill_op_norm(
+                a_exp,
+                a_mant,
+                &mut row.a_lshift,
+                &mut row.a_shln,
+                &mut row.a_y2_lo7,
+                &chip,
+            );
+            fill_op_norm(
+                b_exp,
+                b_mant,
+                &mut row.b_lshift,
+                &mut row.b_shln,
+                &mut row.b_y2_lo7,
+                &chip,
+            );
         }
         let air = FdivCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0);
         let mut builder = NumericBuilder::new(vec![]);
@@ -1547,6 +1765,11 @@ mod finite_numeric_tests {
             (f32::MAX.to_bits(), f32::MIN.to_bits()), // overflow -> -inf
             (0x3F800000u32, 0x7F7FFFFF),              // 1/MAX -> subnormal
             (0x00800000u32, 0x7F7FFFFF),              // MIN_NORMAL/MAX -> deep underflow
+            (0x00000001, 0x3F800000),                 // min subnormal / 1
+            (0x3F800000, 0x00000001),                 // 1 / min subnormal -> inf
+            (0x00000001, 0x00000001),                 // min subnormal / min subnormal
+            (0x007FFFFF, 0x40000000),                 // max subnormal * 2
+            (0x00800000, 0x00400000),                 // MIN_NORMAL / subnormal
         ] {
             let builder = run(a, b);
             assert!(
@@ -1580,6 +1803,24 @@ mod finite_numeric_tests {
                     builder.failures, a, b, r, r_exp
                 );
             }
+        }
+        // Fuzz including subnormal operands.
+        for _ in 0..2000 {
+            let a_exp = next() % 255;
+            let b_exp = next() % 255;
+            let a = ((next() & 1) << 31) | (a_exp << 23) | (next() & 0x7FFFFF);
+            let b = ((next() & 1) << 31) | (b_exp << 23) | (next() & 0x7FFFFF);
+            if (a_exp == 0 && (a & 0x7FFFFF) == 0) || (b_exp == 0 && (b & 0x7FFFFF) == 0) {
+                continue; // zero operands are special-cased
+            }
+            let builder = run(a, b);
+            assert!(
+                builder.ok(),
+                "fdiv subnormal-operand fuzz failed: {:?}\n a={:08x} b={:08x}",
+                builder.failures,
+                a,
+                b
+            );
         }
     }
 }

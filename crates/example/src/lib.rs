@@ -1651,6 +1651,11 @@ mod fuzz_tests {
             (0x80000000, (-3.0f32).to_bits()),           // -0 / -3 = +0
             (0x00800000, 0x7F7FFFFF),                    // MIN_NORMAL / MAX -> subnormal result
             (0x3F800000, 0x7F000000),                    // 1 / huge -> subnormal result
+            (0x00000001, 0x3F800000),                    // min subnormal / 1
+            (0x3F800000, 0x00000001),                    // 1 / min subnormal -> overflow
+            (0x007FFFFF, 0x40000000),                    // max subnormal * 2
+            (0x00800000, 0x00400000),                    // MIN_NORMAL / subnormal
+            (0x00000001, 0x00000001),                    // min subnormal / min subnormal = 1.0
         ];
         // 15 rows per chunk: the register file has only 32 entries.
         for chunk in cases.chunks(15) {
