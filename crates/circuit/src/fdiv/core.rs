@@ -1322,7 +1322,7 @@ fn fill_finite_div<F: PrimeField32>(
     range_checker.add_count(base_exp_b, 10);
     let lt10 = IsLtSubAir::new(range_checker.bus(), 10);
     lt10.generate_subrow(
-        (range_checker.as_ref(), 510u32, base_exp_b + rc2 as u32),
+        (range_checker.as_ref(), 510u32, base_exp_b + rc2),
         (&mut row.route_ovf_decomp, &mut row.s_overflow),
     );
     lt10.generate_subrow(
