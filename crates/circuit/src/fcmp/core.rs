@@ -184,6 +184,13 @@ where
         builder.assert_eq(cols.a[3], cols.a_hi + cols.a_sign * f128);
         builder.assert_eq(cols.b[2], cols.b_mant2 + cols.b_exp_lo * f128);
         builder.assert_eq(cols.b[3], cols.b_hi + cols.b_sign * f128);
+        // Pin the decomposition: the 7-bit pieces must be range-checked, or
+        // a_exp_lo / a_sign are free field choices.
+        for v in [cols.a_mant2, cols.b_mant2, cols.a_hi, cols.b_hi] {
+            self.range_bus
+                .range_check(v.into(), 7)
+                .eval(builder, cols.is_valid.into());
+        }
 
         // ── Monotone comparison keys ─────────────────────────────────────
         // Bytes 0-2: key = sign ? 255 - x : x
@@ -486,6 +493,10 @@ where
         core_row.b_mant2 = F::from_u32((b_mant >> 16) & 0x7F);
         core_row.a_hi = F::from_u32(a_exp >> 1);
         core_row.b_hi = F::from_u32(b_exp >> 1);
+        self.range_checker.add_count((a_mant >> 16) & 0x7F, 7);
+        self.range_checker.add_count((b_mant >> 16) & 0x7F, 7);
+        self.range_checker.add_count(a_exp >> 1, 7);
+        self.range_checker.add_count(b_exp >> 1, 7);
 
         // Comparison keys
         let (ka, kb) = (fp_key(a_bits), fp_key(b_bits));
@@ -601,4 +612,179 @@ fn decompose(bits: u32) -> (u32, u32, u32) {
     let exp = (bits >> 23) & 0xFF;
     let mant = bits & 0x7FFFFF;
     (sign, exp, mant)
+}
+
+#[cfg(test)]
+mod air_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+    type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+
+    fn build_row(a_bits: u32, b_bits: u32, op: FcmpOp) -> Vec<F> {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let lt_air = IsLtArraySubAir::<4>::new(chip.bus(), KEY_LIMB_BITS);
+        let mut buf = vec![F::ZERO; FcmpCoreCols::<F>::width()];
+        let row: &mut FcmpCoreCols<F> = buf.as_mut_slice().borrow_mut();
+        let result = fcmp_result(a_bits, b_bits, op);
+        let (a_sign, a_exp, a_mant) = decompose(a_bits);
+        let (b_sign, b_exp, b_mant) = decompose(b_bits);
+
+        for i in 0..4 {
+            row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
+            row.b[i] = F::from_u32((b_bits >> (i * 8)) & 0xFF);
+            row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        }
+        row.a_sign = F::from_u32(a_sign);
+        row.b_sign = F::from_u32(b_sign);
+        row.a_exp_lo = F::from_u32(a_exp & 1);
+        row.b_exp_lo = F::from_u32(b_exp & 1);
+        row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+        row.b_mant2 = F::from_u32((b_mant >> 16) & 0x7F);
+        row.a_hi = F::from_u32(a_exp >> 1);
+        row.b_hi = F::from_u32(b_exp >> 1);
+
+        let (ka, kb) = (fp_key(a_bits), fp_key(b_bits));
+        let key_a: [F; 4] = core::array::from_fn(|i| F::from_u32((ka >> (i * 8)) & 0xFF));
+        let key_b: [F; 4] = core::array::from_fn(|i| F::from_u32((kb >> (i * 8)) & 0xFF));
+        row.key_a = key_a;
+        row.key_b = key_b;
+
+        row.a_exp_is_zero = F::from_bool(a_exp == 0);
+        row.b_exp_is_zero = F::from_bool(b_exp == 0);
+        row.a_exp_is_max = F::from_bool(a_exp == 255);
+        row.b_exp_is_max = F::from_bool(b_exp == 255);
+        row.a_exp_zero_inv = if a_exp != 0 {
+            F::from_u32(a_exp).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.b_exp_zero_inv = if b_exp != 0 {
+            F::from_u32(b_exp).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.a_exp_max_inv = if a_exp != 255 {
+            (F::from_u32(255) - F::from_u32(a_exp))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.b_exp_max_inv = if b_exp != 255 {
+            (F::from_u32(255) - F::from_u32(b_exp))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
+        let b_mant_sum = (b_mant & 0xFF) + ((b_mant >> 8) & 0xFF) + ((b_mant >> 16) & 0x7F);
+        row.a_mant_is_zero = F::from_bool(a_mant == 0);
+        row.b_mant_is_zero = F::from_bool(b_mant == 0);
+        row.a_mant_sum_inv = if a_mant != 0 {
+            F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.b_mant_sum_inv = if b_mant != 0 {
+            F::from_u32(b_mant_sum).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        let a_is_zero = a_exp == 0 && a_mant == 0;
+        let b_is_zero = b_exp == 0 && b_mant == 0;
+        row.a_is_zero = F::from_bool(a_is_zero);
+        row.b_is_zero = F::from_bool(b_is_zero);
+        row.both_zero = F::from_bool(a_is_zero && b_is_zero);
+        let a_nan = a_exp == 255 && a_mant != 0;
+        let b_nan = b_exp == 255 && b_mant != 0;
+        row.a_nan = F::from_bool(a_nan);
+        row.b_nan = F::from_bool(b_nan);
+        row.any_nan = F::from_bool(a_nan || b_nan);
+
+        let x_ab = [key_a[3], key_a[2], key_a[1], key_a[0]];
+        let y_ab = [key_b[3], key_b[2], key_b[1], key_b[0]];
+        let aux_ab = IsLtArrayAuxColsMut {
+            diff_marker: &mut row.lt_ab_aux.diff_marker,
+            diff_inv: &mut row.lt_ab_aux.diff_inv,
+            lt_decomp: &mut row.lt_ab_aux.lt_aux.lower_decomp,
+        };
+        lt_air.generate_subrow((chip.as_ref(), &x_ab, &y_ab), (aux_ab, &mut row.lt_ab));
+        let aux_ba = IsLtArrayAuxColsMut {
+            diff_marker: &mut row.lt_ba_aux.diff_marker,
+            diff_inv: &mut row.lt_ba_aux.diff_inv,
+            lt_decomp: &mut row.lt_ba_aux.lt_aux.lower_decomp,
+        };
+        lt_air.generate_subrow((chip.as_ref(), &y_ab, &x_ab), (aux_ba, &mut row.lt_ba));
+
+        let lt_ab = ka < kb;
+        let lt_ba = kb < ka;
+        row.key_eq = F::from_bool(!lt_ab && !lt_ba);
+        let both_zero = a_is_zero && b_is_zero;
+        let sel = match op {
+            FcmpOp::Eq => (!lt_ab && !lt_ba) || both_zero,
+            FcmpOp::Lt => lt_ab && !both_zero,
+            FcmpOp::Le => !lt_ba || both_zero,
+        };
+        row.sel = F::from_bool(sel);
+        row.feq_flag = F::from_bool(op == FcmpOp::Eq);
+        row.flt_flag = F::from_bool(op == FcmpOp::Lt);
+        row.fle_flag = F::from_bool(op == FcmpOp::Le);
+        row.is_valid = F::ONE;
+        buf
+    }
+
+    fn eval_row(buf: &[F]) -> NumericBuilder<F> {
+        let air = FcmpCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
+        let mut b = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air, &mut b, buf, F::ZERO);
+        b
+    }
+
+    #[test]
+    fn honest_rows_pass() {
+        for (a, b) in [
+            (1.0f32.to_bits(), 2.0f32.to_bits()),
+            (0x7FC00000, 0x3F800000), // qNaN vs 1.0
+            (0x80000000, 0x00000000), // -0 vs +0
+            (0x7F800000, 0xFF800000), // inf vs -inf
+            (0x00400000, 0x3F800000), // subnormal vs 1.0
+        ] {
+            for op in [FcmpOp::Eq, FcmpOp::Lt, FcmpOp::Le] {
+                let row = build_row(a, b, op);
+                assert!(
+                    eval_row(&row).ok(),
+                    "fcmp {op:?} honest failed: a={a:08x} b={b:08x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decomposition_flip_rejected() {
+        let (a, b) = (1.0f32.to_bits(), 2.0f32.to_bits());
+        // Flipping a_exp_lo (with a_mant2 wrapping) must be rejected.
+        let mut buf = build_row(a, b, FcmpOp::Lt);
+        {
+            let row: &mut FcmpCoreCols<F> = buf.as_mut_slice().borrow_mut();
+            row.a_exp_lo = F::ONE - row.a_exp_lo;
+            row.a_mant2 -= F::from_u32(128);
+        }
+        assert!(!eval_row(&buf).ok(), "a_exp_lo flip accepted");
+        // Flipping a_sign (with a_hi wrapping) must be rejected.
+        let mut buf = build_row(a, b, FcmpOp::Lt);
+        {
+            let row: &mut FcmpCoreCols<F> = buf.as_mut_slice().borrow_mut();
+            row.a_sign = F::ONE - row.a_sign;
+            row.a_hi -= F::from_u32(128);
+        }
+        assert!(!eval_row(&buf).ok(), "a_sign flip accepted");
+    }
 }
