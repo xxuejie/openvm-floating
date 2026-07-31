@@ -199,6 +199,14 @@ where
         builder.assert_bool(cols.b_sign);
         builder.assert_bool(cols.b_exp_lo);
 
+        // Pin the decomposition: the high pieces must be range-checked, or
+        // exp_lo / sign are free field choices (classification re-routing).
+        for v in [cols.a_mant2, cols.b_mant2, cols.a_exp_hi, cols.b_exp_hi] {
+            self.range_bus
+                .range_check(v.into(), 7)
+                .eval(builder, cols.is_valid.into());
+        }
+
         // ── Phase 2: Classification (stored as columns, fdiv-style) ──────────
         // The exp_is_zero / exp_is_max / mant_is_zero columns are constrained only
         // on valid rows. On padding rows (is_valid = 0) they are left zero-filled,
@@ -339,6 +347,10 @@ where
             .when(s_finite.clone())
             .when(not(cols.is_high))
             .assert_eq(cols.product[5], cols.p5_lo + f64);
+        // p5_lo must be range-checked, or is_high is a free choice.
+        self.range_bus
+            .range_check(cols.p5_lo.into(), 7)
+            .eval(builder, cols.is_valid.into());
 
         // Verify norm_sig: when is_high, norm_sig = product; when !is_high, norm_sig = product << 1.
         // Gated on s_finite for the same reason.
@@ -357,6 +369,11 @@ where
                 .when(s_finite.clone())
                 .when(not(cols.is_high))
                 .assert_eq(cols.norm_sig[i], shifted - new_carry.clone() * f256);
+            // The per-limb carry must be a bit, or the chain is tautological.
+            self.range_bus.range_check(new_carry.clone(), 1).eval(
+                builder,
+                cols.is_valid.into() * s_finite.clone() * not(cols.is_high),
+            );
             shift_carry = new_carry;
         }
         // Only enforce shift carry == 0 when !is_high (skipped for is_high rows)
@@ -369,17 +386,25 @@ where
         builder.assert_bool(cols.guard);
         // norm_sig[2] = norm2_lo + guard * 128
         builder.assert_eq(cols.norm_sig[2], cols.norm2_lo + cols.guard * f128);
+        self.range_bus
+            .range_check(cols.norm2_lo.into(), 7)
+            .eval(builder, cols.is_valid.into());
 
         // Sticky: slack_sum = norm_sig[0] + norm_sig[1] + norm2_lo
         let slack_sum = cols.norm_sig[0] + cols.norm_sig[1] + cols.norm2_lo;
-        let slack_is_zero = one.clone() - slack_sum * cols.slack_sum_inv;
+        let slack_is_zero = one.clone() - slack_sum.clone() * cols.slack_sum_inv;
         builder.assert_bool(slack_is_zero.clone());
+        builder.assert_zero(slack_sum * slack_is_zero.clone());
         let sticky = one.clone() - slack_is_zero;
 
         // LSB: bit 0 of norm_sig[3]
         // norm_sig[3] = lsb + norm3_high * 2
         let lsb = cols.norm_sig[3] - cols.norm3_high * f2;
         builder.assert_eq(cols.norm_sig[3], lsb.clone() + cols.norm3_high * f2);
+        builder.assert_bool(lsb.clone());
+        self.range_bus
+            .range_check(cols.norm3_high.into(), 7)
+            .eval(builder, cols.is_valid.into());
 
         // round_up = guard AND (sticky OR lsb)
         let sticky_or_lsb = sticky.clone() + lsb.clone() - sticky * lsb;
@@ -929,6 +954,11 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.b_mant1 = F::from_u32(b_mant1);
     row.b_mant2 = F::from_u32(b_mant2);
 
+    range_chip.add_count(a_mant2, 7);
+    range_chip.add_count(b_mant2, 7);
+    range_chip.add_count(a_exp_hi, 7);
+    range_chip.add_count(b_exp_hi, 7);
+
     // Classification inverse witnesses
     let a_exp_f = F::from_u32(a_exp);
     let b_exp_f = F::from_u32(b_exp);
@@ -1051,6 +1081,7 @@ fn fill_fmul_witness<F: PrimeField32>(
         0
     };
     row.p5_lo = F::from_u32(p5_lo);
+    range_chip.add_count(p5_lo, 7);
     let norm = if is_high { prod } else { prod << 1 };
     for i in 0..PRODUCT_NUM_LIMBS {
         row.norm_sig[i] = F::from_u32((norm >> (i * LIMB_BITS)) as u32 & 0xFF);
@@ -1066,6 +1097,7 @@ fn fill_fmul_witness<F: PrimeField32>(
 
     row.guard = F::from_u32(guard_bit);
     row.norm2_lo = F::from_u32(norm2_lo);
+    range_chip.add_count(norm2_lo, 7);
     let slack_sum = F::from_u32((slack & 0xFF) as u32)
         + F::from_u32(((slack >> 8) & 0xFF) as u32)
         + F::from_u32(norm2_lo);
@@ -1075,6 +1107,7 @@ fn fill_fmul_witness<F: PrimeField32>(
         F::ZERO
     };
     row.norm3_high = F::from_u32(((norm >> 25) & 0x7F) as u32);
+    range_chip.add_count(((norm >> 25) & 0x7F) as u32, 7);
     row.round_up = F::from_bool(round_up);
 
     // Result decomposition
@@ -1106,6 +1139,21 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.s_nan = F::from_bool(is_nan_res);
     row.s_inf = F::from_bool(s_inf);
     row.s_zero = F::from_bool(s_zero);
+
+    // 1-bit shift carries for the <<1 normalization (finite, !is_high only).
+    let s_finite = !is_nan_res && !s_inf && !s_zero;
+    if s_finite && !is_high {
+        let mut sc: u32 = 0;
+        for i in 0..PRODUCT_NUM_LIMBS {
+            let plimb = (prod >> (i * LIMB_BITS)) as u32 & 0xFF;
+            let nlimb = (norm >> (i * LIMB_BITS)) as u32 & 0xFF;
+            let shifted = 2 * plimb + sc;
+            sc = (shifted - nlimb) / 256;
+            debug_assert!(sc <= 1, "fmul shift carry not a bit");
+            range_chip.add_count(sc, 1);
+        }
+        debug_assert_eq!(sc, 0, "fmul shift final carry nonzero");
+    }
 
     // Finite normal-result output reconstruction witnesses. (c0/c1/c2 are
     // computed after s_finite below — they are only meaningful for finite
