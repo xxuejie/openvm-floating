@@ -1567,24 +1567,33 @@ mod fuzz_tests {
             (m, 0x00000000, 0x3F800000, 0x3F800000), // +0 * 1 + 1
             (m, 0x80000000, 0x3F800000, 0x3F800000), // -0 * 1 + 1
             (m, 0x00400000, 0x3F800000, 0x3F800000), // subnormal a
+            (m, 0x3F800000, 0x40000000, 0xC0000000), // 1*2 + (-2) = +0
+            (m, 0x80000000, 0x3F800000, 0x80000000), // -0 * 1 + -0 = -0
+            (m, 0x00000000, 0x3F800000, 0x00400000), // +0 * 1 + subnormal c
+            (m, 0x00800000, 0x00800000, 0x00800000), // min_norm^2 + min_norm
+            (m, 0x00000001, 0x3F800000, 0x80000001), // min_sub - min_sub = +0
+            (s, 0x00800000, 0x3F000000, 0x00000001), // min_norm*0.5 - min_sub
+            (m, 0x007FFFFF, 0x007FFFFF, 0x00000000), // max_sub^2 + 0
+            (m, 0x33800000, 0x33800000, 0x00000000), // deep underflow -> +0
         ];
-        // Random normal-range operands with random signs; keep only cases
-        // whose results are outside the deferred bucket (subnormal/zero).
+        // Random operands with random signs (some subnormal/zero); all
+        // results are provable — no deferred buckets remain.
+        let mut i = 0usize;
         while cases.len() < 40 {
-            let a = ((rng.next_u32() % 254) + 1) << 23
-                | (rng.next_u32() & 0x7FFFFF)
-                | ((rng.next_u32() & 1) << 31);
-            let b = ((rng.next_u32() % 254) + 1) << 23
-                | (rng.next_u32() & 0x7FFFFF)
-                | ((rng.next_u32() & 1) << 31);
-            let c = ((rng.next_u32() % 254) + 1) << 23
-                | (rng.next_u32() & 0x7FFFFF)
-                | ((rng.next_u32() & 1) << 31);
+            i += 1;
+            let gen = |rng: &mut XorShift64| {
+                if i.is_multiple_of(4) {
+                    ((rng.next_u32() % 255) << 23)
+                        | (rng.next_u32() & 0x7FFFFF)
+                        | ((rng.next_u32() & 1) << 31)
+                } else {
+                    ((rng.next_u32() % 254) + 1) << 23
+                        | (rng.next_u32() & 0x7FFFFF)
+                        | ((rng.next_u32() & 1) << 31)
+                }
+            };
+            let (a, b, c) = (gen(&mut rng), gen(&mut rng), gen(&mut rng));
             let op = OPS[rng.next_u32() as usize % 4];
-            let r = fmadd_result(a, b, c, op);
-            if (r >> 23) & 0xFF == 0 {
-                continue; // deferred: subnormal/zero results
-            }
             cases.push((op, a, b, c));
         }
         // 10 rows per chunk: the register file has only 32 entries.
