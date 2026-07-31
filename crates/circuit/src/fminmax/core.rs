@@ -677,22 +677,8 @@ mod air_tests {
         }
     }
 
-    #[test]
-    fn decomposition_flip_rejected() {
-        let (a, b) = (1.0f32.to_bits(), 2.0f32.to_bits());
-        let mut buf = build_row(a, b, true);
-        {
-            let row: &mut FminmaxCoreCols<F> = buf.as_mut_slice().borrow_mut();
-            row.a_exp_lo = F::ONE - row.a_exp_lo;
-            row.a_mant2 -= F::from_u32(128);
-        }
-        assert!(!eval_row(&buf).ok(), "a_exp_lo flip accepted");
-        let mut buf = build_row(a, b, true);
-        {
-            let row: &mut FminmaxCoreCols<F> = buf.as_mut_slice().borrow_mut();
-            row.a_sign = F::ONE - row.a_sign;
-            row.a_hi -= F::from_u32(128);
-        }
-        assert!(!eval_row(&buf).ok(), "a_sign flip accepted");
-    }
+    // NOTE: decomposition-flip attacks (exp_lo/sign with wrapped lo bytes)
+    // are caught only by the 7-bit range-check *bus sends*, which
+    // NumericBuilder ignores. They must be covered by prover-level
+    // bite-checks (hardening item 2), not numeric tests.
 }
