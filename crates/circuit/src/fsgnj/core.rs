@@ -5,6 +5,7 @@ use openvm_circuit::{
     system::memory::{online::TracingMemory, MemoryAuxColsFactory},
 };
 use openvm_circuit_primitives::{
+    var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
     AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
@@ -36,6 +37,7 @@ pub struct FsgnjCoreCols<T> {
 #[derive(Copy, Clone, Debug, derive_new::new, ColumnsAir)]
 #[columns_via(FsgnjCoreCols<u8>)]
 pub struct FsgnjCoreAir {
+    pub range_bus: VariableRangeCheckerBus,
     pub offset: usize,
 }
 
@@ -73,6 +75,13 @@ where
         // Sign extraction: a[3] = a_byte3_lo + a_sign * 128
         builder.assert_eq(cols.a[3], cols.a_byte3_lo + cols.a_sign * f128);
         builder.assert_eq(cols.b[3], cols.b_byte3_lo + cols.b_sign * f128);
+        // Pin the decomposition: the 7-bit pieces must be range-checked, or
+        // a_sign / b_sign are free field choices.
+        for v in [cols.a_byte3_lo, cols.b_byte3_lo] {
+            self.range_bus
+                .range_check(v.into(), 7)
+                .eval(builder, cols.is_valid.into());
+        }
 
         // Exactly one opcode flag when valid
         let flag_sum = cols.fsgnj_flag + cols.fsgnjn_flag + cols.fsgnjx_flag;
@@ -188,11 +197,16 @@ where
 pub struct FsgnjFiller<A> {
     adapter: A,
     pub offset: usize,
+    pub range_checker: SharedVariableRangeCheckerChip,
 }
 
 impl<A> FsgnjFiller<A> {
-    pub fn new(adapter: A, offset: usize) -> Self {
-        Self { adapter, offset }
+    pub fn new(adapter: A, range_checker: SharedVariableRangeCheckerChip, offset: usize) -> Self {
+        Self {
+            adapter,
+            offset,
+            range_checker,
+        }
     }
 }
 
@@ -229,9 +243,73 @@ where
         core_row.b_sign = F::from_u32(b_sign);
         core_row.a_byte3_lo = F::from_u32((a_bits >> 24) & 0x7F);
         core_row.b_byte3_lo = F::from_u32((b_bits >> 24) & 0x7F);
+        self.range_checker.add_count((a_bits >> 24) & 0x7F, 7);
+        self.range_checker.add_count((b_bits >> 24) & 0x7F, 7);
         core_row.fsgnj_flag = F::from_bool(opcode == FpOpcode::FSGNJ_S);
         core_row.fsgnjn_flag = F::from_bool(opcode == FpOpcode::FSGNJN_S);
         core_row.fsgnjx_flag = F::from_bool(opcode == FpOpcode::FSGNJX_S);
         core_row.is_valid = F::ONE;
     }
+}
+
+#[cfg(test)]
+mod air_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+    type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+
+    fn build_row(a_bits: u32, b_bits: u32, opcode: FpOpcode) -> Vec<F> {
+        let _chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let mut buf = vec![F::ZERO; FsgnjCoreCols::<F>::width()];
+        let row: &mut FsgnjCoreCols<F> = buf.as_mut_slice().borrow_mut();
+        let a_sign = (a_bits >> 31) & 1;
+        let b_sign = (b_bits >> 31) & 1;
+        let result_bits = match opcode {
+            FpOpcode::FSGNJ_S => (a_bits & 0x7FFFFFFF) | (b_bits & 0x80000000),
+            FpOpcode::FSGNJN_S => (a_bits & 0x7FFFFFFF) | (!b_bits & 0x80000000),
+            FpOpcode::FSGNJX_S => a_bits ^ (b_bits & 0x80000000),
+            _ => unreachable!(),
+        };
+        for i in 0..4 {
+            row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
+            row.b[i] = F::from_u32((b_bits >> (i * 8)) & 0xFF);
+            row.result[i] = F::from_u32((result_bits >> (i * 8)) & 0xFF);
+        }
+        row.a_sign = F::from_u32(a_sign);
+        row.b_sign = F::from_u32(b_sign);
+        row.a_byte3_lo = F::from_u32((a_bits >> 24) & 0x7F);
+        row.b_byte3_lo = F::from_u32((b_bits >> 24) & 0x7F);
+        row.fsgnj_flag = F::from_bool(opcode == FpOpcode::FSGNJ_S);
+        row.fsgnjn_flag = F::from_bool(opcode == FpOpcode::FSGNJN_S);
+        row.fsgnjx_flag = F::from_bool(opcode == FpOpcode::FSGNJX_S);
+        row.is_valid = F::ONE;
+        buf
+    }
+
+    fn eval_row(buf: &[F]) -> NumericBuilder<F> {
+        let air = FsgnjCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
+        let mut b = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air, &mut b, buf, F::ZERO);
+        b
+    }
+
+    #[test]
+    fn honest_rows_pass() {
+        for op in [FpOpcode::FSGNJ_S, FpOpcode::FSGNJN_S, FpOpcode::FSGNJX_S] {
+            let buf = build_row(1.0f32.to_bits(), (-2.0f32).to_bits(), op);
+            assert!(eval_row(&buf).ok(), "fsgnj {op:?} honest failed");
+        }
+    }
+
+    // NOTE: decomposition-flip attacks (sign/exp_lo with wrapped lo bytes)
+    // are caught only by the 7-bit range-check *bus sends*, which
+    // NumericBuilder ignores. They must be covered by prover-level
+    // bite-checks (hardening item 2), not numeric tests.
 }

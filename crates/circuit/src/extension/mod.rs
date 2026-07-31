@@ -281,7 +281,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
 
         let fsgnj = Rv32FsgnjAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
-            FsgnjCoreAir::new(FpOpcode::CLASS_OFFSET),
+            FsgnjCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fsgnj);
 
@@ -441,7 +441,11 @@ where
 
         inventory.next_air::<Rv32FsgnjAir>()?;
         let fsgnj = Rv32FsgnjChip::new(
-            FsgnjFiller::new(Rv32FpAdapterFiller, FpOpcode::CLASS_OFFSET),
+            FsgnjFiller::new(
+                Rv32FpAdapterFiller,
+                range_checker.clone(),
+                FpOpcode::CLASS_OFFSET,
+            ),
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fsgnj);

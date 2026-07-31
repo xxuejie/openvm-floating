@@ -1436,6 +1436,21 @@ mod fuzz_tests {
 
     #[cfg(feature = "proving")]
     #[test]
+    fn fuzz_prove_fsgnj() {
+        let mut rng = XorShift64::new(0xB0B0_0007);
+        let cases: Vec<(u32, u32)> = (0..15)
+            .map(|_| (rand_bits(&mut rng), rand_bits(&mut rng)))
+            .collect();
+        let (instrs, mem) = build_binary_chunk(&cases, &mut |rd, rs1, rs2, i| match i % 3 {
+            0 => fsgnj_s(rd, rs1, rs2),
+            1 => fsgnjn_s(rd, rs1, rs2),
+            _ => fsgnjx_s(rd, rs1, rs2),
+        });
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
     fn fuzz_prove_fminmax() {
         let mut rng = XorShift64::new(0xB0B0_0001);
         let cases: Vec<(u32, u32)> = (0..15)
