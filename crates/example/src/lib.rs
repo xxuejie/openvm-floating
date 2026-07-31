@@ -1694,6 +1694,8 @@ mod fuzz_tests {
             0x00200000,            // subnormal
             (-100.0f32).to_bits(), // negative -> NaN
             0x00100000,            // subnormal
+            0x80100000,            // negative subnormal -> NaN
+            0x80000001,            // negative min subnormal -> NaN
         ];
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fsqrt_s(rd, rs1));
         prove_chunk(instrs, mem);

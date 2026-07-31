@@ -79,6 +79,7 @@ pub struct FsqrtCoreCols<T> {
     pub norm_shift: T,
     pub ns_lo: T,
     pub ns_half: T,
+    pub a_sig2_lo7: T, // low 7 bits of the normalized subnormal significand top byte
     pub norm_shln: ShlnCols<T, 4>,
     pub a_sig: [T; 3],    // significand bytes (mant | implicit)
     pub a_sig_hi: [T; 3], // bit 7 of each a_sig byte (for odd-exp left shift)
@@ -166,11 +167,22 @@ where
         // ── Byte decomposition ───────────────────────────────────────────
         builder.assert_eq(cols.a[2], cols.a_mant2 + cols.a_exp_lo * f128);
         builder.assert_eq(cols.a[3], cols.a_hi + cols.a_sign * f128);
+        // Pin the decomposition: the 7-bit pieces must be range-checked, or
+        // exp_lo / sign are free field choices (classification re-routing).
+        for v in [cols.a_mant2, cols.a_hi] {
+            self.range_bus
+                .range_check(v.into(), 7)
+                .eval(builder, cols.is_valid.into());
+        }
 
-        // Range check input bytes (bounds exponent/mantissa sums).
+        // Range check input bytes (bounds exponent/mantissa sums) and the
+        // result bytes (the memory side does not byte-check written data).
         for i in 0..4 {
             self.range_bus
                 .range_check(cols.a[i].into(), 8)
+                .eval(builder, cols.is_valid.into());
+            self.range_bus
+                .range_check(cols.result[i].into(), 8)
                 .eval(builder, cols.is_valid.into());
         }
 
@@ -290,7 +302,7 @@ impl FsqrtCoreAir {
             .assert_eq(cols.a_normal, a_normal_expr);
         builder.when(cols.is_valid).assert_eq(
             cols.a_subnormal,
-            cols.a_exp_is_zero * (one.clone() - cols.a_mant_is_zero),
+            cols.a_exp_is_zero * (one.clone() - cols.a_mant_is_zero) * (one.clone() - cols.a_sign),
         );
         builder.when(cols.is_valid).assert_eq(
             cols.s_finite,
@@ -308,6 +320,15 @@ impl FsqrtCoreAir {
         builder
             .when(s)
             .assert_eq(cols.norm_shln.shift, cols.norm_shift);
+        // norm_shift decomposes as ns_lo + 2*ns_half (parity + half-shift),
+        // which the effective exponent below is built from.
+        builder.assert_bool(cols.ns_lo);
+        builder
+            .when(s)
+            .assert_eq(cols.norm_shift, cols.ns_lo + cols.ns_half * f2);
+        self.range_bus
+            .range_check(cols.ns_half.into(), 4)
+            .eval(builder, is_sub.into());
         builder.assert_eq(cols.norm_shln.enable, is_sub);
         let shln = ShlnGadget::new(self.range_bus);
         shln.eval_shln(builder, &cols.norm_shln);
@@ -333,6 +354,14 @@ impl FsqrtCoreAir {
             .when(s * is_sub)
             .assert_eq(cols.a_sig[2], cols.norm_shln.y[2]);
         builder.when(s * is_sub).assert_zero(cols.norm_shln.y[3]);
+        // The normalized significand's MSB must land at bit 23 (anchors the
+        // normalization shift; otherwise the exponent reconstruction breaks).
+        builder
+            .when(s * is_sub)
+            .assert_eq(cols.a_sig[2], cols.a_sig2_lo7 + f128);
+        self.range_bus
+            .range_check(cols.a_sig2_lo7.into(), 7)
+            .eval(builder, s * is_sub);
         for i in 0..3 {
             builder.assert_bool(cols.a_sig_hi[i]);
             self.range_bus
@@ -651,6 +680,7 @@ where
             core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
             core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
             self.range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
+            self.range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
         }
 
         let (a_sign, a_exp, a_mant) = decompose(a_bits);
@@ -658,6 +688,8 @@ where
         core_row.a_exp_lo = F::from_u32(a_exp & 1);
         core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
         core_row.a_hi = F::from_u32(a_exp >> 1);
+        self.range_checker.add_count((a_mant >> 16) & 0x7F, 7);
+        self.range_checker.add_count(a_exp >> 1, 7);
 
         let a_exp_f = F::from_u32(a_exp);
         core_row.a_exp_is_zero = F::from_bool(a_exp == 0);
@@ -754,6 +786,7 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FsqrtCoreCols<F>) {
     row.norm_shift = F::ZERO;
     row.ns_lo = F::ZERO;
     row.ns_half = F::ZERO;
+    row.a_sig2_lo7 = F::ZERO;
     row.norm_shln = ShlnCols::<F, 4>::default();
     for i in 0..3 {
         row.a_sig[i] = F::ZERO;
@@ -819,6 +852,7 @@ fn fill_finite_sqrt<F: PrimeField32>(
         row.norm_shift = F::from_u32(ns);
         row.ns_lo = F::from_u32(ns & 1);
         row.ns_half = F::from_u32(ns >> 1);
+        range_checker.add_count(ns >> 1, 4);
         row.eff_exp_hi = F::ZERO - F::from_u32(ns >> 1);
     } else {
         row.norm_shift = F::ZERO;
@@ -845,6 +879,10 @@ fn fill_finite_sqrt<F: PrimeField32>(
         row.a_sig[i] = F::from_u32(sb);
         row.a_sig_hi[i] = F::from_u32(sb >> 7);
         range_checker.add_count(sb, 8);
+    }
+    if is_sub {
+        row.a_sig2_lo7 = F::from_u32(asig_bytes[2] - 128);
+        range_checker.add_count(asig_bytes[2] - 128, 7);
     }
 
     // sig_shifted = a_sig << eff_exp_odd. n = sig_shifted << 48.
