@@ -162,6 +162,10 @@ where
         );
 
         // Range checks: a_mant2_lo is 6 bits; result is 2 bytes (mask < 1024).
+        // a_hi must be 7 bits, or a_sign is a free field choice.
+        self.range_bus
+            .range_check(cols.a_hi.into(), 7)
+            .eval(builder, cols.is_valid.into());
         self.range_bus
             .range_check(cols.a_mant2_lo.into(), 6)
             .eval(builder, cols.is_valid.into());
@@ -359,6 +363,7 @@ where
         core_row.a_exp_lo = F::from_u32(a_exp & 1);
         core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
         core_row.a_hi = F::from_u32(a_exp >> 1);
+        self.range_checker.add_count(a_exp >> 1, 7);
 
         let a_exp_f = F::from_u32(a_exp);
         core_row.a_exp_is_zero = F::from_bool(a_exp == 0);
@@ -402,5 +407,110 @@ where
         self.range_checker.add_count((result >> 8) & 0xFF, 8);
 
         core_row.is_valid = F::ONE;
+    }
+}
+
+#[cfg(test)]
+mod air_tests {
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+    type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 1, 1, 4, 4>;
+
+    fn build_row(a_bits: u32) -> Vec<F> {
+        let _chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let mut buf = vec![F::ZERO; FclassCoreCols::<F>::width()];
+        let row: &mut FclassCoreCols<F> = buf.as_mut_slice().borrow_mut();
+        let result = fclass_s(a_bits);
+        let a_sign = (a_bits >> 31) & 1;
+        let a_exp = (a_bits >> 23) & 0xFF;
+        let a_mant = a_bits & 0x7FFFFF;
+
+        for i in 0..4 {
+            row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
+            row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        }
+        row.a_sign = F::from_u32(a_sign);
+        row.a_exp_lo = F::from_u32(a_exp & 1);
+        row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+        row.a_hi = F::from_u32(a_exp >> 1);
+        row.a_exp_is_zero = F::from_bool(a_exp == 0);
+        row.a_exp_is_max = F::from_bool(a_exp == 255);
+        row.a_exp_zero_inv = if a_exp != 0 {
+            F::from_u32(a_exp).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        row.a_exp_max_inv = if a_exp != 255 {
+            (F::from_u32(255) - F::from_u32(a_exp))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
+        row.a_mant_is_zero = F::from_bool(a_mant == 0);
+        row.a_mant_sum_inv = if a_mant != 0 {
+            F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        let a_mant2 = (a_mant >> 16) & 0x7F;
+        row.a_quiet = F::from_u32(a_mant2 >> 6);
+        row.a_mant2_lo = F::from_u32(a_mant2 & 0x3F);
+        let is_nan = a_exp == 255 && a_mant != 0;
+        let is_inf = a_exp == 255 && a_mant == 0;
+        let is_zero = a_exp == 0 && a_mant == 0;
+        let is_sub = a_exp == 0 && a_mant != 0;
+        row.nan_sel = F::from_bool(is_nan);
+        row.inf_sel = F::from_bool(is_inf);
+        row.zero_sel = F::from_bool(is_zero);
+        row.sub_sel = F::from_bool(is_sub);
+        row.is_special = F::from_bool(is_nan || is_inf || is_zero || is_sub);
+        row.is_valid = F::ONE;
+        buf
+    }
+
+    fn eval_row(buf: &[F]) -> NumericBuilder<F> {
+        let air = FclassCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
+        let mut b = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air, &mut b, buf, F::ZERO);
+        b
+    }
+
+    #[test]
+    fn honest_rows_pass() {
+        for a in [
+            1.5f32.to_bits(),
+            (-1.5f32).to_bits(),
+            0x7FC00000, // qNaN
+            0x7FA00001, // sNaN
+            0x7F800000, // inf
+            0xFF800000, // -inf
+            0x00000000, // +0
+            0x80000000, // -0
+            0x00400000, // subnormal
+            0x80400000, // -subnormal
+        ] {
+            let buf = build_row(a);
+            assert!(eval_row(&buf).ok(), "fclass honest failed: a={a:08x}");
+        }
+    }
+
+    #[test]
+    fn sign_flip_rejected() {
+        let mut buf = build_row(1.5f32.to_bits());
+        {
+            let row: &mut FclassCoreCols<F> = buf.as_mut_slice().borrow_mut();
+            row.a_sign = F::ONE - row.a_sign;
+            row.a_hi -= F::from_u32(128);
+        }
+        assert!(!eval_row(&buf).ok(), "a_sign flip accepted");
     }
 }
