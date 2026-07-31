@@ -71,6 +71,7 @@ pub struct FcvtI2FCoreCols<T> {
     pub rc1: T,     // rounding carry out of mantissa byte 1
     pub rc2: T,     // rounding carry into the implicit bit (exponent)
     pub rc2_rem: T, // rounded top 7 mantissa bits
+    pub y2_lo7: T,  // shrn.y[2] - 128 (implicit-bit anchor, 7 bits)
 
     pub result: [T; 4],
     pub is_valid: T,
@@ -130,6 +131,11 @@ where
 
         // ── Input decomposition ──────────────────────────────────────────
         builder.assert_eq(cols.a[3], cols.a_hi + cols.a_sign * f128);
+        // Pin the decomposition: a_hi must be range-checked to 7 bits, or
+        // a_sign is a free field choice (result sign / negation path).
+        self.range_bus
+            .range_check(cols.a_hi.into(), 7)
+            .eval(builder, cols.is_valid.into());
         let a_sum = cols.a[0] + cols.a[1] + cols.a[2] + cols.a[3];
         builder
             .when(cols.is_valid)
@@ -313,10 +319,17 @@ impl FcvtI2FCoreAir {
             .when(s)
             .assert_eq(cols.result[1] + cols.rc1 * f256, cols.shrn.y[1] + cols.rc0);
         // top7c = (shrn.y[2] - 128) + rc1 = rc2_rem + rc2*128.
-        builder.when(s).assert_eq(
-            (cols.shrn.y[2] - f128) + cols.rc1,
-            cols.rc2_rem + cols.rc2 * f128,
-        );
+        // The implicit bit must be present: enforce y[2] >= 128 directly
+        // (otherwise shift = honest+1 slips through when rc1 = 1).
+        builder
+            .when(s)
+            .assert_eq(cols.shrn.y[2], cols.y2_lo7 + f128);
+        self.range_bus
+            .range_check(cols.y2_lo7.into(), 7)
+            .eval(builder, s);
+        builder
+            .when(s)
+            .assert_eq(cols.y2_lo7 + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s);
@@ -469,6 +482,8 @@ where
         }
         core_row.a_sign = F::from_u32((a_bits >> 31) & 1);
         core_row.a_hi = F::from_u32(((a_bits >> 24) & 0xFF) & 0x7F);
+        self.range_checker
+            .add_count(((a_bits >> 24) & 0xFF) & 0x7F, 7);
         let a_sum: u32 = (a_bits & 0xFF)
             + ((a_bits >> 8) & 0xFF)
             + ((a_bits >> 16) & 0xFF)
@@ -583,7 +598,9 @@ where
             core_row.rc1 = F::from_u32(rc1);
             core_row.rc2 = F::from_u32(rc2);
             core_row.rc2_rem = F::from_u32(rc2_rem);
+            core_row.y2_lo7 = F::from_u32(y2v - 128);
             self.range_checker.add_count(rc2_rem, 7);
+            self.range_checker.add_count(y2v - 128, 7);
             // Sanity: the reconstructed exponent must match the native result.
             debug_assert_eq!(
                 (e_unrounded - 126) + 126 + rc2,
@@ -602,6 +619,7 @@ where
             core_row.rc1 = F::ZERO;
             core_row.rc2 = F::ZERO;
             core_row.rc2_rem = F::ZERO;
+            core_row.y2_lo7 = F::ZERO;
         }
 
         core_row.is_valid = F::ONE;
