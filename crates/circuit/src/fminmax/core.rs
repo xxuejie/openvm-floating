@@ -681,4 +681,85 @@ mod air_tests {
     // are caught only by the 7-bit range-check *bus sends*, which
     // NumericBuilder ignores. They must be covered by prover-level
     // bite-checks (hardening item 2), not numeric tests.
+
+    /// Every column must be constrained: perturbing any single column by +1
+    /// must break at least one gate constraint (except columns whose only
+    /// constraint is a range-check bus send — those are whitelisted here).
+    #[test]
+    fn corruption_sweep_finds_no_unconstrained_witness() {
+        use crate::test_utils::corruption_sweep;
+        use openvm_circuit_primitives::StructReflectionHelper;
+
+        let names = FminmaxCoreCols::<F>::struct_reflection().unwrap_or_default();
+        // Whitelist rationale:
+        // - range-bus-only: NumericBuilder ignores bus sends, so +1 is accepted;
+        //   the real prover range-checks them (see eval).
+        // - `a/b_exp_max_inv`, `a/b_mant_sum_inv`: `flag = 1 - delta * inv` with
+        //   `assert_zero(delta * flag)`; `inv` is multiplied by 0 exactly when the
+        //   corresponding delta is 0 (exp 255 / zero mantissa), where the flag is
+        //   pinned to 1 by the other side of the equation.
+        // - `lt_aux_cols`: IsLtArraySubAir aux; only the limbs of a zero diff are
+        //   free (nothing to decompose), covered by the diff != 0 classes below.
+        let whitelist: std::collections::HashSet<usize> = {
+            let mut s = std::collections::HashSet::new();
+            for name in [
+                "a_mant2",
+                "b_mant2",
+                "a_hi",
+                "b_hi",
+                "key_a",
+                "key_b",
+                "a_exp_max_inv",
+                "b_exp_max_inv",
+                "a_mant_sum_inv",
+                "b_mant_sum_inv",
+                "lt_aux_cols",
+            ] {
+                for (i, n) in names.iter().enumerate() {
+                    if n == name || n.starts_with(&format!("{name}__")) {
+                        s.insert(i);
+                    }
+                }
+            }
+            s
+        };
+
+        let classes: &[(u32, u32)] = &[
+            (1.0f32.to_bits(), 2.0f32.to_bits()),
+            (0x7FC00000, 0x3F800000), // qNaN vs 1.0
+            (0x7FC00000, 0x7FA00001), // both NaN
+            (0x80000000, 0x00000000), // -0 vs +0
+            (0x7F800000, 0xFF800000), // inf vs -inf
+            (0x00400000, 0x3F800000), // subnormal vs 1.0
+        ];
+
+        for is_min in [true, false] {
+            for (a, b) in classes {
+                let row = build_row(*a, *b, is_min);
+                let accepted = corruption_sweep(&row, |builder, cols| {
+                    VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+                        &FminmaxCoreAir::new(
+                            VariableRangeCheckerBus::new(0, 16),
+                            FpOpcode::CLASS_OFFSET,
+                        ),
+                        builder,
+                        cols,
+                        F::ZERO,
+                    );
+                });
+                let unexpected: Vec<usize> = accepted
+                    .into_iter()
+                    .filter(|i| !whitelist.contains(i))
+                    .collect();
+                assert!(
+                    unexpected.is_empty(),
+                    "fminmax min={is_min} a={a:08x} b={b:08x}: unconstrained columns {:?}",
+                    unexpected
+                        .iter()
+                        .map(|&i| (i, names.get(i).cloned().unwrap_or_default()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 }

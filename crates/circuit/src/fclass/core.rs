@@ -507,4 +507,80 @@ mod air_tests {
     // are caught only by the 7-bit range-check *bus sends*, which
     // NumericBuilder ignores. They must be covered by prover-level
     // bite-checks (hardening item 2), not numeric tests.
+
+    /// Every column must be constrained: perturbing any single column by +1
+    /// must break at least one gate constraint (except columns whose only
+    /// constraint is a range-check bus send — those are whitelisted here).
+    #[test]
+    fn corruption_sweep_finds_no_unconstrained_witness() {
+        use crate::test_utils::corruption_sweep;
+        use openvm_circuit_primitives::StructReflectionHelper;
+
+        let names = FclassCoreCols::<F>::struct_reflection().unwrap_or_default();
+        // Whitelist rationale:
+        // - range-bus-only (`a_mant2`, `a_hi`, `a_quiet`, `a_mant2_lo`):
+        //   NumericBuilder ignores bus sends, so +1 is accepted; the real prover
+        //   range-checks them (see eval).
+        // - `a_exp_zero_inv`, `a_exp_max_inv`, `a_mant_sum_inv`: `flag = 1 - delta * inv`
+        //   with `assert_zero(delta * flag)`; `inv` is multiplied by 0 exactly when the
+        //   corresponding delta is 0 (exp 0/255, zero mantissa), where the flag is pinned
+        //   to 1 by the other side of the equation.
+        let whitelist: std::collections::HashSet<usize> = {
+            let mut s = std::collections::HashSet::new();
+            for name in [
+                "a_mant2",
+                "a_hi",
+                "a_quiet",
+                "a_mant2_lo",
+                "a_exp_zero_inv",
+                "a_exp_max_inv",
+                "a_mant_sum_inv",
+            ] {
+                for (i, n) in names.iter().enumerate() {
+                    if n == name || n.starts_with(&format!("{name}__")) {
+                        s.insert(i);
+                    }
+                }
+            }
+            s
+        };
+
+        for a in [
+            1.5f32.to_bits(),
+            (-1.5f32).to_bits(),
+            0x7FC00000, // qNaN
+            0x7FA00001, // sNaN
+            0x7F800000, // inf
+            0xFF800000, // -inf
+            0x00000000, // +0
+            0x80000000, // -0
+            0x00400000, // subnormal
+            0x80400000, // -subnormal
+        ] {
+            let row = build_row(a);
+            let accepted = corruption_sweep(&row, |builder, cols| {
+                VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+                    &FclassCoreAir::new(
+                        VariableRangeCheckerBus::new(0, 16),
+                        FpOpcode::CLASS_OFFSET,
+                    ),
+                    builder,
+                    cols,
+                    F::ZERO,
+                );
+            });
+            let unexpected: Vec<usize> = accepted
+                .into_iter()
+                .filter(|i| !whitelist.contains(i))
+                .collect();
+            assert!(
+                unexpected.is_empty(),
+                "fclass a={a:08x}: unconstrained columns {:?}",
+                unexpected
+                    .iter()
+                    .map(|&i| (i, names.get(i).cloned().unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

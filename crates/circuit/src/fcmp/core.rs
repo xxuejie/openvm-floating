@@ -771,4 +771,83 @@ mod air_tests {
     // are caught only by the 7-bit range-check *bus sends*, which
     // NumericBuilder ignores. They must be covered by prover-level
     // bite-checks (hardening item 2), not numeric tests.
+
+    /// Every column must be constrained: perturbing any single column by +1
+    /// must break at least one gate constraint (except columns whose only
+    /// constraint is a range-check bus send — those are whitelisted here).
+    #[test]
+    fn corruption_sweep_finds_no_unconstrained_witness() {
+        use crate::test_utils::corruption_sweep;
+        use openvm_circuit_primitives::StructReflectionHelper;
+
+        let names = FcmpCoreCols::<F>::struct_reflection().unwrap_or_default();
+        // Columns whose only constraint is a range-check bus send: NumericBuilder
+        // ignores interactions, so a +1 perturbation is accepted even though the
+        // real prover rejects it. Verified constrained by the bus (see eval).
+        // The `*_inv` inverse witnesses follow the uniform pattern
+        // `flag = 1 - delta * inv` + `assert_zero(delta * flag)`: when `delta == 0`
+        // the flag is pinned to 1 by the constraint and `inv` is multiplied by 0
+        // (hence free); when `delta != 0` the equation pins `inv = (1 - flag)/delta`.
+        // The sweep matrix covers delta == 0 (exp 0/255, zero mantissa) and delta != 0
+        // (normal exp, non-zero mantissa) classes, confirming the pin on the latter.
+        let range_bus_only: std::collections::HashSet<usize> = {
+            let mut s = std::collections::HashSet::new();
+            for name in [
+                "a_mant2",
+                "b_mant2",
+                "a_hi",
+                "b_hi",
+                "key_a",
+                "key_b",
+                "lt_ab_aux",
+                "lt_ba_aux",
+                "a_exp_zero_inv",
+                "b_exp_zero_inv",
+                "a_exp_max_inv",
+                "b_exp_max_inv",
+                "a_mant_sum_inv",
+                "b_mant_sum_inv",
+            ] {
+                for (i, n) in names.iter().enumerate() {
+                    if n == name || n.starts_with(&format!("{name}__")) {
+                        s.insert(i);
+                    }
+                }
+            }
+            s
+        };
+
+        let classes: &[(u32, u32, FcmpOp)] = &[
+            (1.0f32.to_bits(), 2.0f32.to_bits(), FcmpOp::Lt),
+            (1.5f32.to_bits(), 2.5f32.to_bits(), FcmpOp::Eq),
+            (0x7FC00000, 0x3F800000, FcmpOp::Eq), // qNaN vs 1.0
+            (0x80000000, 0x00000000, FcmpOp::Le), // -0 vs +0
+            (0x7F800000, 0xFF800000, FcmpOp::Eq), // inf vs -inf
+            (0x00400000, 0x3F800000, FcmpOp::Lt), // subnormal vs 1.0
+        ];
+
+        for (a, b, op) in classes {
+            let row = build_row(*a, *b, *op);
+            let accepted = corruption_sweep(&row, |builder, cols| {
+                VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+                    &FcmpCoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET),
+                    builder,
+                    cols,
+                    F::ZERO,
+                );
+            });
+            let unexpected: Vec<usize> = accepted
+                .into_iter()
+                .filter(|i| !range_bus_only.contains(i))
+                .collect();
+            assert!(
+                unexpected.is_empty(),
+                "fcmp a={a:08x} b={b:08x} op={op:?}: unconstrained columns {:?}",
+                unexpected
+                    .iter()
+                    .map(|&i| (i, names.get(i).cloned().unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

@@ -8,6 +8,7 @@
 //! which is verified separately by the real prover; this builder exercises the
 //! polynomial (gate) constraints only.
 
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 
 use openvm_stark_backend::{
@@ -100,6 +101,40 @@ where
     fn all_interactions(&self) -> &[Interaction<Self::Expr>] {
         &[]
     }
+}
+
+/// Sweeps every column of a single trace row: perturbs the honest value by +1
+/// and re-evaluates the AIR. Returns the column indices whose perturbation is
+/// *accepted* (i.e. the constraint set did not react to the change) — these are
+/// candidate unconstrained witness columns.
+///
+/// # Notes
+/// - The interaction (LogUp) side is ignored here (see [NumericBuilder]), so a
+///   column whose only constraint is a *range-check bus send* will show up as a
+///   false positive. Such columns must be validated with prover-level bite-checks.
+/// - Callers are expected to run the sweep per input class and triage: a column
+///   may be legitimately free when its path is disabled, but must be constrained
+///   on at least the classes where it feeds the result.
+pub fn corruption_sweep<F, C: ?Sized>(
+    honest: &[F],
+    air_fn: impl Fn(&mut NumericBuilder<F>, &C),
+) -> Vec<usize>
+where
+    F: Field + PrimeCharacteristicRing + Copy + Default,
+    [F]: Borrow<C>,
+{
+    let mut accepted = Vec::new();
+    for i in 0..honest.len() {
+        let mut row = honest.to_vec();
+        row[i] += F::ONE;
+        let cols: &C = row.as_slice().borrow();
+        let mut b = NumericBuilder::new(vec![]);
+        air_fn(&mut b, cols);
+        if b.ok() {
+            accepted.push(i);
+        }
+    }
+    accepted
 }
 
 #[cfg(test)]

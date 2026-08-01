@@ -90,3 +90,37 @@ fn no_flag_set_is_rejected() {
         "zero opcode flags on a valid row must be rejected"
     );
 }
+
+/// Every column must be constrained: perturbing any single column by +1 must
+/// break at least one gate constraint. fxfer has no range-check bus, so no
+/// whitelist is needed.
+#[test]
+fn corruption_sweep_finds_no_unconstrained_witness() {
+    use crate::test_utils::corruption_sweep;
+    use openvm_circuit_primitives::StructReflectionHelper;
+
+    let names = FxferCoreCols::<F>::struct_reflection().unwrap_or_default();
+    for (data, opcode) in [
+        (3.5f32.to_bits().to_le_bytes(), FpOpcode::FMV_X_S),
+        ((-2.25f32).to_bits().to_le_bytes(), FpOpcode::FMV_S_X),
+        ([0x00, 0xFF, 0x80, 0x7F], FpOpcode::FMV_X_S),
+    ] {
+        let row = build_row(data, opcode, true);
+        let accepted = corruption_sweep(&row, |builder, cols| {
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+                &FxferCoreAir::new(FpOpcode::CLASS_OFFSET),
+                builder,
+                cols,
+                F::ZERO,
+            );
+        });
+        assert!(
+            accepted.is_empty(),
+            "fxfer opcode={opcode:?} data={data:?}: unconstrained columns {:?}",
+            accepted
+                .iter()
+                .map(|&i| (i, names.get(i).cloned().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        );
+    }
+}

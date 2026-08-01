@@ -312,4 +312,68 @@ mod air_tests {
     // are caught only by the 7-bit range-check *bus sends*, which
     // NumericBuilder ignores. They must be covered by prover-level
     // bite-checks (hardening item 2), not numeric tests.
+
+    /// Every column must be constrained: perturbing any single column by +1
+    /// must break at least one gate constraint (except columns whose only
+    /// constraint is a range-check bus send — those are whitelisted here).
+    #[test]
+    fn corruption_sweep_finds_no_unconstrained_witness() {
+        use crate::test_utils::corruption_sweep;
+        use openvm_circuit_primitives::StructReflectionHelper;
+
+        let names = FsgnjCoreCols::<F>::struct_reflection().unwrap_or_default();
+        // Whitelist rationale:
+        // - `a/b_byte3_lo`: constrained only by the 7-bit range-check bus send,
+        //   which NumericBuilder ignores; the real prover range-checks them.
+        // - `b__0..2`: the low 24 bits of `b` do not affect the result (RISC-V
+        //   FSGNJ only copies `b`'s sign bit); they are pinned by the adapter's
+        //   memory read at rs2 (reads[1] is sent on the memory bus), which
+        //   NumericBuilder ignores.
+        let whitelist: std::collections::HashSet<usize> = {
+            let mut s = std::collections::HashSet::new();
+            for name in ["a_byte3_lo", "b_byte3_lo", "b__0", "b__1", "b__2"] {
+                for (i, n) in names.iter().enumerate() {
+                    if n == name || n.starts_with(&format!("{name}__")) {
+                        s.insert(i);
+                    }
+                }
+            }
+            s
+        };
+
+        for op in [FpOpcode::FSGNJ_S, FpOpcode::FSGNJN_S, FpOpcode::FSGNJX_S] {
+            for (a, b) in [
+                (1.0f32.to_bits(), (-2.0f32).to_bits()),
+                (0x7FC00000, 0x3F800000), // qNaN vs 1.0
+                (0x80000000, 0x00000000), // -0 vs +0
+                (0x7F800000, 0xFF800000), // inf vs -inf
+                (0x00400000, 0x3F800000), // subnormal vs 1.0
+            ] {
+                let row = build_row(a, b, op);
+                let accepted = corruption_sweep(&row, |builder, cols| {
+                    VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+                        &FsgnjCoreAir::new(
+                            VariableRangeCheckerBus::new(0, 16),
+                            FpOpcode::CLASS_OFFSET,
+                        ),
+                        builder,
+                        cols,
+                        F::ZERO,
+                    );
+                });
+                let unexpected: Vec<usize> = accepted
+                    .into_iter()
+                    .filter(|i| !whitelist.contains(i))
+                    .collect();
+                assert!(
+                    unexpected.is_empty(),
+                    "fsgnj {op:?} a={a:08x} b={b:08x}: unconstrained columns {:?}",
+                    unexpected
+                        .iter()
+                        .map(|&i| (i, names.get(i).cloned().unwrap_or_default()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 }
