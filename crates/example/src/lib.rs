@@ -2457,7 +2457,44 @@ mod chip_proving_tests {
         let mut mem = SparseMemoryImage::new();
         write_int_reg_bits(&mut mem, 1, 0x1000);
         write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
-        prove_program(vec![flw(5, 1, 0), terminate()], mem);
+        write_fp_reg_bits(&mut mem, 2, (-2.25f32).to_bits());
+        prove_program(
+            vec![
+                flw(5, 1, 0),  // f5 = load(0x1000) = 3.5
+                fsw(1, 2, 0),  // store f2 (-2.25) to memory[0x1000]
+                flw(6, 1, 16), // f6 = load(0x1010) = 0
+                fsw(1, 5, 16), // store f5 (3.5) to memory[0x1010]
+                flw(7, 1, 16), // f7 = load(0x1010) = 3.5
+                terminate(),
+            ],
+            mem,
+        );
+    }
+
+    #[test]
+    fn test_prove_flw_fsw_fuzz() {
+        // Random 4-aligned addresses / values through store-then-load round trips.
+        let mut mem = SparseMemoryImage::new();
+        let mut instrs = Vec::new();
+        let mut rng = 0x5EED_1234u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        write_int_reg_bits(&mut mem, 1, 0x1000);
+        for i in 0..12u32 {
+            let rd = 10 + i; // FP dest reg
+            let src = 5 + i; // FP source reg
+            let val = next() as u32;
+            write_fp_reg_bits(&mut mem, src, val);
+            let off = (next() as u32) & 0xFFC; // 4-aligned
+            instrs.push(fsw(1, src, off));
+            instrs.push(flw(rd, 1, off));
+        }
+        instrs.push(terminate());
+        prove_program(instrs, mem);
     }
 }
 
@@ -2500,6 +2537,18 @@ mod bite_checks {
                 .iter()
                 .position(|n| n == name)
                 .unwrap_or_else(|| panic!("core column {name} not found"))
+    }
+
+    /// Trace column index of an adapter column, given the adapter cols type `A`.
+    fn adapter_col<A>(name: &str) -> usize
+    where
+        A: StructReflectionHelper,
+    {
+        A::struct_reflection()
+            .unwrap()
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("adapter column {name} not found"))
     }
 
     type E = BabyBearPoseidon2CpuEngine;
@@ -3154,6 +3203,56 @@ mod bite_checks {
             1,
         );
     }
+
+    #[test]
+    fn bite_fmem_imm_sign() {
+        // FLW with imm=0: corrupting imm_sign (bit 15 of the immediate) must fail.
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg_bits(&mut mem, 1, 0x1000);
+        write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+        let col = adapter_col::<Rv32FpMemAdapterCols<u8>>("imm_sign");
+        bite_check(
+            vec![flw(5, 1, 0), terminate()],
+            mem,
+            "FmemCoreAir",
+            0,
+            col,
+            1,
+        );
+    }
+
+    #[test]
+    fn bite_fmem_mem_ptr_limb() {
+        // Corrupting the low address limb must fail (address arithmetic pinned).
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg_bits(&mut mem, 1, 0x1000);
+        write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+        let col = adapter_col::<Rv32FpMemAdapterCols<u8>>("mem_ptr_limbs__0");
+        bite_check(
+            vec![flw(5, 1, 0), terminate()],
+            mem,
+            "FmemCoreAir",
+            0,
+            col,
+            0x1001,
+        );
+    }
+
+    #[test]
+    fn bite_fmove_read_as() {
+        // FMV: corrupting the source address space must fail (pinned by program bus).
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
+        let col = adapter_col::<Rv32FpMoveAdapterCols<u8>>("read_as");
+        bite_check(
+            vec![fmv_x_s(5, 1), terminate()],
+            mem,
+            "FxferCoreAir",
+            0,
+            col,
+            5,
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3204,6 +3303,90 @@ mod f_extension_tests {
             F::ZERO,
             F::ZERO,
         )
+    }
+
+    /// Binary FP op in F mode: all register operands in AS `F_AS`.
+    fn fp_binary_f(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(opcode.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::from_usize(4 * rs2 as usize),
+            F::from_u32(F_AS),
+            F::from_u32(F_AS),
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+
+    fn fsub_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_binary_f(FpOpcode::FSUB_S, rd, rs1, rs2)
+    }
+    fn fdiv_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_binary_f(FpOpcode::FDIV_S, rd, rs1, rs2)
+    }
+    fn fsgnj_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_binary_f(FpOpcode::FSGNJ_S, rd, rs1, rs2)
+    }
+    fn fmin_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_binary_f(FpOpcode::FMIN_S, rd, rs1, rs2)
+    }
+    fn fmax_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_binary_f(FpOpcode::FMAX_S, rd, rs1, rs2)
+    }
+
+    /// Unary FP op in F mode: read/write AS `F_AS`.
+    fn fp_unary_f(opcode: FpOpcode, rd: u32, rs1: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(opcode.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::ZERO,
+            F::from_u32(F_AS),
+            F::from_u32(F_AS),
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+    fn fsqrt_f(rd: u32, rs1: u32) -> Instruction<F> {
+        fp_unary_f(FpOpcode::FSQRT_S, rd, rs1)
+    }
+
+    /// Ternary FP op in F mode (fmadd family): rd/rs1/rs2/rs3 in AS `F_AS`.
+    fn fp_ternary_f(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(opcode.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::from_usize(4 * rs2 as usize),
+            F::from_usize(4 * rs3 as usize),
+            F::from_u32(F_AS),
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+    fn fmadd_f(rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
+        fp_ternary_f(FpOpcode::FMADD_S, rd, rs1, rs2, rs3)
+    }
+
+    /// FP compare in F mode: rs1/rs2 in AS `F_AS`, rd is an integer register (AS 1).
+    fn fp_cmp_f(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(opcode.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::from_usize(4 * rs2 as usize),
+            F::from_u32(RV32_REGISTER_AS), // d: integer register AS
+            F::from_u32(F_AS),             // e: FP register AS
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+    fn fle_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_cmp_f(FpOpcode::FLE_S, rd, rs1, rs2)
+    }
+    fn flt_f(rd: u32, rs1: u32, rs2: u32) -> Instruction<F> {
+        fp_cmp_f(FpOpcode::FLT_S, rd, rs1, rs2)
     }
 
     fn run_f_program(
@@ -3423,6 +3606,72 @@ mod f_extension_tests {
         assert_eq!(read_fpreg_f(&state, 0), 3.5);
         assert_eq!(read_fpreg_f(&state, 3), -2.25);
         assert_eq!(read_mem_bytes(&state, 0x1000), (-2.25f32).to_bits());
+    }
+
+    #[test]
+    fn test_f_ext_remaining_chips() {
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 7.0);
+        write_fpreg_f(&mut mem, 2, 3.0);
+        write_fpreg_f(&mut mem, 3, 5.0);
+        write_fpreg_f(&mut mem, 4, f32::INFINITY);
+        write_fpreg_f(&mut mem, 5, f32::NAN);
+
+        let state = run_f_program(
+            vec![
+                fsub_f(0, 1, 2),     // f0 = 4.0
+                fdiv_f(6, 1, 2),     // f6 = 7/3
+                fsqrt_f(7, 3),       // f7 = sqrt(5)
+                fmadd_f(8, 1, 2, 3), // f8 = 7*3+5 = 26
+                fsgnj_f(9, 1, 2),    // f9 = sign(3)*|7| = 7
+                fmin_f(10, 1, 2),    // f10 = 3.0
+                fmax_f(11, 2, 4),    // f11 = inf
+                fle_f(12, 1, 2),     // int r12 = 7 <= 3 = 0
+                flt_f(13, 2, 1),     // int r13 = 3 < 7 = 1
+                terminate(),
+            ],
+            mem,
+        );
+
+        assert_eq!(read_fpreg_f(&state, 0), 4.0);
+        assert_eq!(read_fpreg_f(&state, 6), 7.0 / 3.0);
+        assert_eq!(read_fpreg_f(&state, 7), 5.0f32.sqrt());
+        assert_eq!(read_fpreg_f(&state, 8), 26.0);
+        assert_eq!(read_fpreg_f(&state, 9), 7.0);
+        assert_eq!(read_fpreg_f(&state, 10), 3.0);
+        assert_eq!(read_fpreg_f(&state, 11), f32::INFINITY);
+        assert_eq!(read_int_reg_bits(&state, 12), 0);
+        assert_eq!(read_int_reg_bits(&state, 13), 1);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_remaining_chips_f() {
+        use openvm_circuit::utils::air_test;
+        use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 7.0);
+        write_fpreg_f(&mut mem, 2, 3.0);
+        write_fpreg_f(&mut mem, 3, 5.0);
+
+        let program = Program::new_without_debug_infos(
+            &vec![
+                fsub_f(0, 1, 2),     // f0 = 4.0
+                fdiv_f(6, 1, 2),     // f6 = 7/3
+                fsqrt_f(7, 3),       // f7 = sqrt(5)
+                fmadd_f(8, 1, 2, 3), // f8 = 26
+                fsgnj_f(9, 1, 2),    // f9 = 7
+                fmin_f(10, 1, 2),    // f10 = 3
+                fmax_f(11, 2, 4),    // f11 = max(3, 0) = 3
+                fle_f(12, 1, 2),     // int r12 = 0
+                flt_f(13, 2, 1),     // int r13 = 1
+                terminate(),
+            ],
+            0,
+        );
+        let exe = VmExe::new(program).with_init_memory(mem);
+        air_test(Rv32FCpuBuilder, Rv32FConfig::new_f(), exe);
     }
 
     #[cfg(feature = "proving")]
