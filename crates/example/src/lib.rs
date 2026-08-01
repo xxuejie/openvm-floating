@@ -1768,9 +1768,12 @@ mod fuzz_tests {
         cases.push((0x00800000, 0x80800001)); // min_normal - (min_normal+1ulp)
         cases.push((0x00800000, 0x807FFFFF)); // min_normal - (min_normal-1ulp)
         cases.push((0x00000001, 0x80000001)); // min_sub - min_sub = +0
-                                              // Subnormal operands.
+                                              // Subnormal operands (incl. both-subnormal -> subnormal result).
         cases.push((0x00000001, 0x3F800000)); // min subnormal + 1.0
         cases.push((0x00400000, 0x80400000)); // subnormal - subnormal
+        cases.push((0x00000001, 0x00000001)); // min_sub + min_sub = 2*min_sub
+        cases.push((0x007FFFFF, 0x007FFFFF)); // max_sub + max_sub (round to normal)
+        cases.push((0x00400000, 0x00000001)); // sub + min_sub
                                               // 15 rows per chunk: the register file has only 32 entries.
         for chunk in cases.chunks(15) {
             let (instrs, mem) =
