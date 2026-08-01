@@ -2257,9 +2257,431 @@ mod chip_proving_tests {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// F extension mode tests (separate FP register file, AS 5)
+// STARK-level bite-checks (hardening item 2)
+//
+// Each bite-check builds a full proving context, verifies the honest trace
+// satisfies every constraint + LogUp bus balance, then corrupts a single
+// witness column and asserts the corruption is caught by the debug constraint
+// checker (the same checks `air_test` runs before proving).
 // ════════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "proving")]
+#[cfg(test)]
+mod bite_checks {
+    use openvm_circuit::arch::{
+        debug_proving_ctx, execution_mode::Segment, PreflightExecutionOutput, Streams,
+        VirtualMachine,
+    };
+    use openvm_circuit_primitives::StructReflectionHelper;
+    use openvm_rv32f_circuit::{adapters::Rv32FpAdapterCols, Rv32FCpuBuilder};
+    use openvm_stark_sdk::{
+        config::baby_bear_poseidon2::BabyBearPoseidon2CpuEngine,
+        openvm_stark_backend::{
+            p3_field::PrimeCharacteristicRing, prover::ProvingContext, StarkEngine, SystemParams,
+        },
+    };
+
+    use super::*;
+
+    /// Absolute trace column index of a core column, given the adapter cols type
+    /// `A` (u8 instantiation: `size_of` == number of columns) and core cols type `C`.
+    fn core_col<A, C>(name: &str) -> usize
+    where
+        C: StructReflectionHelper,
+    {
+        std::mem::size_of::<A>()
+            + C::struct_reflection()
+                .unwrap()
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("core column {name} not found"))
+    }
+
+    type E = BabyBearPoseidon2CpuEngine;
+
+    /// Runs a single program to a proving context (honest). Panics if the honest
+    /// trace does not satisfy all constraints + LogUp balances.
+    fn build_ctx(
+        instrs: Vec<Instruction<F>>,
+        init_memory: SparseMemoryImage,
+    ) -> (
+        VirtualMachine<E, Rv32FCpuBuilder>,
+        ProvingContext<<E as StarkEngine>::PB>,
+    ) {
+        let program = Program::new_without_debug_infos(&instrs, 0);
+        let exe = VmExe::new(program).with_init_memory(init_memory);
+        let params = SystemParams::new_for_testing(22);
+        let engine = E::new(params);
+        let (mut vm, _pk) = VirtualMachine::<E, Rv32FCpuBuilder>::new_with_keygen(
+            engine,
+            Rv32FCpuBuilder,
+            Rv32FConfig::default(),
+        )
+        .expect("keygen");
+        let metered_ctx = vm.build_metered_ctx(&exe);
+        let (segments, _) = vm
+            .metered_interpreter(&exe)
+            .expect("metered interpreter")
+            .execute_metered(Streams::default(), metered_ctx.clone())
+            .expect("metered execution");
+        let cached_program_trace = vm.commit_program_on_device(&exe.program);
+        vm.load_program(cached_program_trace);
+        let mut preflight_interpreter = vm
+            .preflight_interpreter(&exe)
+            .expect("preflight interpreter");
+        let mut state = Some(vm.create_initial_state(&exe, Streams::default()));
+        let mut ctx = None;
+        for segment in &segments {
+            let Segment {
+                num_insns,
+                trace_heights,
+                ..
+            } = segment.clone();
+            let from_state = Option::take(&mut state).expect("state");
+            vm.transport_init_memory_to_device(&from_state.memory);
+            let PreflightExecutionOutput {
+                system_records,
+                record_arenas,
+                to_state,
+            } = vm
+                .execute_preflight(
+                    &mut preflight_interpreter,
+                    from_state,
+                    Some(num_insns),
+                    &trace_heights,
+                )
+                .expect("preflight");
+            state = Some(to_state);
+            ctx = Some(
+                vm.generate_proving_ctx(system_records, record_arenas)
+                    .expect("proving ctx"),
+            );
+        }
+        let ctx = ctx.expect("empty segments");
+        debug_proving_ctx(&vm, &ctx);
+        (vm, ctx)
+    }
+
+    /// Corrupts cell `(row, col)` of the AIR whose name contains `air_name_substr`
+    /// and asserts the corrupted trace is rejected by the constraint + LogUp check.
+    fn bite_check(
+        instrs: Vec<Instruction<F>>,
+        init_memory: SparseMemoryImage,
+        air_name_substr: &str,
+        row: usize,
+        col: usize,
+        bad_val: u32,
+    ) {
+        let (vm, mut ctx) = build_ctx(instrs, init_memory);
+        let air_id = vm
+            .air_names()
+            .position(|n| n.contains(air_name_substr))
+            .unwrap_or_else(|| panic!("no air matching {air_name_substr}"));
+        let (_, air_ctx) = ctx
+            .per_trace
+            .iter_mut()
+            .find(|(id, _)| *id == air_id)
+            .unwrap_or_else(|| panic!("air {air_name_substr} has no non-empty trace"));
+        let width = air_ctx.common_main.width;
+        let height = air_ctx.common_main.values.len() / width;
+        assert!(
+            row < height,
+            "bite row {row} out of bounds (height {height})"
+        );
+        assert!(col < width, "bite col {col} out of bounds (width {width})");
+        air_ctx.common_main.values[row * width + col] =
+            <_ as PrimeCharacteristicRing>::from_u32(bad_val);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            debug_proving_ctx(&vm, &ctx);
+        }));
+        assert!(
+            caught.is_err(),
+            "corruption of {air_name_substr} (row={row}, col={col} -> {bad_val:#x}) was NOT caught"
+        );
+    }
+
+    /// Bite-check for a binary op: corrupt the low result byte.
+    fn bite_result_binary<A, C>(
+        rd: u32,
+        rs1: u32,
+        rs2: u32,
+        a: f32,
+        b: f32,
+        air: &str,
+        make: impl Fn(u32, u32, u32) -> Instruction<F>,
+    ) where
+        C: StructReflectionHelper,
+    {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, rs1, a);
+        write_fp_reg(&mut mem, rs2, b);
+        let col = core_col::<A, C>("result__0");
+        bite_check(
+            vec![make(rd, rs1, rs2), terminate()],
+            mem,
+            air,
+            0,
+            col,
+            0x55,
+        );
+    }
+
+    /// Bite-check for a unary op: corrupt the low result byte.
+    fn bite_result_unary<A, C>(
+        rd: u32,
+        rs1: u32,
+        a: u32,
+        air: &str,
+        make: impl Fn(u32, u32) -> Instruction<F>,
+    ) where
+        C: StructReflectionHelper,
+    {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, rs1, a);
+        let col = core_col::<A, C>("result__0");
+        bite_check(vec![make(rd, rs1), terminate()], mem, air, 0, col, 0x55);
+    }
+
+    use openvm_rv32f_circuit::adapters::{Rv32Fp3AdapterCols, Rv32FpUnaryAdapterCols};
+    use openvm_rv32f_circuit::{
+        fadd::FaddCoreCols, fclass::FclassCoreCols, fcmp::FcmpCoreCols, fcvt_f2i::FcvtF2ICoreCols,
+        fcvt_i2f::FcvtI2FCoreCols, fdiv::FdivCoreCols, fma::FmaCoreCols, fminmax::FminmaxCoreCols,
+        fmul::FmulCoreCols, fsgnj::FsgnjCoreCols, fsqrt::FsqrtCoreCols, fsub::FsubCoreCols,
+        fxfer::FxferCoreCols,
+    };
+
+    // ── fadd ────────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fadd_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FaddCoreCols<F>>(
+            0,
+            1,
+            2,
+            1.5,
+            2.5,
+            "FaddCoreAir",
+            fadd_s,
+        );
+    }
+
+    // ── fsub ────────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fsub_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FsubCoreCols<F>>(
+            0,
+            1,
+            2,
+            7.0,
+            3.0,
+            "FsubCoreAir",
+            fsub_s,
+        );
+    }
+
+    // ── fmul ────────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fmul_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FmulCoreCols<F>>(
+            0,
+            1,
+            2,
+            3.0,
+            4.0,
+            "FmulCoreAir",
+            fmul_s,
+        );
+    }
+
+    // ── fdiv ────────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fdiv_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FdivCoreCols<F>>(
+            0,
+            1,
+            2,
+            7.0,
+            2.0,
+            "FdivCoreAir",
+            fdiv_s,
+        );
+    }
+
+    // ── fsgnj ───────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fsgnj_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FsgnjCoreCols<F>>(
+            0,
+            1,
+            2,
+            3.5,
+            -2.0,
+            "FsgnjCoreAir",
+            fsgnj_s,
+        );
+    }
+
+    // ── fminmax ─────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fminmax_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FminmaxCoreCols<F>>(
+            0,
+            1,
+            2,
+            3.0,
+            4.0,
+            "FminmaxCoreAir",
+            fmin_s,
+        );
+    }
+
+    // ── fcmp ────────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fcmp_result_byte() {
+        bite_result_binary::<Rv32FpAdapterCols<u8>, FcmpCoreCols<F>>(
+            0,
+            1,
+            2,
+            1.0,
+            2.0,
+            "FcmpCoreAir",
+            fle_s,
+        );
+    }
+
+    // ── fclass ──────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fclass_result_byte() {
+        bite_result_unary::<Rv32FpUnaryAdapterCols<u8>, FclassCoreCols<F>>(
+            0,
+            1,
+            1.5f32.to_bits(),
+            "FclassCoreAir",
+            fclass_s,
+        );
+    }
+
+    // ── fcvt_f2i ────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fcvt_f2i_result_byte() {
+        bite_result_unary::<Rv32FpUnaryAdapterCols<u8>, FcvtF2ICoreCols<F>>(
+            0,
+            1,
+            3.7f32.to_bits(),
+            "FcvtF2ICoreAir",
+            fcvt_w_s,
+        );
+    }
+
+    // ── fcvt_i2f ────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fcvt_i2f_result_byte() {
+        bite_result_unary::<Rv32FpUnaryAdapterCols<u8>, FcvtI2FCoreCols<F>>(
+            0,
+            1,
+            42,
+            "FcvtI2FCoreAir",
+            fcvt_s_w,
+        );
+    }
+
+    // ── fsqrt ───────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fsqrt_result_byte() {
+        bite_result_unary::<Rv32FpUnaryAdapterCols<u8>, FsqrtCoreCols<F>>(
+            0,
+            1,
+            4.0f32.to_bits(),
+            "FsqrtCoreAir",
+            fsqrt_s,
+        );
+    }
+
+    // ── fma ─────────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fma_result_byte() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 2.0);
+        write_fp_reg(&mut mem, 2, 3.0);
+        write_fp_reg(&mut mem, 3, 4.0);
+        let col = core_col::<Rv32Fp3AdapterCols<u8>, FmaCoreCols<F>>("result__0");
+        bite_check(
+            vec![fmadd_s(0, 1, 2, 3), terminate()],
+            mem,
+            "FmaCoreAir",
+            0,
+            col,
+            0x55,
+        );
+    }
+
+    // ── fxfer ───────────────────────────────────────────────────────────
+    #[test]
+    fn bite_fxfer_result_byte() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
+        let col = core_col::<Rv32FpAdapterCols<u8>, FxferCoreCols<F>>("result__0");
+        bite_check(
+            vec![fmv_x_s(5, 1), terminate()],
+            mem,
+            "FxferCoreAir",
+            0,
+            col,
+            0x55,
+        );
+    }
+
+    // ── selector / flag bites (opcode routing must be pinned) ───────────
+    #[test]
+    fn bite_fxfer_opcode_flag() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
+        let col = core_col::<Rv32FpAdapterCols<u8>, FxferCoreCols<F>>("fmv_x_flag");
+        bite_check(
+            vec![fmv_x_s(5, 1), terminate()],
+            mem,
+            "FxferCoreAir",
+            0,
+            col,
+            0,
+        );
+    }
+
+    #[test]
+    fn bite_fsgnj_flag() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 3.5);
+        write_fp_reg(&mut mem, 2, -2.0);
+        let col = core_col::<Rv32FpAdapterCols<u8>, FsgnjCoreCols<F>>("fsgnj_flag");
+        bite_check(
+            vec![fsgnj_s(0, 1, 2), terminate()],
+            mem,
+            "FsgnjCoreAir",
+            0,
+            col,
+            0,
+        );
+    }
+
+    #[test]
+    fn bite_fcmp_flag() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 1.0);
+        write_fp_reg(&mut mem, 2, 2.0);
+        let col = core_col::<Rv32FpAdapterCols<u8>, FcmpCoreCols<F>>("fle_flag");
+        bite_check(
+            vec![fle_s(0, 1, 2), terminate()],
+            mem,
+            "FcmpCoreAir",
+            0,
+            col,
+            0,
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// F extension mode tests (separate FP register file, AS 5)
+// ════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod f_extension_tests {
     use openvm_rv32f_circuit::Rv32FConfig;

@@ -1363,6 +1363,7 @@ version = "0.1.0"
 dependencies = [
  "openvm-build",
  "openvm-circuit",
+ "openvm-circuit-primitives",
  "openvm-instructions",
  "openvm-rv32f-circuit",
  "openvm-rv32f-transpiler",

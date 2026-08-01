@@ -19,6 +19,7 @@ openvm-rv32f-transpiler = { path = "../transpiler" }
 [dev-dependencies]
 openvm-rv32im-circuit = { workspace = true, default-features = false }
 openvm-rv32im-transpiler = { workspace = true }
+openvm-circuit-primitives = { workspace = true }
 
 [features]
 default = []
