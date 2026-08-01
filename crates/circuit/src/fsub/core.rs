@@ -21,7 +21,8 @@ use openvm_stark_backend::{
 };
 
 use crate::fp_shift::{
-    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+    fill_op_norm, run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget,
+    SHLIMB_BITS,
 };
 
 pub const SIG_NUM_LIMBS: usize = 3;
@@ -100,6 +101,18 @@ pub struct FsubCoreCols<T> {
     // Both-normal indicator columns (degree-1 witnesses, used by selectors).
     pub a_is_normal: T,
     pub b_is_normal: T,
+    // Subnormal operand pre-normalization (leading-zeros left shift; the
+    // exponent absorbs the shift, so the downstream pipeline is unchanged).
+    pub a_sub: T,
+    pub b_sub: T,
+    pub a_lshift: T,
+    pub b_lshift: T,
+    pub a_shln: ShlnCols<T, 3>,
+    pub b_shln: ShlnCols<T, 3>,
+    pub a_y2_lo7: T,
+    pub b_y2_lo7: T,
+    pub a_sigb: [T; 3], // effective significand bytes (normalized if subnormal)
+    pub b_sigb: [T; 3],
     // Selected significands (3 bytes each). large = the operand with the larger exp.
     pub large_sig: [T; SIG_NUM_LIMBS],
     pub small_sig: [T; SIG_NUM_LIMBS],
@@ -313,11 +326,66 @@ where
         // ── Special-case selectors + result constraints ──────────────────
         self.eval_special_cases(builder, cols);
 
+        // ── Subnormal operand pre-normalization ──────────────────────────
+        // Shift the subnormal significand left so its MSB lands at bit 23
+        // (the implicit-bit position); the exponent absorbs the shift.
+        builder.assert_eq(
+            cols.a_sub,
+            cols.a_exp_is_zero * (one.clone() - cols.a_mant_is_zero),
+        );
+        builder.assert_eq(
+            cols.b_sub,
+            cols.b_exp_is_zero * (one.clone() - cols.b_mant_is_zero),
+        );
+        builder.assert_bool(cols.a_sub);
+        builder.assert_bool(cols.b_sub);
+        let shln = ShlnGadget::new(self.range_bus);
+        let mut eval_op_norm = |x_sub: AB::Var,
+                                lshift: AB::Var,
+                                m0v: AB::Var,
+                                m1v: AB::Var,
+                                m2v: AB::Var,
+                                shln_cols: &ShlnCols<AB::Var, 3>,
+                                y2_lo7: AB::Var| {
+            builder.assert_eq(shln_cols.x[0], x_sub * m0v);
+            builder.assert_eq(shln_cols.x[1], x_sub * m1v);
+            builder.assert_eq(shln_cols.x[2], x_sub * m2v);
+            builder.assert_eq(shln_cols.shift, lshift);
+            builder.assert_eq(shln_cols.enable, x_sub);
+            shln.eval_shln(builder, shln_cols);
+            // MSB must land at bit 23 (forces the maximal shift).
+            builder.when(x_sub).assert_eq(shln_cols.y[2], y2_lo7 + f128);
+            self.range_bus
+                .range_check(y2_lo7.into(), 7)
+                .eval(builder, x_sub.into());
+        };
+        eval_op_norm(
+            cols.a_sub,
+            cols.a_lshift,
+            cols.a_mant0,
+            cols.a_mant1,
+            cols.a_mant2,
+            &cols.a_shln,
+            cols.a_y2_lo7,
+        );
+        eval_op_norm(
+            cols.b_sub,
+            cols.b_lshift,
+            cols.b_mant0,
+            cols.b_mant1,
+            cols.b_mant2,
+            &cols.b_shln,
+            cols.b_y2_lo7,
+        );
+        // Effective exponents absorb the normalization shift.
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp.clone());
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp.clone());
+
         // ── Phase 3: Alignment selection (ediff / a_is_larger) ───────────
         self.range_bus
-            .range_check(cols.ediff.into(), LIMB_BITS)
+            .range_check(cols.ediff.into(), 9)
             .eval(builder, cols.is_valid.into());
-        let diff = a_exp.clone() - b_exp.clone();
+        let diff = a_exp_eff - b_exp_eff;
         let expected_ediff =
             cols.a_is_larger * diff.clone() + (one.clone() - cols.a_is_larger) * (-diff.clone());
         builder.assert_eq(cols.ediff, expected_ediff);
@@ -497,41 +565,55 @@ impl FsubCoreAir {
             cols.b_is_normal,
             (one.clone() - cols.b_exp_is_zero) * (one.clone() - cols.b_exp_is_max),
         );
-        let a_sig2 = cols.a_mant2 + cols.a_is_normal * f128;
-        let b_sig2 = cols.b_mant2 + cols.b_is_normal * f128;
+        // Effective significand bytes: normal = mantissa + implicit bit;
+        // subnormal = pre-normalized significand.
+        let a_ns = one.clone() - cols.a_sub;
+        let b_ns = one.clone() - cols.b_sub;
+        for i in 0..3 {
+            let a_base = match i {
+                0 => cols.a_mant0.into(),
+                1 => cols.a_mant1.into(),
+                _ => cols.a_mant2 + cols.a_is_normal * f128,
+            };
+            builder.when(cols.is_valid).assert_eq(
+                cols.a_sigb[i],
+                a_ns.clone() * a_base + cols.a_sub * cols.a_shln.y[i],
+            );
+            let b_base = match i {
+                0 => cols.b_mant0.into(),
+                1 => cols.b_mant1.into(),
+                _ => cols.b_mant2 + cols.b_is_normal * f128,
+            };
+            builder.when(cols.is_valid).assert_eq(
+                cols.b_sigb[i],
+                b_ns.clone() * b_base + cols.b_sub * cols.b_shln.y[i],
+            );
+        }
         let sel = cols.a_is_larger.into();
         let notsel = one.clone() - sel.clone();
-        builder.when(cols.is_valid).assert_eq(
-            cols.large_sig[0],
-            sel.clone() * cols.a_mant0 + notsel.clone() * cols.b_mant0,
-        );
-        builder.when(cols.is_valid).assert_eq(
-            cols.large_sig[1],
-            sel.clone() * cols.a_mant1 + notsel.clone() * cols.b_mant1,
-        );
-        builder.when(cols.is_valid).assert_eq(
-            cols.large_sig[2],
-            sel.clone() * a_sig2.clone() + notsel.clone() * b_sig2.clone(),
-        );
-        builder.when(cols.is_valid).assert_eq(
-            cols.small_sig[0],
-            sel.clone() * cols.b_mant0 + notsel.clone() * cols.a_mant0,
-        );
-        builder.when(cols.is_valid).assert_eq(
-            cols.small_sig[1],
-            sel.clone() * cols.b_mant1 + notsel.clone() * cols.a_mant1,
-        );
-        builder.when(cols.is_valid).assert_eq(
-            cols.small_sig[2],
-            sel.clone() * b_sig2.clone() + notsel.clone() * a_sig2.clone(),
-        );
+        for i in 0..3 {
+            builder.when(cols.is_valid).assert_eq(
+                cols.large_sig[i],
+                sel.clone() * cols.a_sigb[i] + notsel.clone() * cols.b_sigb[i],
+            );
+            builder.when(cols.is_valid).assert_eq(
+                cols.small_sig[i],
+                sel.clone() * cols.b_sigb[i] + notsel.clone() * cols.a_sigb[i],
+            );
+        }
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp.clone());
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp.clone());
         let large_exp = sel.clone() * a_exp.clone() + notsel.clone() * b_exp.clone();
+        let large_exp_eff = sel.clone() * a_exp_eff.clone() + notsel.clone() * b_exp_eff.clone();
 
         // ── Sound selector s_sub (opposite signs ⇒ magnitude addition) ──
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
         builder.assert_eq(
             cols.s_sub,
-            s_finite.clone() * (one.clone() - cols.is_add) * cols.a_is_normal * cols.b_is_normal,
+            s_finite.clone()
+                * (one.clone() - cols.is_add)
+                * (cols.a_is_normal + cols.a_sub)
+                * (cols.b_is_normal + cols.b_sub),
         );
         builder.assert_bool(cols.s_sub);
 
@@ -694,7 +776,7 @@ impl FsubCoreAir {
             .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
         builder.when(s_shallow).assert_eq(
             cols.r_exp_lo + cols.r_exp_hi * f2,
-            large_exp + cols.carry_out + cols.rc2,
+            large_exp_eff + cols.carry_out + cols.rc2,
         );
         // Result sign for opposite-sign subtraction = a_sign.
         builder
@@ -799,7 +881,7 @@ impl FsubCoreAir {
         let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero_both;
         builder.when(cols.is_valid).assert_eq(
             cols.s_bn,
-            s_finite.clone() * cols.a_is_normal * cols.b_is_normal,
+            s_finite.clone() * (cols.a_is_normal + cols.a_sub) * (cols.b_is_normal + cols.b_sub),
         );
         builder.assert_bool(cols.s_bn);
         builder.when(cols.is_valid).assert_eq(
@@ -946,8 +1028,10 @@ impl FsubCoreAir {
         builder.assert_bool(cols.round_up);
 
         // ── Output reconstruction ───────────────────────────────────────
-        let large_exp =
-            cols.a_is_larger * a_exp.clone() + (one.clone() - cols.a_is_larger) * b_exp.clone();
+        let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp.clone());
+        let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp.clone());
+        let large_exp = cols.a_is_larger * a_exp_eff.clone()
+            + (one.clone() - cols.a_is_larger) * b_exp_eff.clone();
         // fsub result sign: ediff>=1 → cancel_sign_e1; ediff=0 → a_ge_b ? a_sign : (1-a_sign).
         let cancel_sign_e1 = cols.a_is_larger * cols.a_sign
             + (one.clone() - cols.a_is_larger) * (one.clone() - cols.a_sign);
@@ -1228,6 +1312,45 @@ fn fill_fsub_witness<F: PrimeField32>(
     row.a_is_normal = F::from_bool(a_is_normal);
     row.b_is_normal = F::from_bool(b_is_normal);
 
+    // Subnormal operand pre-normalization (fills shln columns + counts).
+    let (a_sub, a_exp_eff, a_sig_norm) = fill_op_norm(
+        a_exp,
+        a_mant,
+        &mut row.a_lshift,
+        &mut row.a_shln,
+        &mut row.a_y2_lo7,
+        range_checker,
+    );
+    let (b_sub, b_exp_eff, b_sig_norm) = fill_op_norm(
+        b_exp,
+        b_mant,
+        &mut row.b_lshift,
+        &mut row.b_shln,
+        &mut row.b_y2_lo7,
+        range_checker,
+    );
+    row.a_sub = F::from_bool(a_sub);
+    row.b_sub = F::from_bool(b_sub);
+    // Effective significands: implicit bit only for *normal* operands.
+    let a_sig_eff = if a_sub {
+        a_sig_norm
+    } else if a_is_normal {
+        a_mant | 0x800000
+    } else {
+        a_mant
+    };
+    let b_sig_eff = if b_sub {
+        b_sig_norm
+    } else if b_is_normal {
+        b_mant | 0x800000
+    } else {
+        b_mant
+    };
+    for i in 0..3 {
+        row.a_sigb[i] = F::from_u32((a_sig_eff >> (i * 8)) & 0xFF);
+        row.b_sigb[i] = F::from_u32((b_sig_eff >> (i * 8)) & 0xFF);
+    }
+
     // Result
     let (r_sign, r_exp, _r_mant) = decompose(result_bits);
     row.result_sign = F::from_u32(r_sign);
@@ -1257,37 +1380,29 @@ fn fill_fsub_witness<F: PrimeField32>(
     row.s_inf = F::from_bool(s_inf);
     row.s_zero_both = F::from_bool(s_zero_both);
 
-    // Alignment selection
+    // Alignment selection (effective exponents absorb the normalization shift).
     let same_sign = a_sign == b_sign;
-    let a_is_larger = a_exp >= b_exp;
+    let a_is_larger = a_exp_eff >= b_exp_eff;
     let ediff = if a_is_larger {
-        a_exp - b_exp
+        (a_exp_eff - b_exp_eff) as u32
     } else {
-        b_exp - a_exp
+        (b_exp_eff - a_exp_eff) as u32
     };
     row.is_add = F::from_bool(same_sign);
     row.a_is_larger = F::from_bool(a_is_larger);
     row.ediff = F::from_u32(ediff);
-    range_checker.add_count(ediff, LIMB_BITS);
+    range_checker.add_count(ediff, 9);
 
-    // Sound selector: finite, opposite-sign (magnitude addition), both-normal.
-    let s_sub = !is_nan_res && !inf_in && !s_zero_both && !same_sign && a_is_normal && b_is_normal;
+    // Sound selector: finite, opposite-sign (magnitude addition), both finite-nonzero.
+    let a_ok = a_is_normal || a_sub;
+    let b_ok = b_is_normal || b_sub;
+    let s_sub = !is_nan_res && !inf_in && !s_zero_both && !same_sign && a_ok && b_ok;
     row.s_sub = F::from_bool(s_sub);
 
-    let a_sig = if a_is_normal {
-        a_mant | 0x800000
+    let (large_sig, small_sig, _large_exp, large_exp_eff, _large_sign) = if a_is_larger {
+        (a_sig_eff, b_sig_eff, a_exp, a_exp_eff, a_sign)
     } else {
-        a_mant
-    };
-    let b_sig = if b_is_normal {
-        b_mant | 0x800000
-    } else {
-        b_mant
-    };
-    let (large_sig, small_sig, large_exp, _large_sign) = if a_is_larger {
-        (a_sig, b_sig, a_exp, a_sign)
-    } else {
-        (b_sig, a_sig, b_exp, b_sign)
+        (b_sig_eff, a_sig_eff, b_exp, b_exp_eff, b_sign)
     };
     for i in 0..SIG_NUM_LIMBS {
         row.large_sig[i] = F::from_u32((large_sig >> (i * LIMB_BITS)) & 0xFF);
@@ -1314,8 +1429,8 @@ fn fill_fsub_witness<F: PrimeField32>(
     } else {
         F::ZERO
     };
-    let s_cancel = s_finite_bool && same_sign && a_is_normal && b_is_normal && !is_deep;
-    row.s_bn = F::from_bool(s_finite_bool && a_is_normal && b_is_normal);
+    let s_cancel = s_finite_bool && same_sign && a_ok && b_ok && !is_deep;
+    row.s_bn = F::from_bool(s_finite_bool && a_ok && b_ok);
     // Deep-path result sign: a_sign for magnitude add, flipped when b is the
     // larger operand in same-sign subtraction.
     let deep_sign = if same_sign && !a_is_larger {
@@ -1357,9 +1472,9 @@ fn fill_fsub_witness<F: PrimeField32>(
                 row,
                 large_sig,
                 small_sig,
-                large_exp,
-                a_sig,
-                b_sig,
+                large_exp_eff,
+                a_sig_eff,
+                b_sig_eff,
                 a_sign,
                 a_is_larger,
                 r_exp,
@@ -1463,7 +1578,7 @@ fn fill_fsub_witness<F: PrimeField32>(
     let top7c = (((norm >> 24) & 0x7F) as u32) + rc1;
     let rc2 = top7c >> 7;
     let rc2_rem = top7c & 0x7F;
-    let result_exp_calc = large_exp + carry_out + rc2;
+    let result_exp_calc = large_exp_eff + carry_out as i32 + rc2 as i32;
 
     row.rc0 = F::from_u32(rc0);
     row.rc1 = F::from_u32(rc1);
@@ -1487,7 +1602,7 @@ fn fill_fsub_witness<F: PrimeField32>(
 
     if (1u32..=254).contains(&r_exp) {
         debug_assert_eq!(
-            result_exp_calc, r_exp,
+            result_exp_calc, r_exp as i32,
             "fsub finite exponent mismatch: a={:08x} b={:08x}",
             a_bits, b_bits
         );
@@ -1616,7 +1731,7 @@ fn fill_cancel_fsub<F: PrimeField32>(
     row: &mut FsubCoreCols<F>,
     large_sig: u32,
     small_sig: u32,
-    large_exp: u32,
+    large_exp: i32,
     a_sig: u32,
     b_sig: u32,
     a_sign: u32,
@@ -1764,7 +1879,7 @@ fn fill_cancel_fsub<F: PrimeField32>(
     let top7c = (nb5 - 128) + rc1;
     let rc2 = top7c >> 7;
     let rc2_rem = top7c & 0x7F;
-    let result_exp_calc = large_exp.wrapping_sub(lshift).wrapping_add(rc2);
+    let result_exp_calc = large_exp - lshift as i32 + rc2 as i32;
 
     // fsub result sign: ediff>=1 → a_is_larger ? a_sign : (1-a_sign); ediff=0 → a_ge_b ? a_sign : (1-a_sign).
     let sign_selector = if ediff != 0 { a_is_larger } else { a_ge_b };
@@ -1803,7 +1918,7 @@ fn fill_cancel_fsub<F: PrimeField32>(
 
     if (1u32..=254).contains(&r_exp) {
         debug_assert_eq!(
-            result_exp_calc, r_exp,
+            result_exp_calc, r_exp as i32,
             "fsub cancel exp: a={:08x} b={:08x}",
             a_bits, b_bits
         );
@@ -2145,6 +2260,54 @@ mod finite_sub_tests {
         assert!(round_up_seen, "never exercised a round_up=1 case");
         assert!(deep_seen, "never exercised the deep (ediff>=25) path");
         assert!(overflow_seen, "never exercised an overflow->inf result");
+    }
+
+    #[test]
+    fn finite_sub_subnormal_operands_pass() {
+        let chip = rc();
+        // Curated subnormal-operand cases (result exp field >= 1; subnormal
+        // results land in a later change).
+        for &(a, b) in &[
+            (0x00000001, 0x3F800000), // min subnormal - 1.0 (deep)
+            (0x3F800000, 0x00000001), // 1.0 - min subnormal (deep)
+            (0x007FFFFF, 0x3F800000), // max subnormal - 1.0 (shallow)
+            (0x00800000, 0x00400000), // min normal - subnormal
+            (0x00400000, 0x00400000), // subnormal - subnormal (cancel, zero)
+            (0x00400000, 0x00800000), // subnormal - subnormal (cancel, negative)
+            (0x3F800000, 0x00800000), // 1.0 - min normal (cancel)
+        ] {
+            if (fsub_s(a, b) >> 23) & 0xFF == 0 {
+                continue;
+            }
+            let (builder, _) = run_with(a, b, &chip);
+            assert!(
+                builder.ok(),
+                "subnormal-operand fsub failed: {:?}\n a={a:08x} b={b:08x}",
+                builder.failures
+            );
+        }
+        // Fuzz with subnormal operands (result exp field >= 1 only).
+        let mut rng = Rng(0x5BB0_2222_0DEF_0002);
+        for _ in 0..2000 {
+            let sa = ((rng.next() as u32) & 1) << 31;
+            let sb = ((rng.next() as u32) & 1) << 31;
+            let ea = rng.next() as u32 % 255;
+            let eb = rng.next() as u32 % 255;
+            let a = sa | (ea << 23) | ((rng.next() as u32) & 0x7FFFFF);
+            let b = sb | (eb << 23) | ((rng.next() as u32) & 0x7FFFFF);
+            if (ea == 0 && a & 0x7FFFFF == 0) || (eb == 0 && b & 0x7FFFFF == 0) {
+                continue; // zero operands are special-cased
+            }
+            if (fsub_s(a, b) >> 23) & 0xFF == 0 {
+                continue; // subnormal/zero results land in a later change
+            }
+            let (builder, _) = run_with(a, b, &chip);
+            assert!(
+                builder.ok(),
+                "subnormal-operand fuzz failed: {:?}\n a={a:08x} b={b:08x}",
+                builder.failures
+            );
+        }
     }
 
     #[test]
