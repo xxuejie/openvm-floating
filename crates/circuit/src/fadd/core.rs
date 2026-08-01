@@ -226,10 +226,7 @@ pub struct FaddCoreCols<T> {
     // === Result ===
     pub result_sign: T,
     pub result: [T; 4], // output f32 bits (4 limbs)
-    pub is_special: T,
     pub is_nan_result: T,
-    pub is_inf_result: T,
-    pub is_zero_result: T,
 
     pub is_valid: T,
 }
@@ -355,9 +352,6 @@ where
 
         // Verify result classification flags
         builder.assert_bool(cols.is_nan_result);
-        builder.assert_bool(cols.is_inf_result);
-        builder.assert_bool(cols.is_zero_result);
-        builder.assert_bool(cols.is_special);
         builder.assert_bool(cols.is_add);
         builder.assert_bool(cols.a_is_larger);
         builder.assert_bool(cols.carry_out);
@@ -1701,12 +1695,7 @@ fn fill_fadd_witness<F: PrimeField32>(
     }
 
     let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_inf && a_sign != b_sign);
-    let is_inf_res = !is_nan_res && (a_is_inf || b_is_inf || r_exp == 255);
-    let is_zero_res = !is_nan_res && (r_exp == 0 && result_bits & 0x7FFFFF == 0);
     row.is_nan_result = F::from_bool(is_nan_res);
-    row.is_inf_result = F::from_bool(is_inf_res);
-    row.is_zero_result = F::from_bool(is_zero_res);
-    row.is_special = F::from_bool(is_nan_res || is_inf_res || is_zero_res);
 
     // Input-derived special-case selectors (constrained in eval_special_cases).
     let inf_in = a_is_inf || b_is_inf;
@@ -2632,7 +2621,6 @@ mod special_tests {
         let inf_in = a_inf || b_inf;
         let s_inf = !is_nan_res && inf_in;
         let s_zero_both = !is_nan_res && !inf_in && a_zero && b_zero;
-        let is_special = is_nan_res || s_inf || s_zero_both;
 
         // Decompose inputs (needed for the one-zero special case).
         let a_mant = a & 0x7FFFFF;
@@ -2664,7 +2652,6 @@ mod special_tests {
             s_inf: F::from_bool(s_inf),
             s_zero_both: F::from_bool(s_zero_both),
             is_nan_result: F::from_bool(is_nan_res),
-            is_special: F::from_bool(is_special),
             result: core::array::from_fn(|i| F::from_u32((result >> (i * 8)) & 0xFF)),
             ..Default::default()
         }

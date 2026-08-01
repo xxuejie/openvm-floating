@@ -227,10 +227,7 @@ pub struct FsubCoreCols<T> {
     // === Result ===
     pub result_sign: T,
     pub result: [T; 4], // output f32 bits (4 limbs)
-    pub is_special: T,
     pub is_nan_result: T,
-    pub is_inf_result: T,
-    pub is_zero_result: T,
 
     pub is_valid: T,
 }
@@ -353,9 +350,6 @@ where
 
         // Verify result classification flags
         builder.assert_bool(cols.is_nan_result);
-        builder.assert_bool(cols.is_inf_result);
-        builder.assert_bool(cols.is_zero_result);
-        builder.assert_bool(cols.is_special);
         builder.assert_bool(cols.is_add);
         builder.assert_bool(cols.a_is_larger);
         builder.assert_bool(cols.carry_out);
@@ -1636,12 +1630,7 @@ fn fill_fsub_witness<F: PrimeField32>(
 
     // fsub: inf - inf is NaN only for same-sign infinities.
     let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_inf && a_sign == b_sign);
-    let is_inf_res = !is_nan_res && (a_is_inf || b_is_inf || r_exp == 255);
-    let is_zero_res = !is_nan_res && (r_exp == 0 && result_bits & 0x7FFFFF == 0);
     row.is_nan_result = F::from_bool(is_nan_res);
-    row.is_inf_result = F::from_bool(is_inf_res);
-    row.is_zero_result = F::from_bool(is_zero_res);
-    row.is_special = F::from_bool(is_nan_res || is_inf_res || is_zero_res);
 
     let inf_in = a_is_inf || b_is_inf;
     let s_inf = !is_nan_res && inf_in;

@@ -120,10 +120,7 @@ pub struct FmulCoreCols<T> {
     pub result_sign: T,
     pub result_exp: T,
     pub result: [T; 4], // output f32 bits (4 limbs) — goes to adapter writes
-    pub is_special: T,
     pub is_nan_result: T,
-    pub is_inf_result: T,
-    pub is_zero_result: T,
 
     // Special-case selectors (input-derived; see eval_special_cases).
     pub inf_in: T,  // a_is_inf | b_is_inf
@@ -281,9 +278,6 @@ where
 
         // Verify result classification flags
         builder.assert_bool(cols.is_nan_result);
-        builder.assert_bool(cols.is_inf_result);
-        builder.assert_bool(cols.is_zero_result);
-        builder.assert_bool(cols.is_special);
 
         // Result sign = a_sign XOR b_sign
         let r_sign = cols.a_sign + cols.b_sign - cols.a_sign * cols.b_sign * f2;
@@ -1245,12 +1239,7 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.result[3] = F::from_u32((result_bits >> 24) & 0xFF);
 
     let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_zero) || (a_is_zero && b_is_inf);
-    let is_inf_res = !is_nan_res && (a_is_inf || b_is_inf || r_exp == 255);
-    let is_zero_res = !is_nan_res && (a_is_zero || b_is_zero || (r_exp == 0 && r_mant == 0));
     row.is_nan_result = F::from_bool(is_nan_res);
-    row.is_inf_result = F::from_bool(is_inf_res);
-    row.is_zero_result = F::from_bool(is_zero_res);
-    row.is_special = F::from_bool(is_nan_res || is_inf_res || is_zero_res);
 
     // Input-derived special-case selectors (constrained in eval_special_cases).
     let inf_in = a_is_inf || b_is_inf;
