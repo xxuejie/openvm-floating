@@ -1512,6 +1512,23 @@ mod fuzz_tests {
         );
     }
 
+    #[test]
+    fn fuzz_exec_fxfer() {
+        let mut rng = XorShift64::new(0xA11C_E006);
+        let cases: Vec<u32> = (0..150).map(|_| rand_bits(&mut rng)).collect();
+        fuzz_unary(
+            &cases,
+            |rd, rs1, i| {
+                if i % 2 == 0 {
+                    fmv_x_s(rd, rs1)
+                } else {
+                    fmv_s_x(rd, rs1)
+                }
+            },
+            |a, _| a, // register-to-register copy: result bits == source bits
+        );
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // Proving-level fuzz: random programs through air_test (constraint check).
     // ════════════════════════════════════════════════════════════════════════
@@ -1580,6 +1597,21 @@ mod fuzz_tests {
         let mut rng = XorShift64::new(0xB0B0_0003);
         let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
         let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, _| fclass_s(rd, rs1));
+        prove_chunk(instrs, mem);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn fuzz_prove_fxfer() {
+        let mut rng = XorShift64::new(0xB0B0_0008);
+        let cases: Vec<u32> = (0..30).map(|_| rand_bits(&mut rng)).collect();
+        let (instrs, mem) = build_unary_chunk(&cases, &mut |rd, rs1, i| {
+            if i % 2 == 0 {
+                fmv_x_s(rd, rs1)
+            } else {
+                fmv_s_x(rd, rs1)
+            }
+        });
         prove_chunk(instrs, mem);
     }
 
@@ -2749,6 +2781,202 @@ mod bite_checks {
             0,
         );
     }
+
+    // ── selector bites for the arithmetic chips (result-routing witnesses) ──
+    /// Corrupts a single core column of a binary-op chip's trace and asserts
+    /// the corruption is caught. `bad_val` must differ from the honest value.
+    fn bite_selector_binary<A, C>(
+        rd: u32,
+        rs1: u32,
+        rs2: u32,
+        a: f32,
+        b: f32,
+        air: &str,
+        col_name: &str,
+        bad_val: u32,
+        make: impl Fn(u32, u32, u32) -> Instruction<F>,
+    ) where
+        C: StructReflectionHelper,
+    {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, rs1, a);
+        write_fp_reg(&mut mem, rs2, b);
+        let col = core_col::<A, C>(col_name);
+        bite_check(
+            vec![make(rd, rs1, rs2), terminate()],
+            mem,
+            air,
+            0,
+            col,
+            bad_val,
+        );
+    }
+
+    /// Corrupts a single core column of a unary-op chip's trace.
+    /// `bad_val` must differ from the honest value.
+    fn bite_selector_unary<A, C>(
+        rd: u32,
+        rs1: u32,
+        a: u32,
+        air: &str,
+        col_name: &str,
+        bad_val: u32,
+        make: impl Fn(u32, u32) -> Instruction<F>,
+    ) where
+        C: StructReflectionHelper,
+    {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, rs1, a);
+        let col = core_col::<A, C>(col_name);
+        bite_check(vec![make(rd, rs1), terminate()], mem, air, 0, col, bad_val);
+    }
+
+    #[test]
+    fn bite_fadd_is_add_selector() {
+        bite_selector_binary::<Rv32FpAdapterCols<u8>, FaddCoreCols<F>>(
+            0,
+            1,
+            2,
+            1.5,
+            2.5,
+            "FaddCoreAir",
+            "is_add",
+            0,
+            fadd_s,
+        );
+    }
+
+    #[test]
+    fn bite_fsub_is_add_selector() {
+        bite_selector_binary::<Rv32FpAdapterCols<u8>, FsubCoreCols<F>>(
+            0,
+            1,
+            2,
+            7.0,
+            3.0,
+            "FsubCoreAir",
+            "is_add",
+            0,
+            fsub_s,
+        );
+    }
+
+    #[test]
+    fn bite_fmul_s_inf_selector() {
+        // 3.0 * 4.0 is not special (honest s_inf = 0); claim an inf input.
+        bite_selector_binary::<Rv32FpAdapterCols<u8>, FmulCoreCols<F>>(
+            0,
+            1,
+            2,
+            3.0,
+            4.0,
+            "FmulCoreAir",
+            "s_inf",
+            1,
+            fmul_s,
+        );
+    }
+
+    #[test]
+    fn bite_fdiv_s_finite_selector() {
+        bite_selector_binary::<Rv32FpAdapterCols<u8>, FdivCoreCols<F>>(
+            0,
+            1,
+            2,
+            7.0,
+            2.0,
+            "FdivCoreAir",
+            "s_finite",
+            0,
+            fdiv_s,
+        );
+    }
+
+    #[test]
+    fn bite_fsqrt_s_finite_selector() {
+        bite_selector_unary::<Rv32FpUnaryAdapterCols<u8>, FsqrtCoreCols<F>>(
+            0,
+            1,
+            4.0f32.to_bits(),
+            "FsqrtCoreAir",
+            "s_finite",
+            0,
+            fsqrt_s,
+        );
+    }
+
+    #[test]
+    fn bite_fma_s_finite_selector() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg(&mut mem, 1, 2.0);
+        write_fp_reg(&mut mem, 2, 3.0);
+        write_fp_reg(&mut mem, 3, 4.0);
+        let col = core_col::<Rv32Fp3AdapterCols<u8>, FmaCoreCols<F>>("s_finite");
+        bite_check(
+            vec![fmadd_s(0, 1, 2, 3), terminate()],
+            mem,
+            "FmaCoreAir",
+            0,
+            col,
+            0,
+        );
+    }
+
+    #[test]
+    fn bite_fcvt_f2i_sel_wit_selector() {
+        bite_selector_unary::<Rv32FpUnaryAdapterCols<u8>, FcvtF2ICoreCols<F>>(
+            0,
+            1,
+            3.7f32.to_bits(),
+            "FcvtF2ICoreAir",
+            "sel_wit",
+            0,
+            fcvt_w_s,
+        );
+    }
+
+    #[test]
+    fn bite_fcvt_i2f_a_sign_selector() {
+        // fcvt.s.w(42) is positive (honest a_sign = 0); claim negative.
+        bite_selector_unary::<Rv32FpUnaryAdapterCols<u8>, FcvtI2FCoreCols<F>>(
+            0,
+            1,
+            42,
+            "FcvtI2FCoreAir",
+            "a_sign",
+            1,
+            fcvt_s_w,
+        );
+    }
+
+    #[test]
+    fn bite_fminmax_fmin_flag_selector() {
+        bite_selector_binary::<Rv32FpAdapterCols<u8>, FminmaxCoreCols<F>>(
+            0,
+            1,
+            2,
+            3.0,
+            4.0,
+            "FminmaxCoreAir",
+            "fmin_flag",
+            0,
+            fmin_s,
+        );
+    }
+
+    #[test]
+    fn bite_fclass_nan_sel_selector() {
+        // FCLASS(1.5) is not NaN (honest nan_sel = 0); claim NaN.
+        bite_selector_unary::<Rv32FpUnaryAdapterCols<u8>, FclassCoreCols<F>>(
+            0,
+            1,
+            1.5f32.to_bits(),
+            "FclassCoreAir",
+            "nan_sel",
+            1,
+            fclass_s,
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2930,5 +3158,94 @@ mod f_extension_tests {
 
         assert_eq!(read_fpreg_f(&state, 0), 12.0);
         assert_eq!(read_fpreg_f(&state, 4), 17.0);
+    }
+
+    /// fclass.s in F mode: read FP reg (AS 5), write integer mask (AS 1).
+    fn fclass_f(rd: u32, rs1: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(FpOpcode::FCLASS_S.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::ZERO,
+            F::from_u32(RV32_REGISTER_AS), // d: integer register AS
+            F::from_u32(F_AS),             // e: FP register AS
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+
+    /// fcvt.w.s in F mode: read FP reg (AS 5), write integer result (AS 1).
+    fn fcvt_w_s_f(rd: u32, rs1: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(FpOpcode::FCVT_W_S.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::ZERO,
+            F::from_u32(RV32_REGISTER_AS), // d: integer register AS
+            F::from_u32(F_AS),             // e: FP register AS
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+
+    /// fcvt.s.w in F mode: read integer reg (AS 1), write FP result (AS 5).
+    fn fcvt_s_w_f(rd: u32, rs1: u32) -> Instruction<F> {
+        Instruction::new(
+            VmOpcode::from_usize(FpOpcode::FCVT_S_W.global_opcode_usize()),
+            F::from_usize(4 * rd as usize),
+            F::from_usize(4 * rs1 as usize),
+            F::ZERO,
+            F::from_u32(F_AS),             // d: FP register AS
+            F::from_u32(RV32_REGISTER_AS), // e: integer register AS
+            F::ZERO,
+            F::ZERO,
+        )
+    }
+
+    #[test]
+    fn test_f_ext_cross_as_unary() {
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 1.5);
+        write_fpreg_f(&mut mem, 2, f32::INFINITY);
+        write_int_reg(&mut mem, 3, (-42i32) as u32);
+
+        let state = run_f_program(
+            vec![
+                fclass_f(0, 1),   // int r0 = FCLASS(1.5) = normal-positive (0x40)
+                fclass_f(5, 2),   // int r5 = FCLASS(+inf) = positive infinity (0x10)
+                fcvt_w_s_f(6, 1), // int r6 = trunc(1.5) = 1
+                fcvt_s_w_f(7, 3), // f7 = float(-42) = -42.0
+                terminate(),
+            ],
+            mem,
+        );
+
+        assert_eq!(read_int_reg_bits(&state, 0), 1 << 6); // positive normal
+        assert_eq!(read_int_reg_bits(&state, 5), 1 << 7); // positive infinity
+        assert_eq!(read_int_reg_bits(&state, 6), 1);
+        assert_eq!(read_fpreg_f(&state, 7), -42.0);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_cross_as_unary_f() {
+        use openvm_circuit::utils::air_test;
+        use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_f(&mut mem, 1, 1.5);
+        write_int_reg(&mut mem, 3, (-42i32) as u32);
+
+        let program = Program::new_without_debug_infos(
+            &vec![
+                fclass_f(5, 1),   // int r5 = FCLASS(1.5)
+                fcvt_w_s_f(6, 1), // int r6 = 1
+                fcvt_s_w_f(7, 3), // f7 = -42.0
+                terminate(),
+            ],
+            0,
+        );
+        let exe = VmExe::new(program).with_init_memory(mem);
+        air_test(Rv32FCpuBuilder, Rv32FConfig::new_f(), exe);
     }
 }
