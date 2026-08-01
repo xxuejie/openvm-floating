@@ -47,7 +47,7 @@ impl<AB, I> VmCoreAir<AB, I> for FxferCoreAir
 where
     AB: InteractionBuilder,
     I: VmAdapterInterface<AB::Expr>,
-    I::Reads: From<[[AB::Expr; NUM_LIMBS]; 2]>,
+    I::Reads: From<[[AB::Expr; NUM_LIMBS]; 1]>,
     I::Writes: From<[[AB::Expr; NUM_LIMBS]; 1]>,
     I::ProcessedInstruction: From<MinimalInstruction<AB::Expr>>,
 {
@@ -76,7 +76,7 @@ where
 
         AdapterAirContext {
             to_pc: None,
-            reads: [cols.data.map(Into::into), [AB::Expr::ZERO; NUM_LIMBS]].into(),
+            reads: [cols.data.map(Into::into)].into(),
             writes: [cols.result.map(Into::into)].into(),
             instruction: MinimalInstruction {
                 is_valid: cols.is_valid.into(),
@@ -108,7 +108,7 @@ impl<A, F, RA> PreflightExecutor<F, RA> for FxferExecutor<A>
 where
     F: PrimeField32,
     A: 'static
-        + AdapterTraceExecutor<F, ReadData: Into<[[u8; 4]; 2]>, WriteData: From<[[u8; 4]; 1]>>,
+        + AdapterTraceExecutor<F, ReadData: Into<[[u8; 4]; 1]>, WriteData: From<[[u8; 4]; 1]>>,
     for<'buf> RA: RecordArena<
         'buf,
         EmptyAdapterCoreLayout<F, A>,
@@ -127,7 +127,7 @@ where
         let (mut adapter_record, core_record) = state.ctx.alloc(EmptyAdapterCoreLayout::new());
         A::start(*state.pc, state.memory, &mut adapter_record);
 
-        let [src, _] = self
+        let [src] = self
             .adapter
             .read(state.memory, instruction, &mut adapter_record)
             .into();

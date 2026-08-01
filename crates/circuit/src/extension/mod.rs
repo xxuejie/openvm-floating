@@ -106,7 +106,7 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
         );
         inventory.add_executor(fsqrt, [FpOpcode::FSQRT_S.global_opcode()])?;
 
-        let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
+        let adapter_exec = Rv32FpMoveAdapterExecutor::new();
         let fxfer = Rv32FxferExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET);
         inventory.add_executor(
             fxfer,
@@ -266,7 +266,7 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         inventory.add_air(fsqrt);
 
         let fxfer = Rv32FxferAir::new(
-            Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
+            Rv32FpMoveAdapterAir::new(exec_bridge, memory_bridge),
             FxferCoreAir::new(FpOpcode::CLASS_OFFSET),
         );
         inventory.add_air(fxfer);
@@ -421,7 +421,7 @@ where
 
         inventory.next_air::<Rv32FxferAir>()?;
         let fxfer = Rv32FxferChip::new(
-            FxferFiller::new(Rv32FpAdapterFiller, FpOpcode::CLASS_OFFSET),
+            FxferFiller::new(Rv32FpMoveAdapterFiller, FpOpcode::CLASS_OFFSET),
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fxfer);

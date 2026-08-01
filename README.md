@@ -53,12 +53,17 @@ pick an unconstrained witness column or input class to forge a result.
   cell, and assert the corruption is caught. Covers all 13 chips (a result-byte
   corruption plus opcode-routing selector bites).
 
-### Known limitation
+### Cross-AS FMV
 
-In F-extension mode (`register_as = 5`), `fmv.x.s`/`fmv.s.x` are cross-AS moves
-and the single-AS `Rv32FpAdapter` is wrong for them; FMV is sound only in the
-default Zfinx mode (`register_as = 1`). `flw`/`fsw` are not supported: the fxfer
-circuit has no AS-2 memory path, so load/store programs fail loudly at preflight.
+`fmv.x.s` / `fmv.s.x` are cross-address-space moves (FP register file in
+AS 5 → integer registers in AS 1, and back) in F-extension mode. fxfer uses a
+dedicated `Rv32FpMoveAdapter` whose `read_as`/`write_as` are witness columns
+filled from the instruction's `d`/`e` fields and pinned by both the program bus
+and the memory bus, so FMV is sound and complete in both Zfinx and F-extension
+mode.
+
+`flw` / `fsw` are not supported: the fxfer circuit has no AS-2 memory path, so
+load/store programs fail loudly at preflight.
 
 ## Build / test commands
 

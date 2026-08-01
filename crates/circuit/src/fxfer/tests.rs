@@ -10,7 +10,7 @@ use super::*;
 use crate::test_utils::NumericBuilder;
 
 type F = BabyBear;
-type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 1, 1, 4, 4>;
 
 fn build_row(data: [u8; 4], opcode: FpOpcode, is_valid: bool) -> Vec<F> {
     let mut buf = vec![F::ZERO; FxferCoreCols::<F>::width()];

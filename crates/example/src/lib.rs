@@ -268,6 +268,36 @@ fn fmv_s_x(rd: u32, rs1: u32) -> Instruction<F> {
     )
 }
 
+/// FMV.X.S in F-extension mode: FP register (AS `fp_as`) -> integer register (AS 1).
+/// Operand layout: a = int rd, b = FP rs1, c = 0, d = int AS, e = FP AS.
+fn fmv_x_s_f(rd: u32, rs1: u32, fp_as: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FMV_X_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::ZERO,
+        F::from_u32(RV32_REGISTER_AS), // d: integer register AS
+        F::from_u32(fp_as),            // e: FP register AS
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+/// FMV.S.X in F-extension mode: integer register (AS 1) -> FP register (AS `fp_as`).
+/// Operand layout: a = FP rd, b = int rs1, c = 0, d = FP AS, e = int AS.
+fn fmv_s_x_f(rd: u32, rs1: u32, fp_as: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FMV_S_X.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::ZERO,
+        F::from_u32(fp_as),            // d: FP register AS
+        F::from_u32(RV32_REGISTER_AS), // e: integer register AS
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 /// Ternary FP instruction (fused multiply-add family): rd, rs1, rs2, rs3.
 /// Operand layout: a=rd, b=rs1, c=rs2, d=rs3, e=address space.
 fn fp_ternary(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
@@ -2304,6 +2334,7 @@ mod bite_checks {
     fn build_ctx(
         instrs: Vec<Instruction<F>>,
         init_memory: SparseMemoryImage,
+        config: Rv32FConfig,
     ) -> (
         VirtualMachine<E, Rv32FCpuBuilder>,
         ProvingContext<<E as StarkEngine>::PB>,
@@ -2312,12 +2343,9 @@ mod bite_checks {
         let exe = VmExe::new(program).with_init_memory(init_memory);
         let params = SystemParams::new_for_testing(22);
         let engine = E::new(params);
-        let (mut vm, _pk) = VirtualMachine::<E, Rv32FCpuBuilder>::new_with_keygen(
-            engine,
-            Rv32FCpuBuilder,
-            Rv32FConfig::default(),
-        )
-        .expect("keygen");
+        let (mut vm, _pk) =
+            VirtualMachine::<E, Rv32FCpuBuilder>::new_with_keygen(engine, Rv32FCpuBuilder, config)
+                .expect("keygen");
         let metered_ctx = vm.build_metered_ctx(&exe);
         let (segments, _) = vm
             .metered_interpreter(&exe)
@@ -2372,7 +2400,28 @@ mod bite_checks {
         col: usize,
         bad_val: u32,
     ) {
-        let (vm, mut ctx) = build_ctx(instrs, init_memory);
+        bite_check_config(
+            instrs,
+            init_memory,
+            Rv32FConfig::default(),
+            air_name_substr,
+            row,
+            col,
+            bad_val,
+        );
+    }
+
+    /// Like [bite_check] but with an explicit VM config (e.g. F-extension mode).
+    fn bite_check_config(
+        instrs: Vec<Instruction<F>>,
+        init_memory: SparseMemoryImage,
+        config: Rv32FConfig,
+        air_name_substr: &str,
+        row: usize,
+        col: usize,
+        bad_val: u32,
+    ) {
+        let (vm, mut ctx) = build_ctx(instrs, init_memory, config);
         let air_id = vm
             .air_names()
             .position(|n| n.contains(air_name_substr))
@@ -2442,7 +2491,9 @@ mod bite_checks {
         bite_check(vec![make(rd, rs1), terminate()], mem, air, 0, col, 0x55);
     }
 
-    use openvm_rv32f_circuit::adapters::{Rv32Fp3AdapterCols, Rv32FpUnaryAdapterCols};
+    use openvm_rv32f_circuit::adapters::{
+        Rv32Fp3AdapterCols, Rv32FpMoveAdapterCols, Rv32FpUnaryAdapterCols,
+    };
     use openvm_rv32f_circuit::{
         fadd::FaddCoreCols, fclass::FclassCoreCols, fcmp::FcmpCoreCols, fcvt_f2i::FcvtF2ICoreCols,
         fcvt_i2f::FcvtI2FCoreCols, fdiv::FdivCoreCols, fma::FmaCoreCols, fminmax::FminmaxCoreCols,
@@ -2619,10 +2670,31 @@ mod bite_checks {
     fn bite_fxfer_result_byte() {
         let mut mem = SparseMemoryImage::new();
         write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
-        let col = core_col::<Rv32FpAdapterCols<u8>, FxferCoreCols<F>>("result__0");
+        let col = core_col::<Rv32FpMoveAdapterCols<u8>, FxferCoreCols<F>>("result__0");
         bite_check(
             vec![fmv_x_s(5, 1), terminate()],
             mem,
+            "FxferCoreAir",
+            0,
+            col,
+            0x55,
+        );
+    }
+
+    // ── fxfer in F-extension mode (cross-AS move) ───────────────────────
+    #[test]
+    fn bite_fxfer_result_byte_f() {
+        const F_AS: u32 = 5;
+        let mut mem = SparseMemoryImage::new();
+        let fp_offset = 1 * 4;
+        for (i, byte) in 3.5f32.to_bits().to_le_bytes().iter().enumerate() {
+            mem.insert((F_AS, fp_offset + i as u32), *byte);
+        }
+        let col = core_col::<Rv32FpMoveAdapterCols<u8>, FxferCoreCols<F>>("result__0");
+        bite_check_config(
+            vec![fmv_x_s_f(5, 1, F_AS), terminate()],
+            mem,
+            Rv32FConfig::new_f(),
             "FxferCoreAir",
             0,
             col,
@@ -2635,7 +2707,7 @@ mod bite_checks {
     fn bite_fxfer_opcode_flag() {
         let mut mem = SparseMemoryImage::new();
         write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
-        let col = core_col::<Rv32FpAdapterCols<u8>, FxferCoreCols<F>>("fmv_x_flag");
+        let col = core_col::<Rv32FpMoveAdapterCols<u8>, FxferCoreCols<F>>("fmv_x_flag");
         bite_check(
             vec![fmv_x_s(5, 1), terminate()],
             mem,
@@ -2738,6 +2810,82 @@ mod f_extension_tests {
         let executor = VmExecutor::new(Rv32FConfig::new_f()).expect("failed to create executor");
         let instance = executor.instance(&exe).expect("failed to create instance");
         instance.execute(vec![], None).expect("execution failed")
+    }
+
+    fn write_int_reg(mem: &mut SparseMemoryImage, reg_idx: u32, bits: u32) {
+        let offset = reg_idx * 4;
+        for (i, byte) in bits.to_le_bytes().iter().enumerate() {
+            mem.insert((RV32_REGISTER_AS, offset + i as u32), *byte);
+        }
+    }
+
+    fn read_int_reg_bits(state: &VmState<F>, reg_idx: u32) -> u32 {
+        let offset = reg_idx * 4;
+        let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(RV32_REGISTER_AS, offset) };
+        u32::from_le_bytes(bytes)
+    }
+
+    fn write_fpreg_bits_f(mem: &mut SparseMemoryImage, reg_idx: u32, bits: u32) {
+        write_fpreg_f(mem, reg_idx, f32::from_bits(bits));
+    }
+
+    fn read_fpreg_bits_f(state: &VmState<F>, reg_idx: u32) -> u32 {
+        read_fpreg_f(state, reg_idx).to_bits()
+    }
+
+    #[test]
+    fn test_f_ext_fmv() {
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_bits_f(&mut mem, 1, 3.5f32.to_bits());
+        write_fpreg_bits_f(&mut mem, 2, (-2.25f32).to_bits());
+        write_int_reg(&mut mem, 3, 12345);
+        write_int_reg(&mut mem, 4, 0x7F800000);
+
+        let state = run_f_program(
+            vec![
+                fmv_x_s_f(0, 1, F_AS), // int r0 = bits of f1 (3.5)
+                fmv_x_s_f(5, 2, F_AS), // int r5 = bits of f2 (-2.25)
+                fmv_s_x_f(6, 3, F_AS), // f6 = bits of int r3 (12345)
+                fmv_s_x_f(7, 4, F_AS), // f7 = bits of int r4 (inf)
+                fmv_x_s_f(8, 7, F_AS), // int r8 = bits of f7 (inf)
+                terminate(),
+            ],
+            mem,
+        );
+
+        assert_eq!(read_int_reg_bits(&state, 0), 3.5f32.to_bits());
+        assert_eq!(read_int_reg_bits(&state, 5), (-2.25f32).to_bits());
+        assert_eq!(read_fpreg_bits_f(&state, 6), 12345);
+        assert_eq!(read_fpreg_bits_f(&state, 7), 0x7F800000);
+        assert_eq!(read_int_reg_bits(&state, 8), 0x7F800000);
+        // Sources preserved
+        assert_eq!(read_fpreg_bits_f(&state, 1), 3.5f32.to_bits());
+        assert_eq!(read_fpreg_bits_f(&state, 2), (-2.25f32).to_bits());
+        assert_eq!(read_int_reg_bits(&state, 3), 12345);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_fmv_f() {
+        use openvm_circuit::utils::air_test;
+        use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+        let mut mem = SparseMemoryImage::new();
+        write_fpreg_bits_f(&mut mem, 1, 3.5f32.to_bits());
+        write_fpreg_bits_f(&mut mem, 2, (-2.25f32).to_bits());
+        write_int_reg(&mut mem, 3, 12345);
+
+        let program = Program::new_without_debug_infos(
+            &vec![
+                fmv_x_s_f(5, 1, F_AS), // int r5 = bits of f1
+                fmv_x_s_f(6, 2, F_AS), // int r6 = bits of f2
+                fmv_s_x_f(7, 5, F_AS), // f7 = bits of int r5
+                terminate(),
+            ],
+            0,
+        );
+        let exe = VmExe::new(program).with_init_memory(mem);
+        air_test(Rv32FCpuBuilder, Rv32FConfig::new_f(), exe);
     }
 
     #[test]
