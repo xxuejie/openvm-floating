@@ -43,17 +43,18 @@ pick an unconstrained witness column or input class to forge a result.
   `InteractionBuilder` over concrete `BabyBear` values for millisecond-scale
   gate tests (honest rows pass; corrupted columns fail) without the STARK
   prover.
-- **Corruption sweeps** (`corruption_sweep` in `test_utils.rs`) — perturb every
-  witness column of an honest row by +1 and re-eval; every accepted perturbation
-  is triaged and whitelisted with a written justification. Live for the small
-  chips (fcmp, fminmax, fclass, fsgnj, fxfer).
+- **Corruption sweeps** (`corruption_sweep` / `assert_columns_constrained` in
+  `test_utils.rs`) — perturb every witness column of an honest row by +1 and
+  re-eval; every accepted perturbation is triaged and whitelisted with a written
+  justification. Live for the small chips (fcmp, fminmax, fclass, fsgnj, fxfer,
+  fmem), plus focused result-byte + selector pinning sweeps for fadd/fsub/fmul.
 - **STARK-level bite-checks** (`crates/example/src/lib.rs`, `bite_checks` module)
   — run a program through the full VM, verify the honest trace with
   `debug_proving_ctx` (constraints + LogUp bus balance), corrupt one witness
-  cell, and assert the corruption is caught. Covers all 13 chips (a result-byte
-  corruption plus opcode-routing selector bites).
+  cell, and assert the corruption is caught. Covers all 14 chips (a result-byte
+  corruption plus opcode-routing / result-class selector bites).
 
-### Cross-AS FMV
+### Cross-AS FMV and FLW/FSW
 
 `fmv.x.s` / `fmv.s.x` are cross-address-space moves (FP register file in
 AS 5 → integer registers in AS 1, and back) in F-extension mode. fxfer uses a
@@ -62,8 +63,12 @@ filled from the instruction's `d`/`e` fields and pinned by both the program bus
 and the memory bus, so FMV is sound and complete in both Zfinx and F-extension
 mode.
 
-`flw` / `fsw` are not supported: the fxfer circuit has no AS-2 memory path, so
-load/store programs fail loudly at preflight.
+`flw` / `fsw` are implemented by the `fmem` chip with a dedicated
+`Rv32FpMemAdapter`: it reads the base address register (AS 1), computes
+`mem_ptr = base + sign_extend(imm)` (2×16-bit carry chain, 4-byte alignment
+enforced), and moves a word between AS 2 at `mem_ptr` and the FP register file.
+Both instructions work in Zfinx and F-extension modes, including negative
+immediate offsets.
 
 ## Build / test commands
 
