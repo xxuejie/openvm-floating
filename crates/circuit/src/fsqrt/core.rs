@@ -281,7 +281,8 @@ impl FsqrtCoreAir {
     /// 24-bit result significand from q via ShrnGadget (shift 12 + is_hi)
     /// with RNE rounding. The result exponent is `a_hi + 63 + is_hi + rc2`.
     ///
-    /// Subnormal inputs are deferred; sqrt output is always normal.
+    /// Subnormal inputs are pre-normalized via ShlnGadget (exponent absorbs the
+    /// shift); the sqrt of a positive finite input is always normal.
     pub fn eval_finite_sqrt<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,

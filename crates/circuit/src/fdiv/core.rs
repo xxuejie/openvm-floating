@@ -394,7 +394,8 @@ impl FdivCoreAir {
     ///
     /// Verifies `q * b_sig + r = a_sig << 25` (product carry chain), `0 <= r < b_sig`
     /// (borrow chain), then extracts the correctly-rounded mantissa from q and r.
-    /// Handles both normal and overflow results; subnormal results are deferred.
+    /// Handles normal, overflow, and subnormal/underflow results; subnormal
+    /// operands are pre-normalized before the long division.
     pub fn eval_finite_div<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,
