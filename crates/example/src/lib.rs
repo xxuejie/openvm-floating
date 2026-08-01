@@ -238,6 +238,36 @@ fn fsqrt_s(rd: u32, rs1: u32) -> Instruction<F> {
     fp_unary(FpOpcode::FSQRT_S, rd, rs1)
 }
 
+/// FMV.X.S: move FP register bits to integer register.
+/// Operand layout: a=integer rd, b=FP rs1, c=0, d=integer AS, e=FP AS.
+fn fmv_x_s(rd: u32, rs1: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FMV_X_S.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::ZERO,
+        F::from_u32(RV32_REGISTER_AS), // d: integer register AS
+        F::from_u32(FP_AS),            // e: FP register AS
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+/// FMV.S.X: move integer register bits to FP register.
+/// Operand layout: a=FP rd, b=integer rs1, c=0, d=FP AS, e=integer AS.
+fn fmv_s_x(rd: u32, rs1: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FMV_S_X.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * rs1 as usize),
+        F::ZERO,
+        F::from_u32(FP_AS),            // d: FP register AS
+        F::from_u32(RV32_REGISTER_AS), // e: integer register AS
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
 /// Ternary FP instruction (fused multiply-add family): rd, rs1, rs2, rs3.
 /// Operand layout: a=rd, b=rs1, c=rs2, d=rs3, e=address space.
 fn fp_ternary(opcode: FpOpcode, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> Instruction<F> {
@@ -1119,6 +1149,38 @@ fn test_fsgnj_family() {
     // inputs preserved
     assert_eq!(read_fp_reg_bits(&state, 1), a);
     assert_eq!(read_fp_reg_bits(&state, 2), b);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FMV.X.S / FMV.S.X execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_fmv_family() {
+    let mut mem = SparseMemoryImage::new();
+    write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
+    write_fp_reg_bits(&mut mem, 2, (-2.25f32).to_bits());
+    write_fp_reg_bits(&mut mem, 3, 12345);
+
+    let state = run_program(
+        vec![
+            fmv_x_s(4, 1), // f4 = 3.5 bits
+            fmv_x_s(5, 2), // f5 = -2.25 bits
+            fmv_s_x(6, 3), // f6 = 12345 (int bits -> fp reg)
+            fmv_x_s(7, 6), // f7 = 12345 (back to int reg)
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg_bits(&state, 4), 3.5f32.to_bits());
+    assert_eq!(read_fp_reg_bits(&state, 5), (-2.25f32).to_bits());
+    assert_eq!(read_fp_reg_bits(&state, 6), 12345);
+    assert_eq!(read_fp_reg_bits(&state, 7), 12345);
+    // inputs preserved
+    assert_eq!(read_fp_reg_bits(&state, 1), 3.5f32.to_bits());
+    assert_eq!(read_fp_reg_bits(&state, 2), (-2.25f32).to_bits());
+    assert_eq!(read_fp_reg_bits(&state, 3), 12345);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2175,6 +2237,22 @@ mod chip_proving_tests {
         }
         instrs.push(terminate());
         prove_program(instrs, mem);
+    }
+
+    #[test]
+    fn test_prove_fmv() {
+        let mut mem = SparseMemoryImage::new();
+        write_fp_reg_bits(&mut mem, 1, 3.5f32.to_bits());
+        write_fp_reg_bits(&mut mem, 2, (-2.25f32).to_bits());
+        prove_program(
+            vec![
+                fmv_x_s(5, 1), // f5 = 3.5 bits
+                fmv_x_s(6, 2), // f6 = -2.25 bits
+                fmv_s_x(7, 5), // f7 = 3.5 bits
+                terminate(),
+            ],
+            mem,
+        );
     }
 }
 

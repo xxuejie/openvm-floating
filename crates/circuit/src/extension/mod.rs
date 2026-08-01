@@ -111,8 +111,6 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
         inventory.add_executor(
             fxfer,
             [
-                FpOpcode::FLW.global_opcode(),
-                FpOpcode::FSW.global_opcode(),
                 FpOpcode::FMV_X_S.global_opcode(),
                 FpOpcode::FMV_S_X.global_opcode(),
             ],

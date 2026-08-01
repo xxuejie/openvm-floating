@@ -12,7 +12,7 @@ use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, Lo
 use openvm_rv32f_transpiler::FpOpcode;
 use openvm_stark_backend::{
     interaction::InteractionBuilder,
-    p3_air::BaseAir,
+    p3_air::{AirBuilder, BaseAir},
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
     BaseAirWithPublicValues,
 };
@@ -24,6 +24,8 @@ const NUM_LIMBS: usize = 4;
 pub struct FxferCoreCols<T> {
     pub data: [T; NUM_LIMBS],
     pub result: [T; NUM_LIMBS],
+    pub fmv_x_flag: T,
+    pub fmv_s_flag: T,
     pub is_valid: T,
 }
 
@@ -57,12 +59,20 @@ where
     ) -> AdapterAirContext<AB::Expr, I> {
         let cols: &FxferCoreCols<AB::Var> = local_core.borrow();
         builder.assert_bool(cols.is_valid);
+        builder.assert_bool(cols.fmv_x_flag);
+        builder.assert_bool(cols.fmv_s_flag);
+
+        builder
+            .when(cols.is_valid)
+            .assert_one(cols.fmv_x_flag + cols.fmv_s_flag);
 
         for i in 0..NUM_LIMBS {
             builder.assert_eq(cols.result[i], cols.data[i]);
         }
 
-        let expected_opcode = AB::F::from_usize(self.offset);
+        let expected_opcode = cols.fmv_x_flag * AB::F::from_u32(FpOpcode::FMV_X_S as u32)
+            + cols.fmv_s_flag * AB::F::from_u32(FpOpcode::FMV_S_X as u32)
+            + AB::F::from_usize(self.offset);
 
         AdapterAirContext {
             to_pc: None,
@@ -70,7 +80,7 @@ where
             writes: [cols.result.map(Into::into)].into(),
             instruction: MinimalInstruction {
                 is_valid: cols.is_valid.into(),
-                opcode: expected_opcode.into(),
+                opcode: expected_opcode,
             }
             .into(),
         }
@@ -85,6 +95,7 @@ where
 #[derive(AlignedBytesBorrow, Debug, Clone)]
 pub struct FxferCoreRecord {
     pub data: [u8; NUM_LIMBS],
+    pub opcode: u8,
 }
 
 #[derive(Clone, Copy, derive_new::new)]
@@ -122,6 +133,7 @@ where
             .into();
 
         core_record.data = src;
+        core_record.opcode = instruction.opcode.local_opcode_idx(self.offset) as u8;
         self.adapter
             .write(state.memory, instruction, [src].into(), &mut adapter_record);
 
@@ -150,10 +162,27 @@ where
         let (adapter_row, mut core_row) = unsafe { row_slice.split_at_mut_unchecked(A::WIDTH) };
         self.adapter.fill_trace_row(mem_helper, adapter_row);
         let record: &FxferCoreRecord = unsafe { get_record_from_slice(&mut core_row, ()) };
+        // NOTE: `record` aliases the start of the core region (it is only
+        // 5 bytes while `core_row.data` spans 4 field elements), so the fields
+        // must be copied to locals *before* any `core_row` writes, which would
+        // otherwise clobber them.
+        let data = record.data;
+        let opcode = FpOpcode::from_usize(record.opcode as usize);
         let core_row: &mut FxferCoreCols<F> = core_row.borrow_mut();
-        for i in 0..NUM_LIMBS {
-            core_row.data[i] = F::from_u8(record.data[i]);
-            core_row.result[i] = F::from_u8(record.data[i]);
+        for (i, b) in data.into_iter().enumerate() {
+            core_row.data[i] = F::from_u8(b);
+            core_row.result[i] = F::from_u8(b);
+        }
+        match opcode {
+            FpOpcode::FMV_X_S => {
+                core_row.fmv_x_flag = F::ONE;
+                core_row.fmv_s_flag = F::ZERO;
+            }
+            FpOpcode::FMV_S_X => {
+                core_row.fmv_x_flag = F::ZERO;
+                core_row.fmv_s_flag = F::ONE;
+            }
+            other => panic!("fxfer filler: unexpected opcode {other:?}"),
         }
         core_row.is_valid = F::ONE;
     }
