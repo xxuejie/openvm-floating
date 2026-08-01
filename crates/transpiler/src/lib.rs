@@ -18,6 +18,9 @@ use rrs_lib::instruction_formats::{IType, RType, SType};
 mod instructions;
 pub use instructions::*;
 
+#[cfg(test)]
+mod tests;
+
 /// Transpiler extension for RISC-V F / Zfinx single-precision floating-point instructions.
 ///
 /// Recognizes OPC-FP (0x53) instructions and converts them to OpenVM opcodes.

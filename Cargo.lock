@@ -1385,6 +1385,7 @@ dependencies = [
  "openvm-instructions-derive",
  "openvm-rv32f-guest",
  "openvm-stark-backend",
+ "openvm-stark-sdk",
  "openvm-transpiler",
  "rrs-lib",
  "serde",

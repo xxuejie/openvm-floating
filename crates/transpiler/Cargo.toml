@@ -15,3 +15,7 @@ openvm-stark-backend = { workspace = true }
 rrs-lib = { workspace = true }
 serde = { workspace = true }
 strum = { workspace = true }
+
+[dev-dependencies]
+openvm-stark-sdk = { workspace = true }
+openvm-stark-backend = { workspace = true, features = ["test-utils"] }
