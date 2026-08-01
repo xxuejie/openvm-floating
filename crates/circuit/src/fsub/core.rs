@@ -1682,6 +1682,7 @@ fn fill_cancel_fsub<F: PrimeField32>(
         ((aligned >> 40) & 0xFF) as u32,
     ];
     let mut borrow = 0i32;
+    let mut byte_borrows = [0u32; 5];
     for i in 0..6 {
         let d = lw_bytes[i] as i32 - al_bytes[i] as i32 - borrow;
         if d < 0 {
@@ -1692,10 +1693,25 @@ fn fill_cancel_fsub<F: PrimeField32>(
             borrow = 0;
         }
         if i < 5 {
-            row.cancel_borrow[i] = F::from_u32(borrow as u32);
+            byte_borrows[i] = borrow as u32;
         }
     }
     debug_assert_eq!(borrow, 0, "fsub cancel final borrow != 0");
+    // The AIR uses different borrow layouts per branch: ediff >= 1 chains all
+    // 6 bytes (borrow[i] = carry out of byte i), while the ediff == 0 branch
+    // chains only bytes 3..5 and reads borrow[0]/borrow[1] as the carries out
+    // of bytes 3/4.
+    if ediff == 0 {
+        row.cancel_borrow[0] = F::from_u32(byte_borrows[3]);
+        row.cancel_borrow[1] = F::from_u32(byte_borrows[4]);
+        for i in 2..5 {
+            row.cancel_borrow[i] = F::ZERO;
+        }
+    } else {
+        for (i, &bb) in byte_borrows.iter().enumerate() {
+            row.cancel_borrow[i] = F::from_u32(bb);
+        }
+    }
 
     let raw_diff_val: u64 = (0..6).fold(0u64, |acc, i| {
         acc | ((row.cancel_diff[i].as_canonical_u32() as u64) << (i * 8))

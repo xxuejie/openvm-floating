@@ -9,11 +9,14 @@
 //! sides of the byte relation by `bit_mult = 2^r`.
 
 use openvm_circuit_primitives::{
-    var_range::VariableRangeCheckerBus, StructReflection, StructReflectionHelper,
+    var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
+    StructReflection, StructReflectionHelper,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
 use openvm_stark_backend::{
-    interaction::InteractionBuilder, p3_air::AirBuilder, p3_field::PrimeCharacteristicRing,
+    interaction::InteractionBuilder,
+    p3_air::AirBuilder,
+    p3_field::{PrimeCharacteristicRing, PrimeField32},
 };
 
 /// Bits per limb (bytes).
@@ -411,6 +414,69 @@ impl ShlnGadget {
 }
 
 // === Host-side computation (for witnesses + tests) ===
+
+/// Pre-normalize a subnormal f32 operand (leading-zeros left shift) and
+/// register range-checker counts. Returns (is_subnormal, effective exponent,
+/// 24-bit significand with the implicit bit at position 23). For
+/// normal/zero/inf/NaN inputs returns (false, exp, mant | implicit).
+pub(crate) fn fill_op_norm<F: PrimeField32>(
+    exp: u32,
+    mant: u32,
+    lshift: &mut F,
+    shln: &mut ShlnCols<F, 3>,
+    y2_lo7: &mut F,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> (bool, i32, u32) {
+    let sub = exp == 0 && mant != 0;
+    if sub {
+        let lz = 24 - (32 - mant.leading_zeros());
+        let bytes = [mant & 0xFF, (mant >> 8) & 0xFF, (mant >> 16) & 0xFF];
+        *shln = make_shln_cols3::<F>(bytes, lz as usize, range_checker);
+        *lshift = F::from_u32(lz);
+        let sig = mant << lz;
+        *y2_lo7 = F::from_u32(((sig >> 16) & 0xFF) - 128);
+        range_checker.add_count(((sig >> 16) & 0xFF) - 128, 7);
+        (true, 1 - lz as i32, sig)
+    } else {
+        (false, exp as i32, mant | 0x800000)
+    }
+}
+
+/// Build a `ShlnCols<3>` witness (subnormal operand normalization) and
+/// register range-checker counts.
+pub(crate) fn make_shln_cols3<F: PrimeField32>(
+    x: [u32; 3],
+    shift: usize,
+    range_checker: &SharedVariableRangeCheckerChip,
+) -> ShlnCols<F, 3> {
+    const N: usize = 3;
+    let (y, q, r) = run_shln(&x, shift);
+    let mut limb_shift_marker = [F::ZERO; N];
+    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
+    limb_shift_marker[q] = F::ONE;
+    bit_shift_marker[r] = F::ONE;
+    let cv = |v: u32| {
+        if r == 0 {
+            0
+        } else {
+            v >> (SHLIMB_BITS - r)
+        }
+    };
+    for i in 0..N {
+        range_checker.add_count(cv(x[i]), r);
+        range_checker.add_count(y[i], 8);
+    }
+    ShlnCols {
+        x: core::array::from_fn(|i| F::from_u32(x[i])),
+        shift: F::from_u32(shift as u32),
+        enable: F::ONE,
+        limb_shift_marker,
+        bit_shift_marker,
+        bit_mult: F::from_u32(1u32 << r),
+        bit_shift_carry: core::array::from_fn(|i| F::from_u32(cv(x[i]))),
+        y: core::array::from_fn(|i| F::from_u32(y[i])),
+    }
+}
 
 /// Compute (y = x >> shift, limb_shift, bit_shift) for little-endian byte array `x`.
 pub fn run_shrn<const N: usize>(x: &[u32; N], shift: usize) -> ([u32; N], usize, usize) {
