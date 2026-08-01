@@ -18,7 +18,7 @@ use openvm_stark_backend::{p3_field::PrimeField32, StarkEngine, StarkProtocolCon
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fdiv::*, fma::*,
+    adapters::*, fadd::*, fclass::*, fcmp::*, fcvt_f2i::*, fcvt_i2f::*, fdiv::*, fma::*, fmem::*,
     fminmax::*, fmul::*, fsgnj::*, fsqrt::*, fsub::*, fxfer::*,
 };
 
@@ -75,6 +75,7 @@ pub enum Rv32FExecutor {
     Fdiv(Rv32FdivExecutor),
     Fsqrt(Rv32FsqrtExecutor),
     Fxfer(Rv32FxferExecutor),
+    Fmem(Rv32FmemExecutor),
 }
 
 impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
@@ -114,6 +115,14 @@ impl<F: PrimeField32> VmExecutionExtension<F> for Rv32F {
                 FpOpcode::FMV_X_S.global_opcode(),
                 FpOpcode::FMV_S_X.global_opcode(),
             ],
+        )?;
+
+        let pointer_max_bits = inventory.pointer_max_bits();
+        let adapter_exec = Rv32FpMemAdapterExecutor::new(self.fp_register_as, pointer_max_bits);
+        let fmem = Rv32FmemExecutor::new(adapter_exec, FpOpcode::CLASS_OFFSET);
+        inventory.add_executor(
+            fmem,
+            [FpOpcode::FLW.global_opcode(), FpOpcode::FSW.global_opcode()],
         )?;
 
         let adapter_exec = Rv32FpAdapterExecutor::new(self.fp_register_as);
@@ -271,6 +280,18 @@ impl<SC: StarkProtocolConfig> VmCircuitExtension<SC> for Rv32F {
         );
         inventory.add_air(fxfer);
 
+        let fmem = Rv32FmemAir::new(
+            Rv32FpMemAdapterAir::new(
+                exec_bridge,
+                memory_bridge,
+                range_checker_bus,
+                self.fp_register_as,
+                inventory.pointer_max_bits(),
+            ),
+            FmemCoreAir::new(FpOpcode::CLASS_OFFSET),
+        );
+        inventory.add_air(fmem);
+
         let fsub = Rv32FsubAir::new(
             Rv32FpAdapterAir::new(exec_bridge, memory_bridge, self.fp_register_as),
             FsubCoreAir::new(range_checker_bus, FpOpcode::CLASS_OFFSET),
@@ -425,6 +446,20 @@ where
             mem_helper.clone(),
         );
         inventory.add_executor_chip(fxfer);
+
+        inventory.next_air::<Rv32FmemAir>()?;
+        let fmem = Rv32FmemChip::new(
+            FmemFiller::new(
+                Rv32FpMemAdapterFiller::new(
+                    range_checker.clone(),
+                    extension.fp_register_as,
+                    inventory.airs().pointer_max_bits(),
+                ),
+                FpOpcode::CLASS_OFFSET,
+            ),
+            mem_helper.clone(),
+        );
+        inventory.add_executor_chip(fmem);
 
         inventory.next_air::<Rv32FsubAir>()?;
         let fsub = Rv32FsubChip::new(

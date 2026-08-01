@@ -1,11 +1,13 @@
 mod fcmp;
 mod fp;
 mod fp3;
+mod fp_mem;
 mod fp_move;
 mod fp_unary;
 pub use fcmp::*;
 pub use fp::*;
 pub use fp3::*;
+pub use fp_mem::*;
 pub use fp_move::*;
 pub use fp_unary::*;
 

@@ -11,7 +11,7 @@ use openvm_instructions::{
     exe::{SparseMemoryImage, VmExe},
     instruction::Instruction,
     program::Program,
-    riscv::RV32_REGISTER_AS,
+    riscv::{RV32_MEMORY_AS, RV32_REGISTER_AS},
     LocalOpcode, SystemOpcode, VmOpcode,
 };
 use openvm_rv32f_circuit::Rv32FConfig;
@@ -268,6 +268,64 @@ fn fmv_s_x(rd: u32, rs1: u32) -> Instruction<F> {
     )
 }
 
+/// FLW: load a float from memory into an FP register.
+/// Operand layout: a=FP rd, b=integer base (AS 1), c=imm, d=FP AS, e=memory AS.
+fn flw(rd: u32, base: u32, imm: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FLW.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * base as usize),
+        F::from_u32(imm),
+        F::from_u32(FP_AS),
+        F::from_u32(RV32_MEMORY_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+/// FLW in F-extension mode: FP register in AS `fp_as`.
+fn flw_f(rd: u32, base: u32, imm: u32, fp_as: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FLW.global_opcode_usize()),
+        F::from_usize(4 * rd as usize),
+        F::from_usize(4 * base as usize),
+        F::from_u32(imm),
+        F::from_u32(fp_as),
+        F::from_u32(RV32_MEMORY_AS),
+        F::ZERO,
+        F::ZERO,
+    )
+}
+
+/// FSW: store a float from an FP register to memory.
+/// Operand layout: a=integer base (AS 1), b=FP source, c=imm, d=memory AS, e=FP AS.
+fn fsw(base: u32, rs2: u32, imm: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FSW.global_opcode_usize()),
+        F::from_usize(4 * base as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(imm),
+        F::from_u32(RV32_MEMORY_AS),
+        F::from_u32(FP_AS),
+        F::ONE, // store indicator
+        F::ZERO,
+    )
+}
+
+/// FSW in F-extension mode: FP source in AS `fp_as`.
+fn fsw_f(base: u32, rs2: u32, imm: u32, fp_as: u32) -> Instruction<F> {
+    Instruction::new(
+        VmOpcode::from_usize(FpOpcode::FSW.global_opcode_usize()),
+        F::from_usize(4 * base as usize),
+        F::from_usize(4 * rs2 as usize),
+        F::from_u32(imm),
+        F::from_u32(RV32_MEMORY_AS),
+        F::from_u32(fp_as),
+        F::ONE, // store indicator
+        F::ZERO,
+    )
+}
+
 /// FMV.X.S in F-extension mode: FP register (AS `fp_as`) -> integer register (AS 1).
 /// Operand layout: a = int rd, b = FP rs1, c = 0, d = int AS, e = FP AS.
 fn fmv_x_s_f(rd: u32, rs1: u32, fp_as: u32) -> Instruction<F> {
@@ -466,6 +524,19 @@ fn write_fp_reg_bits(mem: &mut SparseMemoryImage, reg_idx: u32, bits: u32) {
 fn read_fp_reg_bits(state: &VmState<F>, reg_idx: u32) -> u32 {
     let offset = reg_idx * 4;
     let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(FP_AS, offset) };
+    u32::from_le_bytes(bytes)
+}
+
+fn write_int_reg_bits(mem: &mut SparseMemoryImage, reg_idx: u32, bits: u32) {
+    let offset = reg_idx * 4;
+    for (i, byte) in bits.to_le_bytes().iter().enumerate() {
+        mem.insert((RV32_REGISTER_AS, offset + i as u32), *byte);
+    }
+}
+
+fn read_int_reg_bits(state: &VmState<F>, reg_idx: u32) -> u32 {
+    let offset = reg_idx * 4;
+    let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(RV32_REGISTER_AS, offset) };
     u32::from_le_bytes(bytes)
 }
 
@@ -1184,7 +1255,6 @@ fn test_fsgnj_family() {
 // ════════════════════════════════════════════════════════════════════════════
 // FMV.X.S / FMV.S.X execution tests
 // ════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn test_fmv_family() {
     let mut mem = SparseMemoryImage::new();
@@ -1211,6 +1281,71 @@ fn test_fmv_family() {
     assert_eq!(read_fp_reg_bits(&state, 1), 3.5f32.to_bits());
     assert_eq!(read_fp_reg_bits(&state, 2), (-2.25f32).to_bits());
     assert_eq!(read_fp_reg_bits(&state, 3), 12345);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FLW / FSW execution tests
+// ════════════════════════════════════════════════════════════════════════════
+
+fn read_mem_bytes(state: &VmState<F>, addr: u32) -> u32 {
+    let bytes: [u8; 4] = unsafe { state.memory.read::<u8, 4>(RV32_MEMORY_AS, addr) };
+    u32::from_le_bytes(bytes)
+}
+
+fn write_mem_bytes(mem: &mut SparseMemoryImage, addr: u32, bits: u32) {
+    for (i, byte) in bits.to_le_bytes().iter().enumerate() {
+        mem.insert((RV32_MEMORY_AS, addr + i as u32), *byte);
+    }
+}
+
+#[test]
+fn test_flw_fsw_roundtrip() {
+    let mut mem = SparseMemoryImage::new();
+    // Integer base register (AS 1) holds the memory address 0x1000.
+    write_int_reg_bits(&mut mem, 1, 0x1000);
+    // Initialize memory at 0x1000 with a float bit pattern.
+    write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+    // Pre-store the value to be written by fsw into FP register 2.
+    write_fp_reg_bits(&mut mem, 2, (-2.25f32).to_bits());
+
+    let state = run_program(
+        vec![
+            flw(0, 1, 0),  // f0 = load(0x1000) = 3.5
+            fsw(1, 2, 0),  // store f2 (-2.25) to memory[0x1000]
+            flw(3, 1, 0),  // f3 = load(0x1000) = -2.25
+            fsw(1, 0, 16), // store f0 (3.5) to memory[0x1010]
+            flw(4, 1, 16), // f4 = load(0x1010) = 3.5
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 0), 3.5);
+    assert_eq!(read_fp_reg(&state, 3), -2.25);
+    assert_eq!(read_fp_reg(&state, 4), 3.5);
+    // fsw wrote -2.25 over the initial 3.5 at 0x1000; 0x1010 holds 3.5.
+    assert_eq!(read_mem_bytes(&state, 0x1000), (-2.25f32).to_bits());
+    assert_eq!(read_mem_bytes(&state, 0x1010), 3.5f32.to_bits());
+}
+
+#[test]
+fn test_flw_fsw_negative_offset() {
+    let mut mem = SparseMemoryImage::new();
+    write_int_reg_bits(&mut mem, 1, 0x1004);
+    write_mem_bytes(&mut mem, 0x1000, 7.5f32.to_bits());
+    write_fp_reg(&mut mem, 2, 9.5);
+
+    let state = run_program(
+        vec![
+            flw(0, 1, 0xFFFC), // f0 = load(0x1004 - 4) = load(0x1000) = 7.5
+            fsw(1, 2, 0xFFFC), // store f2 (9.5) to memory[0x1000]
+            terminate(),
+        ],
+        mem,
+    );
+
+    assert_eq!(read_fp_reg(&state, 0), 7.5);
+    assert_eq!(read_mem_bytes(&state, 0x1000), 9.5f32.to_bits());
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2316,6 +2451,14 @@ mod chip_proving_tests {
             mem,
         );
     }
+
+    #[test]
+    fn test_prove_flw_fsw() {
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg_bits(&mut mem, 1, 0x1000);
+        write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+        prove_program(vec![flw(5, 1, 0), terminate()], mem);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2524,13 +2667,13 @@ mod bite_checks {
     }
 
     use openvm_rv32f_circuit::adapters::{
-        Rv32Fp3AdapterCols, Rv32FpMoveAdapterCols, Rv32FpUnaryAdapterCols,
+        Rv32Fp3AdapterCols, Rv32FpMemAdapterCols, Rv32FpMoveAdapterCols, Rv32FpUnaryAdapterCols,
     };
     use openvm_rv32f_circuit::{
         fadd::FaddCoreCols, fclass::FclassCoreCols, fcmp::FcmpCoreCols, fcvt_f2i::FcvtF2ICoreCols,
-        fcvt_i2f::FcvtI2FCoreCols, fdiv::FdivCoreCols, fma::FmaCoreCols, fminmax::FminmaxCoreCols,
-        fmul::FmulCoreCols, fsgnj::FsgnjCoreCols, fsqrt::FsqrtCoreCols, fsub::FsubCoreCols,
-        fxfer::FxferCoreCols,
+        fcvt_i2f::FcvtI2FCoreCols, fdiv::FdivCoreCols, fma::FmaCoreCols, fmem::FmemCoreCols,
+        fminmax::FminmaxCoreCols, fmul::FmulCoreCols, fsgnj::FsgnjCoreCols, fsqrt::FsqrtCoreCols,
+        fsub::FsubCoreCols, fxfer::FxferCoreCols,
     };
 
     // ── fadd ────────────────────────────────────────────────────────────
@@ -2977,6 +3120,40 @@ mod bite_checks {
             fclass_s,
         );
     }
+
+    // ── fmem (FLW/FSW) ──────────────────────────────────────────────────
+    #[test]
+    fn bite_flw_flag() {
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg_bits(&mut mem, 1, 0x1000);
+        write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+        let col = core_col::<Rv32FpMemAdapterCols<u8>, FmemCoreCols<F>>("flw_flag");
+        bite_check(
+            vec![flw(5, 1, 0), terminate()],
+            mem,
+            "FmemCoreAir",
+            0,
+            col,
+            0,
+        );
+    }
+
+    #[test]
+    fn bite_fmem_opcode_flag() {
+        // FSW row: corrupting flw_flag (is_load) must be caught.
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg_bits(&mut mem, 1, 0x1000);
+        write_fp_reg_bits(&mut mem, 2, (-2.25f32).to_bits());
+        let col = core_col::<Rv32FpMemAdapterCols<u8>, FmemCoreCols<F>>("flw_flag");
+        bite_check(
+            vec![fsw(1, 2, 0), terminate()],
+            mem,
+            "FmemCoreAir",
+            0,
+            col,
+            1,
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3226,6 +3403,28 @@ mod f_extension_tests {
         assert_eq!(read_fpreg_f(&state, 7), -42.0);
     }
 
+    #[test]
+    fn test_f_ext_flw_fsw() {
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg(&mut mem, 1, 0x1000);
+        write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+        write_fpreg_f(&mut mem, 2, -2.25);
+
+        let state = run_f_program(
+            vec![
+                flw_f(0, 1, 0, F_AS), // f0 = load(0x1000) = 3.5
+                fsw_f(1, 2, 0, F_AS), // store f2 (-2.25) to memory[0x1000]
+                flw_f(3, 1, 0, F_AS), // f3 = load(0x1000) = -2.25
+                terminate(),
+            ],
+            mem,
+        );
+
+        assert_eq!(read_fpreg_f(&state, 0), 3.5);
+        assert_eq!(read_fpreg_f(&state, 3), -2.25);
+        assert_eq!(read_mem_bytes(&state, 0x1000), (-2.25f32).to_bits());
+    }
+
     #[cfg(feature = "proving")]
     #[test]
     fn test_prove_cross_as_unary_f() {
@@ -3241,6 +3440,30 @@ mod f_extension_tests {
                 fclass_f(5, 1),   // int r5 = FCLASS(1.5)
                 fcvt_w_s_f(6, 1), // int r6 = 1
                 fcvt_s_w_f(7, 3), // f7 = -42.0
+                terminate(),
+            ],
+            0,
+        );
+        let exe = VmExe::new(program).with_init_memory(mem);
+        air_test(Rv32FCpuBuilder, Rv32FConfig::new_f(), exe);
+    }
+
+    #[cfg(feature = "proving")]
+    #[test]
+    fn test_prove_flw_fsw_f() {
+        use openvm_circuit::utils::air_test;
+        use openvm_rv32f_circuit::Rv32FCpuBuilder;
+
+        let mut mem = SparseMemoryImage::new();
+        write_int_reg(&mut mem, 1, 0x1000);
+        write_mem_bytes(&mut mem, 0x1000, 3.5f32.to_bits());
+        write_fpreg_f(&mut mem, 2, -2.25);
+
+        let program = Program::new_without_debug_infos(
+            &vec![
+                flw_f(5, 1, 0, F_AS), // f5 = load(0x1000) = 3.5
+                fsw_f(1, 2, 0, F_AS), // store f2 (-2.25) to memory[0x1000]
+                flw_f(6, 1, 0, F_AS), // f6 = load(0x1000) = -2.25
                 terminate(),
             ],
             0,
