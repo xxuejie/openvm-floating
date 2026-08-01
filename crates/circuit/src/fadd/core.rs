@@ -3003,4 +3003,55 @@ mod finite_add_tests {
         air().eval_finite_cancel(&mut b2, &row2);
         assert!(b2.ok(), "ediff=0 cancel a>b: {:?}", b2.failures);
     }
+
+    /// Result bytes and routing selectors must be pinned: a +1 perturbation of
+    /// each must break a gate on the full eval, across the input classes.
+    #[test]
+    fn corruption_sweep_pins_result_and_selectors() {
+        use crate::test_utils::assert_columns_constrained;
+        use openvm_circuit::arch::BasicAdapterInterface;
+        use openvm_circuit::arch::MinimalInstruction;
+        use openvm_circuit_primitives::StructReflectionHelper;
+        type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+        let chip = rc();
+        let names = FaddCoreCols::<F>::struct_reflection().unwrap_or_default();
+        let eval_full = |b: &mut NumericBuilder<F>, cols: &[F]| {
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air(), b, cols, F::ZERO);
+        };
+        let classes: &[(u32, u32, &[&str])] = &[
+            // (a, b, selectors asserted on this class)
+            (
+                1.5f32.to_bits(),
+                2.5f32.to_bits(),
+                &["is_add", "round_up", "is_deep"][..],
+            ),
+            (0x3F800000, 0xBF800000, &[]), // 1.0 + (-1.0) = +0 (cancel path)
+            (0x7F800000, 0x3F800000, &[]), // inf + 1.0
+            (0x7FC00000, 0x3F800000, &[]), // NaN + 1.0
+            (0x00800000, 0x00800000, &[]), // min normal + min normal
+            (0x00400000, 0x80400000, &[]), // subnormal - subnormal (cancel)
+        ];
+        for &(a, b, selectors) in classes {
+            let mut row = FaddCoreCols::<F>::default();
+            fill_fadd_witness(&mut row, a, b, fadd_s(a, b), &chip);
+            let mut buf = vec![F::ZERO; FaddCoreCols::<F>::width()];
+            *buf.as_mut_slice().borrow_mut() = row;
+            let mut bld = NumericBuilder::new(vec![]);
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air(), &mut bld, &buf, F::ZERO);
+            assert!(
+                bld.ok(),
+                "honest fadd a={a:08x} b={b:08x}: {:?}",
+                bld.failures
+            );
+            let mut pinned = vec!["result__0", "result__1", "result__2", "result__3"];
+            pinned.extend_from_slice(selectors);
+            assert_columns_constrained(
+                &buf,
+                eval_full,
+                &names,
+                &pinned,
+                &format!("fadd a={a:08x} b={b:08x}"),
+            );
+        }
+    }
 }

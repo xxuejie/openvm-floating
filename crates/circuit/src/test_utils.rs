@@ -137,6 +137,35 @@ where
     accepted
 }
 
+/// Asserts that the named columns of an honest row are pinned: a +1 perturbation
+/// of each must break at least one gate constraint. Used by the arithmetic chips
+/// whose full witness sets contain many gated-off gadget aux columns — those are
+/// not asserted on, only the result bytes and routing selectors that must always
+/// be constrained. `names` is the `StructReflectionHelper` column list of the
+/// witness type whose elements the sweep perturbs.
+pub fn assert_columns_constrained<F, C: ?Sized>(
+    honest: &[F],
+    air_fn: impl Fn(&mut NumericBuilder<F>, &C),
+    names: &[String],
+    col_names: &[&str],
+    label: &str,
+) where
+    F: Field + PrimeCharacteristicRing + Copy + Default,
+    [F]: Borrow<C>,
+{
+    let accepted = corruption_sweep(honest, air_fn);
+    for name in col_names {
+        let idx = names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{label}: column {name} not found"));
+        assert!(
+            !accepted.contains(&idx),
+            "{label}: column {name} (idx {idx}) accepted a +1 perturbation"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

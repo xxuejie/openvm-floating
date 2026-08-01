@@ -1923,6 +1923,53 @@ mod full_eval_tests {
         FmulCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0)
     }
 
+    /// Result bytes and routing selectors must be pinned on the full eval.
+    #[test]
+    fn corruption_sweep_pins_result_and_selectors() {
+        use crate::test_utils::assert_columns_constrained;
+        use openvm_circuit::arch::BasicAdapterInterface;
+        use openvm_circuit::arch::MinimalInstruction;
+        use openvm_circuit_primitives::StructReflectionHelper;
+        type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+        let names = FmulCoreCols::<F>::struct_reflection().unwrap_or_default();
+        let eval_full = |b: &mut NumericBuilder<F>, cols: &[F]| {
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air(), b, cols, F::ZERO);
+        };
+        let classes: &[(u32, u32, &[&str])] = &[
+            (
+                3.0f32.to_bits(),
+                4.0f32.to_bits(),
+                &["round_up", "is_high"][..],
+            ),
+            (0x7F7FFFFF, 0x40000000, &[]), // MAX * 2 -> inf (overflow)
+            (0x7F800000, 0x3F800000, &[]), // inf * 1
+            (0x7FC00000, 0x3F800000, &[]), // NaN * 1
+            (0x00000001, 0x00000001, &[]), // min subnormal^2 -> +0
+            (0x00000001, 0x3F800000, &[]), // subnormal * 1 -> subnormal
+        ];
+        for &(a, b, selectors) in classes {
+            let (cols, _chip) = filler_cols(a, b);
+            let mut buf = vec![F::ZERO; FmulCoreCols::<F>::width()];
+            *buf.as_mut_slice().borrow_mut() = cols;
+            let mut bld = NumericBuilder::new(vec![]);
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air(), &mut bld, &buf, F::ZERO);
+            assert!(
+                bld.ok(),
+                "honest fmul a={a:08x} b={b:08x}: {:?}",
+                bld.failures
+            );
+            let mut pinned = vec!["result__0", "result__1", "result__2", "result__3"];
+            pinned.extend_from_slice(selectors);
+            assert_columns_constrained(
+                &buf,
+                eval_full,
+                &names,
+                &pinned,
+                &format!("fmul a={a:08x} b={b:08x}"),
+            );
+        }
+    }
+
     #[test]
     fn full_eval_special_inputs_pass() {
         // Run each eval helper on filler-built witness for special inputs, to see
