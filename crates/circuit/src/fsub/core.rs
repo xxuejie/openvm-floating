@@ -175,9 +175,28 @@ pub struct FsubCoreCols<T> {
     pub s_fb: T,
     pub s_bn: T,         // finite AND both normal (cancellation path)
     pub s_one_zero: T,   // finite AND exactly one input is zero
-    pub s_sub_result: T, // shallow AND result exp field == 0 (subnormal/zero)
-    pub s_cancel: T,     // s_bn AND is_add (same sign) AND !is_deep
-    pub a_ge_b: T,       // bool: a_sig >= b_sig (magnitude compare for ediff=0)
+    pub s_sub_result: T, // shallow AND base_exp_sh <= 0 (subnormal-result gate)
+
+    // === Shallow-path subnormal results ===
+    pub sh_base_exp: T, // pre-rounding exponent (large_exp_eff + carry_out)
+    pub sh_is_sub: T,   // sh_base_exp <= 0
+    pub sh_ef_max: T,   // (result exp field == 255) indicator (witness for degree)
+    pub sh_route_decomp: [T; 1],
+    pub sh_sub_t: T, // denormal shift 9 - sh_base_exp (in [9, 31])
+    pub sh_sub_shrn: ShrnCols<T, 4>,
+    pub sh_sub_lsb: T,
+    pub sh_sub_hi7: T,
+    pub sh_sub_sticky_eff: T, // gadget sticky OR alignment lost_sticky
+    pub sh_sub_round_up: T,
+    pub sh_sub_z0: T,
+    pub sh_sub_z1: T,
+    pub sh_sub_z2: T,
+    pub sh_sub_zc0: T,
+    pub sh_sub_zc1: T,
+    pub sh_sub_exp1: T,   // z bit 23 (rounded up to smallest normal)
+    pub sh_sub_z2_lo7: T, // z2 low 7 bits
+    pub s_cancel: T,      // s_bn AND is_add (same sign) AND !is_deep
+    pub a_ge_b: T,        // bool: a_sig >= b_sig (magnitude compare for ediff=0)
     pub s_cancel_normal: T,
 
     // === Cancellation output routing + subnormal results ===
@@ -798,12 +817,34 @@ impl FsubCoreAir {
         builder.assert_bool(cols.round_up);
 
         // ── Output reconstruction ───────────────────────────────────────
+        // base_exp_sh = large_exp_eff + carry_out (pre-rounding exponent;
+        // witness column for degree). Subnormal results (base_exp_sh <= 0)
+        // are routed by a less-than gadget — the class is never prover-chosen.
         builder
             .when(s_shallow)
+            .assert_eq(cols.sh_base_exp, large_exp_eff + cols.carry_out);
+        let sh_base_exp_b = cols.sh_base_exp + AB::Expr::from(f256);
+        self.range_bus
+            .range_check(sh_base_exp_b.clone(), 9)
+            .eval(builder, s_shallow);
+        let sh_sub_io = IsLessThanIo::new(
+            sh_base_exp_b,
+            AB::Expr::from(AB::F::from_u32(257)),
+            cols.sh_is_sub.into(),
+            s_shallow,
+        );
+        IsLtSubAir::new(self.range_bus, 9).eval(builder, (sh_sub_io, &cols.sh_route_decomp));
+        builder.assert_bool(cols.sh_is_sub);
+        let not_sub = one.clone() - cols.sh_is_sub;
+
+        // result_exp = r_exp_lo + r_exp_hi*2 = base_exp_sh + rc2 (normal and
+        // overflow rows; exponent 255 naturally encodes +-inf).
+        builder
+            .when(s_shallow * not_sub.clone())
             .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
-        builder.when(s_shallow).assert_eq(
+        builder.when(s_shallow * not_sub.clone()).assert_eq(
             cols.r_exp_lo + cols.r_exp_hi * f2,
-            large_exp_eff + cols.carry_out + cols.rc2,
+            cols.sh_base_exp + cols.rc2,
         );
         // Result sign for opposite-sign subtraction = a_sign.
         builder
@@ -816,31 +857,30 @@ impl FsubCoreAir {
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s_shallow);
-        builder
-            .when(s_shallow)
-            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
 
-        // Sound "(r_exp_hi == 0)" / "(r_exp_hi == 127)" indicators.
-        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
-        builder
-            .when(s_shallow)
-            .assert_zero(cols.r_exp_hi * he0.clone());
+        // Sound "(r_exp_hi == 127)" indicator (overflow detection on the
+        // non-subnormal rows; its inverse witness is don't-care elsewhere).
         let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
         let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
         builder
             .when(s_shallow)
             .assert_zero(delta127 * he127.clone());
-        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
         let exp_field_max = cols.r_exp_lo * he127;
+        builder.assert_eq(cols.sh_ef_max, exp_field_max);
+        builder.assert_bool(cols.sh_ef_max);
+        // s_normal / s_overflow stored as columns (degree 1).
         builder.assert_eq(
             cols.s_normal,
-            s_shallow * (one.clone() - exp_field_zero.clone() - exp_field_max.clone()),
+            s_shallow * not_sub.clone() * (one.clone() - cols.sh_ef_max),
         );
-        builder.assert_eq(cols.s_overflow, s_shallow * exp_field_max.clone());
+        builder.assert_eq(
+            cols.s_overflow,
+            s_shallow * not_sub.clone() * cols.sh_ef_max,
+        );
         builder.assert_bool(cols.s_normal);
         builder.assert_bool(cols.s_overflow);
-        // s_sub_result = shallow AND result exp field == 0.
-        builder.assert_eq(cols.s_sub_result, s_shallow * exp_field_zero.clone());
+        // s_sub_result = shallow AND base_exp_sh <= 0 (subnormal/zero result).
+        builder.assert_eq(cols.s_sub_result, s_shallow * cols.sh_is_sub);
         builder.assert_bool(cols.s_sub_result);
 
         // Normal result: tie mantissa bytes to the rounded significand.
@@ -861,29 +901,93 @@ impl FsubCoreAir {
         builder
             .when(cols.s_overflow)
             .assert_eq(cols.result[2], f128);
-        // Subnormal result: no implicit bit to strip from norm_sig[3].
-        let ssr = cols.s_sub_result;
-        builder.when(ssr).assert_eq(
-            cols.result[0] + cols.rc0 * f256,
-            cols.norm_sig[1] + cols.round_up,
-        );
-        builder.when(ssr).assert_eq(
-            cols.result[1] + cols.rc1 * f256,
-            cols.norm_sig[2] + cols.rc0,
-        );
+        // result[3] = r_exp_hi + result_sign*128 (normal and overflow).
         builder
-            .when(ssr)
-            .assert_eq(cols.norm_sig[3] + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
-        self.range_bus
-            .range_check(cols.rc2_rem.into(), 7)
-            .eval(builder, ssr.into());
-        builder
-            .when(ssr)
-            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
-        builder
-            .when(ssr)
+            .when(s_shallow * not_sub)
             .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
-        builder.when(ssr).assert_eq(cols.result_exp, cols.rc2);
+
+        // ── Sub path: subnormal results ──────────────────────────────────
+        // Denormalize: shift norm_sig right by t = 9 - base_exp_sh (in
+        // [9, 31]; base_exp_sh >= -22 is forced by the operand normalization
+        // anchors, so no clamp is needed). Single RNE rounding from the
+        // gadget's guard/sticky plus the alignment loss (additive here); the
+        // round carry into bit 23 yields the smallest normal.
+        let ssub = cols.s_sub_result;
+        builder.when(ssub).assert_eq(
+            cols.sh_sub_t,
+            AB::Expr::from(AB::F::from_u32(9)) - cols.sh_base_exp,
+        );
+        self.range_bus
+            .range_check(cols.sh_sub_t.into(), 5)
+            .eval(builder, ssub.into());
+        builder
+            .when(ssub)
+            .assert_eq(cols.sh_sub_shrn.shift, cols.sh_sub_t);
+        for i in 0..4 {
+            builder
+                .when(ssub)
+                .assert_eq(cols.sh_sub_shrn.x[i], cols.norm_sig[i]);
+        }
+        builder.assert_eq(cols.sh_sub_shrn.enable, ssub);
+        let sh_shrn = ShrnGadget::new(self.range_bus);
+        sh_shrn.eval_shrn(builder, &cols.sh_sub_shrn);
+        // RNE rounding: guard/sticky from the gadget, sticky OR'd with the
+        // alignment loss (magnitude addition: a tie with any loss rounds up).
+        builder.assert_bool(cols.sh_sub_lsb);
+        builder.when(ssub).assert_eq(
+            cols.sh_sub_shrn.y[0],
+            cols.sh_sub_lsb + cols.sh_sub_hi7 * f2,
+        );
+        self.range_bus
+            .range_check(cols.sh_sub_hi7.into(), 7)
+            .eval(builder, ssub.into());
+        builder.when(ssub).assert_eq(
+            cols.sh_sub_sticky_eff,
+            cols.sh_sub_shrn.sticky + cols.lost_sticky - cols.sh_sub_shrn.sticky * cols.lost_sticky,
+        );
+        builder.assert_bool(cols.sh_sub_sticky_eff);
+        let sh_sor =
+            cols.sh_sub_sticky_eff + cols.sh_sub_lsb - cols.sh_sub_sticky_eff * cols.sh_sub_lsb;
+        builder
+            .when(ssub)
+            .assert_eq(cols.sh_sub_round_up, cols.sh_sub_shrn.guard * sh_sor);
+        builder.assert_bool(cols.sh_sub_round_up);
+        // z = y + round_up (<= 2^23; bit 23 of z is the exp field LSB).
+        builder.assert_bool(cols.sh_sub_zc0);
+        builder.assert_bool(cols.sh_sub_zc1);
+        builder.when(ssub).assert_eq(
+            cols.sh_sub_z0 + cols.sh_sub_zc0 * f256,
+            cols.sh_sub_shrn.y[0] + cols.sh_sub_round_up,
+        );
+        builder.when(ssub).assert_eq(
+            cols.sh_sub_z1 + cols.sh_sub_zc1 * f256,
+            cols.sh_sub_shrn.y[1] + cols.sh_sub_zc0,
+        );
+        builder
+            .when(ssub)
+            .assert_eq(cols.sh_sub_z2, cols.sh_sub_shrn.y[2] + cols.sh_sub_zc1);
+        for z in [cols.sh_sub_z0, cols.sh_sub_z1, cols.sh_sub_z2] {
+            self.range_bus
+                .range_check(z.into(), 8)
+                .eval(builder, ssub.into());
+        }
+        // z2 = sh_sub_exp1 * 128 + z2_lo7 (exp field LSB is z bit 23).
+        builder.assert_bool(cols.sh_sub_exp1);
+        builder
+            .when(ssub)
+            .assert_eq(cols.sh_sub_z2, cols.sh_sub_exp1 * f128 + cols.sh_sub_z2_lo7);
+        self.range_bus
+            .range_check(cols.sh_sub_z2_lo7.into(), 7)
+            .eval(builder, ssub.into());
+        builder.when(ssub).assert_eq(cols.result[0], cols.sh_sub_z0);
+        builder.when(ssub).assert_eq(cols.result[1], cols.sh_sub_z1);
+        builder.when(ssub).assert_eq(cols.result[2], cols.sh_sub_z2);
+        builder
+            .when(ssub)
+            .assert_eq(cols.result[3], cols.a_sign * f128);
+        builder
+            .when(ssub)
+            .assert_eq(cols.result_exp, cols.sh_sub_exp1);
     }
 
     /// Constrain the cancellation (same-sign subtraction) result path via a 6-byte
@@ -1767,6 +1871,78 @@ fn fill_fsub_witness<F: PrimeField32>(
     };
     range_checker.add_count(rc2_rem, 7);
 
+    // ── Result-class routing (base_exp_sh + 256 bias, 9 bits) ──────────
+    let base_exp_sh_i = large_exp_eff + carry_out as i32;
+    let is_sub_sh = base_exp_sh_i <= 0;
+    row.sh_is_sub = F::from_bool(is_sub_sh);
+    row.sh_base_exp = if base_exp_sh_i < 0 {
+        -F::from_u32((-base_exp_sh_i) as u32)
+    } else {
+        F::from_u32(base_exp_sh_i as u32)
+    };
+    let sh_base_exp_b = (base_exp_sh_i + 256) as u32;
+    debug_assert!(sh_base_exp_b < 512, "fsub sh_base_exp_b out of range");
+    if s_shallow {
+        range_checker.add_count(sh_base_exp_b, 9);
+        let lt9 = IsLtSubAir::new(range_checker.bus(), 9);
+        lt9.generate_subrow(
+            (range_checker.as_ref(), sh_base_exp_b, 257u32),
+            (&mut row.sh_route_decomp, &mut row.sh_is_sub),
+        );
+        debug_assert_eq!(row.sh_is_sub, F::from_bool(is_sub_sh));
+    }
+
+    // ── Subnormal-result witness (denormalizing shift) ─────────────────
+    if s_shallow && is_sub_sh {
+        let t = 9 - base_exp_sh_i;
+        debug_assert!((9..=31).contains(&t), "fsub sh_sub_t out of range: {t}");
+        row.sh_sub_t = F::from_u32(t as u32);
+        range_checker.add_count(t as u32, 5);
+        let x4: [u32; 4] = core::array::from_fn(|i| ((norm >> (i * 8)) & 0xFF) as u32);
+        row.sh_sub_shrn = make_shrn_cols::<F>(x4, t as usize, range_checker);
+
+        let y0 = row.sh_sub_shrn.y[0].as_canonical_u32();
+        let y1 = row.sh_sub_shrn.y[1].as_canonical_u32();
+        let y2 = row.sh_sub_shrn.y[2].as_canonical_u32();
+        row.sh_sub_lsb = F::from_u32(y0 & 1);
+        row.sh_sub_hi7 = F::from_u32(y0 >> 1);
+        range_checker.add_count(y0 >> 1, 7);
+        row.sh_sub_sticky_eff = F::from_bool(
+            row.sh_sub_shrn.sticky.as_canonical_u32() != 0
+                || row.lost_sticky.as_canonical_u32() != 0,
+        );
+        let sh_round_up = row.sh_sub_shrn.guard.as_canonical_u32() == 1
+            && (row.sh_sub_shrn.sticky.as_canonical_u32() != 0
+                || row.lost_sticky.as_canonical_u32() != 0
+                || y0 & 1 == 1);
+        row.sh_sub_round_up = F::from_bool(sh_round_up);
+        let zc0 = (y0 + sh_round_up as u32) >> 8;
+        let z0 = (y0 + sh_round_up as u32) & 0xFF;
+        let zc1 = (y1 + zc0) >> 8;
+        let z1 = (y1 + zc0) & 0xFF;
+        let z2 = y2 + zc1;
+        row.sh_sub_z0 = F::from_u32(z0);
+        row.sh_sub_z1 = F::from_u32(z1);
+        row.sh_sub_z2 = F::from_u32(z2);
+        row.sh_sub_zc0 = F::from_u32(zc0);
+        row.sh_sub_zc1 = F::from_u32(zc1);
+        range_checker.add_count(z0, 8);
+        range_checker.add_count(z1, 8);
+        range_checker.add_count(z2, 8);
+        let exp1 = z2 == 128;
+        row.sh_sub_exp1 = F::from_bool(exp1);
+        row.sh_sub_z2_lo7 = F::from_u32(z2 & 0x7F);
+        range_checker.add_count(z2 & 0x7F, 7);
+        // Sanity against the native result.
+        debug_assert_eq!(
+            result_bits & 0x7FFF_FFFF,
+            z0 | (z1 << 8) | (z2 << 16),
+            "fsub shallow subnormal result mismatch: a={:08x} b={:08x}",
+            a_bits,
+            b_bits
+        );
+    }
+
     if (1u32..=254).contains(&r_exp) {
         debug_assert_eq!(
             result_exp_calc, r_exp as i32,
@@ -1788,9 +1964,10 @@ fn fill_fsub_witness<F: PrimeField32>(
     }
 
     let _ = result_exp_calc;
-    row.s_normal = F::from_bool(s_shallow && (1u32..=254).contains(&r_exp));
-    row.s_overflow = F::from_bool(s_shallow && r_exp == 255);
-    row.s_sub_result = F::from_bool(s_shallow && r_exp == 0);
+    row.sh_ef_max = F::from_bool(r_exp == 255);
+    row.s_normal = F::from_bool(s_shallow && !is_sub_sh && r_exp != 255);
+    row.s_overflow = F::from_bool(s_shallow && !is_sub_sh && r_exp == 255);
+    row.s_sub_result = F::from_bool(s_shallow && is_sub_sh);
     row.is_valid = F::ONE;
 }
 
@@ -1824,6 +2001,23 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FsubCoreCols<F>) {
     row.s_normal = F::ZERO;
     row.s_overflow = F::ZERO;
     row.s_sub_result = F::ZERO;
+    row.sh_base_exp = F::ZERO;
+    row.sh_is_sub = F::ZERO;
+    row.sh_ef_max = F::ZERO;
+    row.sh_route_decomp = [F::ZERO];
+    row.sh_sub_t = F::ZERO;
+    row.sh_sub_shrn = ShrnCols::<F, 4>::default();
+    row.sh_sub_lsb = F::ZERO;
+    row.sh_sub_hi7 = F::ZERO;
+    row.sh_sub_sticky_eff = F::ZERO;
+    row.sh_sub_round_up = F::ZERO;
+    row.sh_sub_z0 = F::ZERO;
+    row.sh_sub_z1 = F::ZERO;
+    row.sh_sub_z2 = F::ZERO;
+    row.sh_sub_zc0 = F::ZERO;
+    row.sh_sub_zc1 = F::ZERO;
+    row.sh_sub_exp1 = F::ZERO;
+    row.sh_sub_z2_lo7 = F::ZERO;
     row.c_m0 = F::ZERO;
     row.c_m1 = F::ZERO;
     row.base_exp = F::ZERO;
