@@ -23,7 +23,8 @@ use openvm_stark_backend::{
 };
 
 use crate::fp_shift::{
-    run_shln, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget, SHLIMB_BITS,
+    make_shln_cols3, run_shrn, run_shrn_round, ShlnCols, ShlnGadget, ShrnCols, ShrnGadget,
+    SHLIMB_BITS,
 };
 
 pub const SIG_NUM_LIMBS: usize = 3;
@@ -1004,42 +1005,6 @@ where
             &self.range_checker,
             &self.lt_air,
         );
-    }
-}
-
-/// Build a `ShlnCols<3>` witness (subnormal operand normalization) and
-/// register range-checker counts.
-fn make_shln_cols3<F: PrimeField32>(
-    x: [u32; 3],
-    shift: usize,
-    range_checker: &SharedVariableRangeCheckerChip,
-) -> ShlnCols<F, 3> {
-    const N: usize = 3;
-    let (y, q, r) = run_shln(&x, shift);
-    let mut limb_shift_marker = [F::ZERO; N];
-    let mut bit_shift_marker = [F::ZERO; SHLIMB_BITS];
-    limb_shift_marker[q] = F::ONE;
-    bit_shift_marker[r] = F::ONE;
-    let cv = |v: u32| {
-        if r == 0 {
-            0
-        } else {
-            v >> (SHLIMB_BITS - r)
-        }
-    };
-    for i in 0..N {
-        range_checker.add_count(cv(x[i]), r);
-        range_checker.add_count(y[i], 8);
-    }
-    ShlnCols {
-        x: core::array::from_fn(|i| F::from_u32(x[i])),
-        shift: F::from_u32(shift as u32),
-        enable: F::ONE,
-        limb_shift_marker,
-        bit_shift_marker,
-        bit_mult: F::from_u32(1u32 << r),
-        bit_shift_carry: core::array::from_fn(|i| F::from_u32(cv(x[i]))),
-        y: core::array::from_fn(|i| F::from_u32(y[i])),
     }
 }
 
