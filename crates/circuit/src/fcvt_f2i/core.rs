@@ -522,140 +522,147 @@ where
         self.adapter.fill_trace_row(mem_helper, adapter_row);
         let record: &FcvtF2ICoreRecord = unsafe { get_record_from_slice(&mut core_row, ()) };
         let core_row: &mut FcvtF2ICoreCols<F> = core_row.borrow_mut();
-
         let a_bits = u32::from_le_bytes(record.a);
         let opcode = FpOpcode::from_usize(record.opcode as usize);
         let is_wu = opcode_is_wu(opcode).unwrap();
-        let result = fcvt_f2i_result(a_bits, is_wu);
-
-        let a_sign = (a_bits >> 31) & 1;
-        let a_exp = (a_bits >> 23) & 0xFF;
-        let a_mant = a_bits & 0x7FFFFF;
-
-        for i in 0..4 {
-            core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
-            core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
-            self.range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
-            self.range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
-        }
-        core_row.a_sign = F::from_u32(a_sign);
-        core_row.a_exp_lo = F::from_u32(a_exp & 1);
-        core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
-        core_row.a_hi = F::from_u32(a_exp >> 1);
-        self.range_checker.add_count((a_mant >> 16) & 0x7F, 7);
-        self.range_checker.add_count(a_exp >> 1, 7);
-
-        let a_exp_f = F::from_u32(a_exp);
-        core_row.a_exp_is_max = F::from_bool(a_exp == 255);
-        core_row.a_exp_max_inv = if a_exp != 255 {
-            (F::from_u32(255) - a_exp_f)
-                .try_inverse()
-                .unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
-        core_row.a_mant_is_zero = F::from_bool(a_mant == 0);
-        core_row.a_mant_sum_inv = if a_mant != 0 {
-            F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        let a_nan = a_exp == 255 && a_mant != 0;
-        let a_inf = a_exp == 255 && a_mant == 0;
-        core_row.a_nan = F::from_bool(a_nan);
-        core_row.a_inf = F::from_bool(a_inf);
-
-        // Saturation
-        self.lt_air.generate_subrow(
-            (self.range_checker.as_ref(), a_exp, 158),
-            (&mut core_row.lt_aux.lower_decomp, &mut core_row.lt_158),
-        );
-        let lt_158 = a_exp < 158;
-        let eq_158 = a_exp == 158;
-        core_row.eq_158 = F::from_bool(eq_158);
-        core_row.eq_158_inv = if !eq_158 {
-            (a_exp_f - F::from_u32(158))
-                .try_inverse()
-                .unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        let sat = !lt_158 && (!is_wu || !eq_158);
-        core_row.sat = F::from_bool(sat);
-
-        let special = a_nan || a_inf || sat;
-        let inf_sat = !a_nan && (a_inf || sat);
-        let neg_zero_wu = is_wu && a_sign == 1;
-        let zero_res = neg_zero_wu && !special;
-        let sel_wit = !special && !neg_zero_wu;
-        core_row.special = F::from_bool(special);
-        core_row.inf_sat = F::from_bool(inf_sat);
-        core_row.neg_zero_wu = F::from_bool(neg_zero_wu);
-        core_row.zero_res = F::from_bool(zero_res);
-        core_row.sel_wit = F::from_bool(sel_wit);
-        for i in 0..4 {
-            core_row.wit[i] = core_row.result[i];
-        }
-        core_row.ws_flag = F::from_bool(!is_wu);
-        core_row.wu_flag = F::from_bool(is_wu);
-
-        // ── In-range truncation witness ──────────────────────────────────
-        let lt_127 = a_exp < 127;
-        self.lt_air.generate_subrow(
-            (self.range_checker.as_ref(), a_exp, 127),
-            (&mut core_row.lt_aux2.lower_decomp, &mut core_row.lt_127),
-        );
-        core_row.lt_127 = F::from_bool(lt_127);
-        let s_shift = sel_wit && !lt_127;
-        core_row.s_shift = F::from_bool(s_shift);
-        core_row.negate = F::from_bool(!is_wu && a_sign == 1);
-
-        if s_shift {
-            // x = sig << 8 = [0, a[0], a[1], a_mant2 + 128]; magnitude = x >> (158-exp).
-            let sig: u32 = (a_mant | 0x800000) & 0xFFFFFF;
-            let x_val = sig << 8;
-            let x: [u32; 4] = [
-                x_val & 0xFF,
-                (x_val >> 8) & 0xFF,
-                (x_val >> 16) & 0xFF,
-                (x_val >> 24) & 0xFF,
-            ];
-            let shift = 158 - a_exp;
-            core_row.shift = F::from_u32(shift);
-            core_row.shrn = make_shrn_cols::<F>(x, shift as usize, &self.range_checker);
-            // wit is already = result (native trunc). Verify it matches the shift
-            // + two's-complement reconstruction.
-            let mag = (sig as u64) << 8 >> shift;
-            let mag_bytes: [u32; 4] = core::array::from_fn(|i| ((mag >> (i * 8)) & 0xFF) as u32);
-            if !is_wu && a_sign == 1 {
-                // wit = -mag (two's complement). Recover the borrow chain.
-                let neg = (0u64).wrapping_sub(mag);
-                let neg_bytes: [u32; 4] =
-                    core::array::from_fn(|i| ((neg >> (i * 8)) & 0xFF) as u32);
-                let mut carry_in = 1u32; // +1 of two's complement
-                for i in 0..4 {
-                    let lhs = (255 - mag_bytes[i]) + carry_in;
-                    core_row.neg_carry[i] = F::from_u32(lhs >> 8);
-                    carry_in = lhs >> 8;
-                    debug_assert_eq!(neg_bytes[i], core_row.wit[i].as_canonical_u32());
-                }
-            } else {
-                for (i, &mb) in mag_bytes.iter().enumerate() {
-                    core_row.neg_carry[i] = F::ZERO;
-                    debug_assert_eq!(mb, core_row.wit[i].as_canonical_u32());
-                }
-            }
-        } else {
-            core_row.shift = F::ZERO;
-            core_row.shrn = ShrnCols::<F, 4>::default();
-            for i in 0..4 {
-                core_row.neg_carry[i] = F::ZERO;
-            }
-        }
-
-        core_row.is_valid = F::ONE;
+        fill_fcvt_f2i_witness(core_row, a_bits, is_wu, &self.range_checker, &self.lt_air);
     }
+}
+
+/// Builds a full honest witness row for fcvt.w.s / fcvt.wu.s, mirroring the
+/// production filler's core-filling logic.
+fn fill_fcvt_f2i_witness<F: PrimeField32>(
+    core_row: &mut FcvtF2ICoreCols<F>,
+    a_bits: u32,
+    is_wu: bool,
+    range_checker: &SharedVariableRangeCheckerChip,
+    lt_air: &IsLtSubAir,
+) {
+    let result = fcvt_f2i_result(a_bits, is_wu);
+
+    let a_sign = (a_bits >> 31) & 1;
+    let a_exp = (a_bits >> 23) & 0xFF;
+    let a_mant = a_bits & 0x7FFFFF;
+
+    for i in 0..4 {
+        core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
+        core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
+        range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
+    }
+    core_row.a_sign = F::from_u32(a_sign);
+    core_row.a_exp_lo = F::from_u32(a_exp & 1);
+    core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+    core_row.a_hi = F::from_u32(a_exp >> 1);
+    range_checker.add_count((a_mant >> 16) & 0x7F, 7);
+    range_checker.add_count(a_exp >> 1, 7);
+
+    let a_exp_f = F::from_u32(a_exp);
+    core_row.a_exp_is_max = F::from_bool(a_exp == 255);
+    core_row.a_exp_max_inv = if a_exp != 255 {
+        (F::from_u32(255) - a_exp_f)
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
+    core_row.a_mant_is_zero = F::from_bool(a_mant == 0);
+    core_row.a_mant_sum_inv = if a_mant != 0 {
+        F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let a_nan = a_exp == 255 && a_mant != 0;
+    let a_inf = a_exp == 255 && a_mant == 0;
+    core_row.a_nan = F::from_bool(a_nan);
+    core_row.a_inf = F::from_bool(a_inf);
+
+    // Saturation
+    lt_air.generate_subrow(
+        (range_checker.as_ref(), a_exp, 158),
+        (&mut core_row.lt_aux.lower_decomp, &mut core_row.lt_158),
+    );
+    let lt_158 = a_exp < 158;
+    let eq_158 = a_exp == 158;
+    core_row.eq_158 = F::from_bool(eq_158);
+    core_row.eq_158_inv = if !eq_158 {
+        (a_exp_f - F::from_u32(158))
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let sat = !lt_158 && (!is_wu || !eq_158);
+    core_row.sat = F::from_bool(sat);
+
+    let special = a_nan || a_inf || sat;
+    let inf_sat = !a_nan && (a_inf || sat);
+    let neg_zero_wu = is_wu && a_sign == 1;
+    let zero_res = neg_zero_wu && !special;
+    let sel_wit = !special && !neg_zero_wu;
+    core_row.special = F::from_bool(special);
+    core_row.inf_sat = F::from_bool(inf_sat);
+    core_row.neg_zero_wu = F::from_bool(neg_zero_wu);
+    core_row.zero_res = F::from_bool(zero_res);
+    core_row.sel_wit = F::from_bool(sel_wit);
+    for i in 0..4 {
+        core_row.wit[i] = core_row.result[i];
+    }
+    core_row.ws_flag = F::from_bool(!is_wu);
+    core_row.wu_flag = F::from_bool(is_wu);
+
+    // ── In-range truncation witness ──────────────────────────────────
+    let lt_127 = a_exp < 127;
+    lt_air.generate_subrow(
+        (range_checker.as_ref(), a_exp, 127),
+        (&mut core_row.lt_aux2.lower_decomp, &mut core_row.lt_127),
+    );
+    core_row.lt_127 = F::from_bool(lt_127);
+    let s_shift = sel_wit && !lt_127;
+    core_row.s_shift = F::from_bool(s_shift);
+    core_row.negate = F::from_bool(!is_wu && a_sign == 1);
+
+    if s_shift {
+        // x = sig << 8 = [0, a[0], a[1], a_mant2 + 128]; magnitude = x >> (158-exp).
+        let sig: u32 = (a_mant | 0x800000) & 0xFFFFFF;
+        let x_val = sig << 8;
+        let x: [u32; 4] = [
+            x_val & 0xFF,
+            (x_val >> 8) & 0xFF,
+            (x_val >> 16) & 0xFF,
+            (x_val >> 24) & 0xFF,
+        ];
+        let shift = 158 - a_exp;
+        core_row.shift = F::from_u32(shift);
+        core_row.shrn = make_shrn_cols::<F>(x, shift as usize, range_checker);
+        let mag = (sig as u64) << 8 >> shift;
+        let mag_bytes: [u32; 4] = core::array::from_fn(|i| ((mag >> (i * 8)) & 0xFF) as u32);
+        if !is_wu && a_sign == 1 {
+            let neg = (0u64).wrapping_sub(mag);
+            let neg_bytes: [u32; 4] = core::array::from_fn(|i| ((neg >> (i * 8)) & 0xFF) as u32);
+            let mut carry_in = 1u32; // +1 of two's complement
+            for i in 0..4 {
+                let lhs = (255 - mag_bytes[i]) + carry_in;
+                core_row.neg_carry[i] = F::from_u32(lhs >> 8);
+                carry_in = lhs >> 8;
+                debug_assert_eq!(neg_bytes[i], core_row.wit[i].as_canonical_u32());
+            }
+        } else {
+            for (i, &mb) in mag_bytes.iter().enumerate() {
+                core_row.neg_carry[i] = F::ZERO;
+                debug_assert_eq!(mb, core_row.wit[i].as_canonical_u32());
+            }
+        }
+    } else {
+        core_row.shift = F::ZERO;
+        core_row.shrn = ShrnCols::<F, 4>::default();
+        for i in 0..4 {
+            core_row.neg_carry[i] = F::ZERO;
+        }
+    }
+
+    core_row.is_valid = F::ONE;
 }
 
 /// Build a `ShrnCols<4>` witness and register range-checker counts for ShrnGadget.
@@ -722,5 +729,118 @@ fn make_shrn_cols<F: PrimeField32>(
         hrest: F::from_u32(hrest),
         lost_combined: F::from_u32(lost_combined),
         combined_inv,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::BorrowMut;
+    use std::sync::Arc;
+
+    use openvm_circuit::arch::{BasicAdapterInterface, MinimalInstruction, VmCoreAir};
+    use openvm_circuit_primitives::is_less_than::IsLtSubAir;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
+    use openvm_circuit_primitives::StructReflectionHelper;
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+
+    use super::*;
+    use crate::test_utils::NumericBuilder;
+
+    type F = BabyBear;
+    type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 1, 1, 4, 4>;
+
+    fn row(a_bits: u32, is_wu: bool) -> Vec<F> {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let lt_air = IsLtSubAir::new(chip.bus(), 8);
+        let mut buf = vec![F::ZERO; FcvtF2ICoreCols::<F>::width()];
+        let row: &mut FcvtF2ICoreCols<F> = buf.as_mut_slice().borrow_mut();
+        fill_fcvt_f2i_witness(row, a_bits, is_wu, &chip, &lt_air);
+        buf
+    }
+
+    fn eval(buf: &[F]) -> NumericBuilder<F> {
+        let air = FcvtF2ICoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET);
+        let mut b = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air, &mut b, buf, F::ZERO);
+        b
+    }
+
+    #[test]
+    fn honest_rows_pass() {
+        for (bits, is_wu) in [
+            (3.7f32.to_bits(), false),
+            ((-3.7f32).to_bits(), false),
+            (5e9f32.to_bits(), true), // saturates for .w, in-range for .wu
+            ((-3.0f32).to_bits(), true), // negative -> 0 for .wu
+            (0x7FC00000, false),      // NaN -> i32::MAX
+            (0x7F800000, false),      // +inf
+            (0x00000001, false),      // subnormal -> 0
+            (0x4F7FFFFF, true),       // ~2^32-128, .wu in-range
+        ] {
+            for is_wu in [is_wu, !is_wu] {
+                let buf = row(bits, is_wu);
+                assert!(
+                    eval(&buf).ok(),
+                    "fcvt_f2i a={bits:08x} wu={is_wu}: {:?}",
+                    eval(&buf).failures
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_padding_row_passes() {
+        let mut buf = vec![F::ZERO; FcvtF2ICoreCols::<F>::width()];
+        let row: &mut FcvtF2ICoreCols<F> = buf.as_mut_slice().borrow_mut();
+        row.is_valid = F::ZERO;
+        assert!(eval(&buf).ok());
+    }
+
+    #[test]
+    fn corrupt_result_byte_rejected() {
+        let mut buf = row(3.7f32.to_bits(), false);
+        let row: &mut FcvtF2ICoreCols<F> = buf.as_mut_slice().borrow_mut();
+        row.result[0] += F::ONE;
+        assert!(!eval(&buf).ok(), "corrupting a result byte must fail");
+    }
+
+    /// Result bytes must be pinned across input classes.
+    #[test]
+    fn corruption_sweep_pins_result() {
+        use crate::test_utils::assert_columns_constrained;
+        let names = FcvtF2ICoreCols::<F>::struct_reflection().unwrap_or_default();
+        let eval_full = |b: &mut NumericBuilder<F>, cols: &[F]| {
+            VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+                &FcvtF2ICoreAir::new(VariableRangeCheckerBus::new(0, 16), FpOpcode::CLASS_OFFSET),
+                b,
+                cols,
+                F::ZERO,
+            );
+        };
+        for (bits, is_wu) in [
+            (3.7f32.to_bits(), false),
+            ((-3.7f32).to_bits(), false),
+            (5e9f32.to_bits(), true),
+            (0x7FC00000, false),
+            (0x00000001, false),
+        ] {
+            let buf = row(bits, is_wu);
+            assert!(eval(&buf).ok(), "honest fcvt_f2i failed");
+            assert_columns_constrained(
+                &buf,
+                eval_full,
+                &names,
+                &[
+                    "result__0",
+                    "result__1",
+                    "result__2",
+                    "result__3",
+                    "sel_wit",
+                ],
+                &format!("fcvt_f2i a={bits:08x} wu={is_wu}"),
+            );
+        }
     }
 }
