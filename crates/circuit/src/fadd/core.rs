@@ -5,9 +5,11 @@ use openvm_circuit::{
     system::memory::{online::TracingMemory, MemoryAuxColsFactory},
 };
 use openvm_circuit_primitives::{
+    is_less_than::{IsLessThanIo, IsLtSubAir},
     utils::not,
     var_range::{SharedVariableRangeCheckerChip, VariableRangeCheckerBus},
-    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper,
+    AlignedBytesBorrow, ColumnsAir, StructReflection, StructReflectionHelper, SubAir,
+    TraceSubRowGenerator,
 };
 use openvm_circuit_primitives_derive::AlignedBorrow;
 use openvm_instructions::{instruction::Instruction, program::DEFAULT_PC_STEP, LocalOpcode};
@@ -175,7 +177,32 @@ pub struct FaddCoreCols<T> {
     pub s_sub_result: T,    // shallow AND both subnormal AND no carry (subnormal result)
     pub s_cancel: T,        // s_bn AND !is_add AND !is_deep
     pub a_ge_b: T,          // bool: a_sig >= b_sig (magnitude compare for ediff=0)
-    pub s_cancel_normal: T, // s_cancel AND result exp field in [1, 254]
+    pub s_cancel_normal: T, // s_cancel AND normal result (routed via base_exp)
+
+    // === Cancellation output routing + subnormal results ===
+    pub c_m0: T,     // rounded mantissa byte 0 (result byte on normal rows)
+    pub c_m1: T,     // rounded mantissa byte 1
+    pub base_exp: T, // pre-rounding exponent (large_exp_eff - lshift)
+    pub raw_csum: T, // sum of cancel_diff bytes (exact-zero detection)
+    pub raw_csum_inv: T,
+    pub is_exact_zero: T,
+    pub cancel_is_ovf: T, // base_exp + rc2 >= 255
+    pub cancel_is_sub: T, // base_exp <= 0
+    pub s_cancel_sub: T,  // s_cancel AND cancel_is_sub AND !exact_zero (gate col)
+    pub route_ovf_decomp: [T; 1],
+    pub route_sub_decomp: [T; 1],
+    pub sub_t: T,    // denormal shift 25 - base_exp
+    pub sub_deep: T, // t > 55 (deep underflow -> +-0)
+    pub sub_deep_decomp: [T; 1],
+    pub sub_shrn: ShrnCols<T, 6>,
+    pub sub_lsb: T,
+    pub sub_hi7: T,
+    pub sub_round_up: T,
+    pub sub_z0: T,
+    pub sub_z1: T,
+    pub sub_z2: T,
+    pub sub_zc0: T,
+    pub sub_zc1: T,
 
     // === Result ===
     pub result_sign: T,
@@ -924,6 +951,7 @@ impl FaddCoreAir {
         cols: &FaddCoreCols<AB::Var>,
     ) {
         let f2: AB::F = AB::F::from_u32(2);
+        let f25: AB::F = AB::F::from_u32(25);
         let f127: AB::F = AB::F::from_u32(127);
         let f128: AB::F = AB::F::from_u32(128);
         let f256: AB::F = AB::F::from_u32(1 << LIMB_BITS);
@@ -1108,65 +1136,199 @@ impl FaddCoreAir {
             + (one.clone() - cols.a_is_larger) * b_exp_eff.clone();
         let large_sign =
             cols.a_is_larger * cols.a_sign + (one.clone() - cols.a_is_larger) * cols.b_sign;
-        // result_exp = r_exp_lo + 2*r_exp_hi = large_exp_eff - lshift + rc2.
-        builder
-            .when(s)
-            .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
-        builder.when(s).assert_eq(
-            cols.r_exp_lo + cols.r_exp_hi * f2,
-            large_exp.clone() - cols.cancel_lshift + cols.rc2,
-        );
         // result sign: ediff>=1 → large_sign; ediff=0 → a_ge_b ? a_sign : b_sign.
         let ediff0_sign = cols.a_ge_b * cols.a_sign + (one.clone() - cols.a_ge_b) * cols.b_sign;
         let cancel_r_sign =
             cols.ediff_nz * large_sign.clone() + (one.clone() - cols.ediff_nz) * ediff0_sign;
         builder.when(s).assert_eq(cols.result_sign, cancel_r_sign);
-        // result mantissa from norm[3..5] + round_up.
-        builder
-            .when(s)
-            .assert_eq(cols.result[0] + cols.rc0 * f256, norm[3] + cols.round_up);
-        builder
-            .when(s)
-            .assert_eq(cols.result[1] + cols.rc1 * f256, norm[4] + cols.rc0);
-        // top7c = (norm[5] - 128) + rc1 = rc2_rem + rc2*128.
-        builder
-            .when(s)
-            .assert_eq((norm[5] - f128) + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
-        self.range_bus
-            .range_check(cols.rc2_rem.into(), 7)
-            .eval(builder, s.into());
-        builder
-            .when(s)
-            .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
-        builder
-            .when(s)
-            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
 
-        // ── Normal-result selector ──────────────────────────────────────
-        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
-        builder.when(s).assert_zero(cols.r_exp_hi * he0.clone());
-        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
-        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
-        builder.when(s).assert_zero(delta127 * he127.clone());
-        let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
-        let exp_field_max = cols.r_exp_lo * he127;
+        // ── Exact-zero cancellation detection ────────────────────────────
+        // raw_diff == 0 ⟺ exact cancellation (result is +0 in RNE).
+        let raw_csum_expr: AB::Expr = cols.cancel_diff.iter().map(|&v| v.into()).sum();
+        builder.when(s).assert_eq(cols.raw_csum, raw_csum_expr);
+        let ez_free = one.clone() - cols.raw_csum * cols.raw_csum_inv;
+        builder
+            .when(s)
+            .assert_eq(cols.is_exact_zero, ez_free.clone());
+        builder.assert_zero(cols.raw_csum * ez_free);
+        builder.assert_bool(cols.is_exact_zero);
+        let ez = cols.is_exact_zero;
+        // On exact-zero rows the normalization shift is meaningless; pin it,
+        // and the rounding carry (norm is all zero, so top7 is unusable).
+        builder.when(s * ez).assert_zero(cols.cancel_lshift);
+        builder.when(s * ez).assert_zero(cols.rc0);
+        builder.when(s * ez).assert_zero(cols.rc1);
+        builder.when(s * ez).assert_zero(cols.rc2);
+
+        // ── Result-class routing (sound, via base_exp) ───────────────────
+        // base_exp = large_exp_eff - lshift (pre-rounding), in [-68, 254].
+        // Witness column (degree 1) so downstream gating stays within degree 4.
+        builder
+            .when(s)
+            .assert_eq(cols.base_exp, large_exp.clone() - cols.cancel_lshift);
+        let base_exp_b = cols.base_exp + AB::Expr::from(f256);
+        self.range_bus
+            .range_check(base_exp_b.clone(), 9)
+            .eval(builder, s.into());
+        let lt9 = IsLtSubAir::new(self.range_bus, 9);
+        // cancel_is_ovf: base_exp + rc2 >= 255  <=>  510 < base_exp_b + rc2.
+        let ovf_io = IsLessThanIo::new(
+            AB::Expr::from(AB::F::from_u32(510)),
+            base_exp_b.clone() + cols.rc2,
+            cols.cancel_is_ovf.into(),
+            s.into(),
+        );
+        lt9.eval(builder, (ovf_io, &cols.route_ovf_decomp));
+        // cancel_is_sub: base_exp <= 0  <=>  base_exp_b < 257.
+        let sub_io = IsLessThanIo::new(
+            base_exp_b,
+            AB::Expr::from(AB::F::from_u32(257)),
+            cols.cancel_is_sub.into(),
+            s.into(),
+        );
+        lt9.eval(builder, (sub_io, &cols.route_sub_decomp));
+        builder.assert_bool(cols.cancel_is_ovf);
+        builder.assert_bool(cols.cancel_is_sub);
+        builder.assert_zero(cols.cancel_is_ovf * cols.cancel_is_sub);
         builder.assert_eq(
             cols.s_cancel_normal,
-            s * (one.clone() - exp_field_zero.clone() - exp_field_max.clone()),
+            s * (one.clone() - cols.cancel_is_sub)
+                * (one.clone() - cols.cancel_is_ovf)
+                * (one.clone() - ez),
         );
         builder.assert_bool(cols.s_cancel_normal);
         let scn = cols.s_cancel_normal;
-        // Tie result bytes under s_cancel_normal (same recon as above, gated
-        // separately for the normal-exp subset).
+
+        // ── Normal path: mantissa carry chain + result bytes ─────────────
+        // result_exp = r_exp_lo + 2*r_exp_hi = base_exp + rc2.
         builder
             .when(scn)
-            .assert_eq(cols.result[0] + cols.rc0 * f256, norm[3] + cols.round_up);
+            .assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
         builder
             .when(scn)
-            .assert_eq(cols.result[1] + cols.rc1 * f256, norm[4] + cols.rc0);
+            .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, cols.base_exp + cols.rc2);
+        // c_m0/c_m1 are the rounded mantissa low bytes (result bytes only on
+        // normal rows; sub/overflow rows output their own patterns).
+        builder
+            .when(s * (one.clone() - ez))
+            .assert_eq(cols.c_m0 + cols.rc0 * f256, norm[3] + cols.round_up);
+        builder
+            .when(s * (one.clone() - ez))
+            .assert_eq(cols.c_m1 + cols.rc1 * f256, norm[4] + cols.rc0);
+        self.range_bus
+            .range_check(cols.c_m0.into(), 8)
+            .eval(builder, s * (one.clone() - ez));
+        self.range_bus
+            .range_check(cols.c_m1.into(), 8)
+            .eval(builder, s * (one.clone() - ez));
+        builder.when(scn).assert_eq(cols.result[0], cols.c_m0);
+        builder.when(scn).assert_eq(cols.result[1], cols.c_m1);
+        // top7c = (norm[5] - 128) + rc1 = rc2_rem + rc2*128.
+        builder
+            .when(s * (one.clone() - ez))
+            .assert_eq((norm[5] - f128) + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(cols.rc2_rem.into(), 7)
+            .eval(builder, s * (one.clone() - ez));
         builder
             .when(scn)
             .assert_eq(cols.result[2], cols.rc2_rem + cols.r_exp_lo * f128);
+        builder
+            .when(scn)
+            .assert_eq(cols.result[3], cols.r_exp_hi + cols.result_sign * f128);
+
+        // ── Exact-zero path: result = +0 ────────────────────────────────
+        let sez = s * ez;
+        for i in 0..4 {
+            builder.when(sez.clone()).assert_zero(cols.result[i]);
+        }
+
+        // ── Overflow path: result = +-inf ────────────────────────────────
+        let sov = s * cols.cancel_is_ovf;
+        builder.when(sov.clone()).assert_zero(cols.result[0]);
+        builder.when(sov.clone()).assert_zero(cols.result[1]);
+        builder.when(sov.clone()).assert_eq(cols.result[2], f128);
+        builder.when(sov).assert_eq(
+            cols.result[3],
+            AB::Expr::from(f127) + cols.result_sign * f128,
+        );
+
+        // ── Sub path: subnormal results ──────────────────────────────────
+        // Denormalize: shift norm right by t = 25 - base_exp (>= 25), clamped
+        // to 55 (deeper shifts always round to +-0). Single RNE rounding from
+        // the gadget's guard/sticky; the round carry into bit 23 yields the
+        // smallest normal. Cancellation is lossless (ediff <= 24), so no
+        // subtractive-sticky handling is needed.
+        builder.assert_eq(
+            cols.s_cancel_sub,
+            s * cols.cancel_is_sub * (one.clone() - ez),
+        );
+        builder.assert_bool(cols.s_cancel_sub);
+        let ssub = cols.s_cancel_sub;
+        builder
+            .when(ssub)
+            .assert_eq(cols.sub_t, AB::Expr::from(f25) - cols.base_exp);
+        self.range_bus
+            .range_check(cols.sub_t.into(), 7)
+            .eval(builder, ssub.into());
+        builder.assert_bool(cols.sub_deep);
+        let sub_deep_io = IsLessThanIo::new(
+            AB::Expr::from(AB::F::from_u32(55)),
+            cols.sub_t.into(),
+            cols.sub_deep.into(),
+            ssub.into(),
+        );
+        IsLtSubAir::new(self.range_bus, 7).eval(builder, (sub_deep_io, &cols.sub_deep_decomp));
+        builder.when(ssub).assert_eq(
+            cols.sub_shrn.shift,
+            (one.clone() - cols.sub_deep) * cols.sub_t + cols.sub_deep * AB::F::from_u32(55),
+        );
+        for i in 0..6 {
+            builder
+                .when(ssub)
+                .assert_eq(cols.sub_shrn.x[i], cols.cancel_shln.y[i]);
+        }
+        builder.assert_eq(cols.sub_shrn.enable, ssub);
+        let sub_shrn = ShrnGadget::new(self.range_bus);
+        sub_shrn.eval_shrn(builder, &cols.sub_shrn);
+        // RNE rounding: guard/sticky from the gadget, lsb from y[0].
+        builder.assert_bool(cols.sub_lsb);
+        builder
+            .when(ssub)
+            .assert_eq(cols.sub_shrn.y[0], cols.sub_lsb + cols.sub_hi7 * f2);
+        self.range_bus
+            .range_check(cols.sub_hi7.into(), 7)
+            .eval(builder, ssub.into());
+        let sub_sor = cols.sub_shrn.sticky + cols.sub_lsb - cols.sub_shrn.sticky * cols.sub_lsb;
+        builder
+            .when(ssub)
+            .assert_eq(cols.sub_round_up, cols.sub_shrn.guard * sub_sor);
+        builder.assert_bool(cols.sub_round_up);
+        // z = y + round_up (<= 2^23; bit 23 of z is the exp field LSB).
+        builder.assert_bool(cols.sub_zc0);
+        builder.assert_bool(cols.sub_zc1);
+        builder.when(ssub).assert_eq(
+            cols.sub_z0 + cols.sub_zc0 * f256,
+            cols.sub_shrn.y[0] + cols.sub_round_up,
+        );
+        builder.when(ssub).assert_eq(
+            cols.sub_z1 + cols.sub_zc1 * f256,
+            cols.sub_shrn.y[1] + cols.sub_zc0,
+        );
+        builder
+            .when(ssub)
+            .assert_eq(cols.sub_z2, cols.sub_shrn.y[2] + cols.sub_zc1);
+        for z in [cols.sub_z0, cols.sub_z1, cols.sub_z2] {
+            self.range_bus
+                .range_check(z.into(), 8)
+                .eval(builder, ssub.into());
+        }
+        builder.when(ssub).assert_eq(cols.result[0], cols.sub_z0);
+        builder.when(ssub).assert_eq(cols.result[1], cols.sub_z1);
+        builder.when(ssub).assert_eq(cols.result[2], cols.sub_z2);
+        builder
+            .when(ssub)
+            .assert_eq(cols.result[3], cols.result_sign * f128);
     }
 }
 
@@ -1739,6 +1901,29 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FaddCoreCols<F>) {
     row.s_normal = F::ZERO;
     row.s_overflow = F::ZERO;
     row.s_sub_result = F::ZERO;
+    row.raw_csum = F::ZERO;
+    row.raw_csum_inv = F::ZERO;
+    row.is_exact_zero = F::ZERO;
+    row.c_m0 = F::ZERO;
+    row.c_m1 = F::ZERO;
+    row.base_exp = F::ZERO;
+    row.cancel_is_ovf = F::ZERO;
+    row.cancel_is_sub = F::ZERO;
+    row.route_ovf_decomp = [F::ZERO];
+    row.route_sub_decomp = [F::ZERO];
+    row.sub_t = F::ZERO;
+    row.sub_deep = F::ZERO;
+    row.sub_deep_decomp = [F::ZERO];
+    row.sub_shrn = ShrnCols::<F, 6>::default();
+    row.sub_lsb = F::ZERO;
+    row.sub_hi7 = F::ZERO;
+    row.sub_round_up = F::ZERO;
+    row.sub_z0 = F::ZERO;
+    row.sub_z1 = F::ZERO;
+    row.sub_z2 = F::ZERO;
+    row.sub_zc0 = F::ZERO;
+    row.sub_zc1 = F::ZERO;
+    row.s_cancel_sub = F::ZERO;
 }
 
 /// Build a `ShrnCols` witness (mirrors `fp_shift::tests::make_cols`) and register
@@ -1971,10 +2156,112 @@ fn fill_cancel_fadd<F: PrimeField32>(
     let rc0 = s0 >> 8;
     let s1 = nb4 + rc0;
     let rc1 = s1 >> 8;
-    let top7c = (nb5 - 128) + rc1;
+    let top7c = nb5.saturating_sub(128) + rc1;
     let rc2 = top7c >> 7;
     let rc2_rem = top7c & 0x7F;
-    let result_exp_calc = large_exp - lshift as i32 + rc2 as i32;
+    let base_exp_i = large_exp - lshift as i32;
+    row.base_exp = if base_exp_i < 0 {
+        -F::from_u32((-base_exp_i) as u32)
+    } else {
+        F::from_u32(base_exp_i as u32)
+    };
+    let result_exp_calc = base_exp_i + rc2 as i32;
+
+    // Exact-zero cancellation (raw_diff all zero).
+    let raw_csum: u32 = raw_bytes6.iter().sum();
+    let is_exact_zero = raw_csum == 0;
+    row.raw_csum = F::from_u32(raw_csum);
+    row.is_exact_zero = F::from_bool(is_exact_zero);
+    row.raw_csum_inv = if is_exact_zero {
+        F::ZERO
+    } else {
+        F::from_u32(raw_csum).try_inverse().unwrap_or(F::ZERO)
+    };
+    let (rc0, rc1, rc2) = if is_exact_zero {
+        (0, 0, 0)
+    } else {
+        (rc0, rc1, rc2)
+    };
+
+    // Result-class routing via base_exp (+256 bias, 9 bits).
+    let is_ovf = base_exp_i + rc2 as i32 >= 255;
+    let is_sub = base_exp_i <= 0;
+    row.cancel_is_ovf = F::from_bool(is_ovf);
+    row.cancel_is_sub = F::from_bool(is_sub);
+    let base_exp_b = (base_exp_i + 256) as u32;
+    debug_assert!(base_exp_b < 512, "fadd cancel base_exp_b out of range");
+    range_checker.add_count(base_exp_b, 9);
+    let lt9 = IsLtSubAir::new(range_checker.bus(), 9);
+    lt9.generate_subrow(
+        (range_checker.as_ref(), 510u32, base_exp_b + rc2),
+        (&mut row.route_ovf_decomp, &mut row.cancel_is_ovf),
+    );
+    lt9.generate_subrow(
+        (range_checker.as_ref(), base_exp_b, 257u32),
+        (&mut row.route_sub_decomp, &mut row.cancel_is_sub),
+    );
+    debug_assert_eq!(row.cancel_is_ovf, F::from_bool(is_ovf));
+    debug_assert_eq!(row.cancel_is_sub, F::from_bool(is_sub));
+
+    // ── Subnormal-result witness ────────────────────────────────────────
+    if is_sub && !is_exact_zero {
+        let t = 25 - base_exp_i;
+        debug_assert!((25..128).contains(&t), "fadd cancel sub_t out of range");
+        let sub_deep = t > 55;
+        let shift = if sub_deep { 55usize } else { t as usize };
+        row.sub_t = F::from_u32(t as u32);
+        range_checker.add_count(t as u32, 7);
+        let lt7 = IsLtSubAir::new(range_checker.bus(), 7);
+        lt7.generate_subrow(
+            (range_checker.as_ref(), 55u32, t as u32),
+            (&mut row.sub_deep_decomp, &mut row.sub_deep),
+        );
+        debug_assert_eq!(row.sub_deep, F::from_bool(sub_deep));
+        let x6: [u32; 6] = core::array::from_fn(|i| ((norm >> (i * 8)) & 0xFF) as u32);
+        row.sub_shrn = make_shrn_cols6::<F>(x6, shift, range_checker);
+
+        let y0 = row.sub_shrn.y[0].as_canonical_u32();
+        let y1 = row.sub_shrn.y[1].as_canonical_u32();
+        let y2 = row.sub_shrn.y[2].as_canonical_u32();
+        row.sub_lsb = F::from_u32(y0 & 1);
+        row.sub_hi7 = F::from_u32(y0 >> 1);
+        range_checker.add_count(y0 >> 1, 7);
+        let sub_round_up = row.sub_shrn.guard.as_canonical_u32() == 1
+            && (row.sub_shrn.sticky.as_canonical_u32() != 0 || y0 & 1 == 1);
+        row.sub_round_up = F::from_bool(sub_round_up);
+        row.s_cancel_sub = F::from_bool(true);
+        let zc0 = (y0 + sub_round_up as u32) >> 8;
+        let z0 = (y0 + sub_round_up as u32) & 0xFF;
+        let zc1 = (y1 + zc0) >> 8;
+        let z1 = (y1 + zc0) & 0xFF;
+        let z2 = y2 + zc1;
+        row.sub_z0 = F::from_u32(z0);
+        row.sub_z1 = F::from_u32(z1);
+        row.sub_z2 = F::from_u32(z2);
+        row.sub_zc0 = F::from_u32(zc0);
+        row.sub_zc1 = F::from_u32(zc1);
+        range_checker.add_count(z0, 8);
+        range_checker.add_count(z1, 8);
+        range_checker.add_count(z2, 8);
+        // Sanity against the native result.
+        debug_assert_eq!(
+            result_bits & 0x7FFF_FFFF,
+            z0 | (z1 << 8) | (z2 << 16),
+            "fadd cancel subnormal result mismatch: a={:08x} b={:08x}",
+            a_bits,
+            b_bits
+        );
+    }
+    if is_exact_zero {
+        debug_assert_eq!(result_bits, 0, "fadd exact cancellation must be +0");
+    }
+    if is_ovf {
+        debug_assert_eq!(
+            result_bits & 0x7FFF_FFFF,
+            0x7F80_0000,
+            "fadd cancel overflow result not inf: {result_bits:08x}"
+        );
+    }
 
     row.carry_out = F::ZERO;
     row.sum_c1 = F::ZERO;
@@ -1988,6 +2275,12 @@ fn fill_cancel_fadd<F: PrimeField32>(
     row.rc1 = F::from_u32(rc1);
     row.rc2 = F::from_u32(rc2);
     row.rc2_rem = F::from_u32(rc2_rem);
+    row.c_m0 = F::from_u32(s0 & 0xFF);
+    row.c_m1 = F::from_u32(s1 & 0xFF);
+    if !is_exact_zero {
+        range_checker.add_count(s0 & 0xFF, 8);
+        range_checker.add_count(s1 & 0xFF, 8);
+    }
     row.r_exp_lo = F::from_u32(r_exp & 1);
     row.r_exp_hi = F::from_u32(r_exp >> 1);
     row.r_exp_hi_zero_inv = if r_exp >> 1 != 0 {
@@ -2012,8 +2305,10 @@ fn fill_cancel_fadd<F: PrimeField32>(
         b_sign
     };
     row.result_sign = F::from_u32(cancel_r_sign);
-    range_checker.add_count(rc2_rem, 7);
-    row.s_cancel_normal = F::from_bool((1u32..=254).contains(&r_exp));
+    if !is_exact_zero {
+        range_checker.add_count(rc2_rem, 7);
+    }
+    row.s_cancel_normal = F::from_bool(!is_sub && !is_ovf && !is_exact_zero);
 
     if (1u32..=254).contains(&r_exp) {
         debug_assert_eq!(
@@ -2361,20 +2656,20 @@ mod finite_add_tests {
     #[test]
     fn finite_add_subnormal_operands_pass() {
         let chip = rc();
-        // Curated subnormal-operand cases (result exp field >= 1; subnormal
-        // results land in a later change).
+        // Curated subnormal-operand cases (including exp-field-0 results).
         for &(a, b) in &[
             (0x00000001, 0x3F800000), // min subnormal + 1.0 (deep)
             (0x3F800000, 0x00000001), // 1.0 + min subnormal (deep)
             (0x007FFFFF, 0x3F800000), // max subnormal + 1.0 (shallow)
             (0x00800000, 0x00400000), // min normal + subnormal
             (0x00400000, 0x80400000), // subnormal - subnormal (cancel)
-            (0x00000001, 0x80000001), // min sub - min sub = +0 (skip: zero result)
+            (0x00000001, 0x80000001), // min sub - min sub = +0 (exact cancel)
+            (0x3F800000, 0xBF800000), // 1.0 + (-1.0) = +0 (exact cancel)
             (0x3F800000, 0x80800000), // 1.0 - min normal (cancel)
+            (0x00800000, 0x80800001), // min_normal - (min_normal + 1ulp) -> -min_sub
+            (0x00800000, 0x807FFFFF), // min_normal - (min_normal - 1ulp) -> +min_sub
+            (0x00000001, 0x80000002), // min_sub - 2*min_sub -> -min_sub
         ] {
-            if (fadd_s(a, b) >> 23) & 0xFF == 0 {
-                continue;
-            }
             let (builder, _) = run_with(a, b, &chip);
             assert!(
                 builder.ok(),
@@ -2382,9 +2677,9 @@ mod finite_add_tests {
                 builder.failures
             );
         }
-        // Fuzz with subnormal operands (result exp field >= 1 only).
+        // Fuzz with subnormal operands (all result classes).
         let mut rng = Rng(0x5BB0_1A11_0DEF_0001);
-        for _ in 0..2000 {
+        for _ in 0..3000 {
             let sa = ((rng.next() as u32) & 1) << 31;
             let sb = ((rng.next() as u32) & 1) << 31;
             let ea = rng.next() as u32 % 255;
@@ -2394,13 +2689,25 @@ mod finite_add_tests {
             if (ea == 0 && a & 0x7FFFFF == 0) || (eb == 0 && b & 0x7FFFFF == 0) {
                 continue; // zero operands are special-cased
             }
-            if (fadd_s(a, b) >> 23) & 0xFF == 0 {
-                continue; // subnormal/zero results land in a later change
-            }
             let (builder, _) = run_with(a, b, &chip);
             assert!(
                 builder.ok(),
                 "subnormal-operand fuzz failed: {:?}\n a={a:08x} b={b:08x}",
+                builder.failures
+            );
+        }
+        // Fuzz biased to tiny exponents for subnormal-result coverage.
+        for _ in 0..2000 {
+            let sa = ((rng.next() as u32) & 1) << 31;
+            let sb = ((rng.next() as u32) & 1) << 31;
+            let ea = (rng.next() as u32 % 6) + 1;
+            let eb = (rng.next() as u32 % 6) + 1;
+            let a = sa | (ea << 23) | ((rng.next() as u32) & 0x7FFFFF);
+            let b = sb | (eb << 23) | ((rng.next() as u32) & 0x7FFFFF);
+            let (builder, _) = run_with(a, b, &chip);
+            assert!(
+                builder.ok(),
+                "tiny-exp fuzz failed: {:?}\n a={a:08x} b={b:08x}",
                 builder.failures
             );
         }

@@ -1763,6 +1763,14 @@ mod fuzz_tests {
         cases.push((0x74800000, 0x84800000)); // 2^100 + (-2^-5ish... tiny)
         cases.push((0x3F800000, 0x80800000)); // 1.0 + (-min_normal)
         cases.push((0x00800000, 0xBF800000)); // min_normal + (-1.0)
+                                              // Exact-zero and subnormal cancellation results.
+        cases.push((0x3F800000, 0xBF800000)); // 1.0 + (-1.0) = +0
+        cases.push((0x00800000, 0x80800001)); // min_normal - (min_normal+1ulp)
+        cases.push((0x00800000, 0x807FFFFF)); // min_normal - (min_normal-1ulp)
+        cases.push((0x00000001, 0x80000001)); // min_sub - min_sub = +0
+                                              // Subnormal operands.
+        cases.push((0x00000001, 0x3F800000)); // min subnormal + 1.0
+        cases.push((0x00400000, 0x80400000)); // subnormal - subnormal
                                               // 15 rows per chunk: the register file has only 32 entries.
         for chunk in cases.chunks(15) {
             let (instrs, mem) =
