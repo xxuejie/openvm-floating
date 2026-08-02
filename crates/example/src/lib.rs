@@ -1348,6 +1348,27 @@ fn test_flw_fsw_negative_offset() {
     assert_eq!(read_mem_bytes(&state, 0x1000), 9.5f32.to_bits());
 }
 
+/// A misaligned FLW/FSW address must fail loudly (clear panic), not silently
+/// round down and prove a different access.
+#[test]
+#[should_panic(expected = "misaligned")]
+fn test_flw_misaligned_fails_loudly() {
+    let mut mem = SparseMemoryImage::new();
+    write_int_reg_bits(&mut mem, 1, 0x1002); // not 4-byte aligned
+    let state = run_program(vec![flw(0, 1, 0), terminate()], mem);
+    let _ = state;
+}
+
+#[test]
+#[should_panic(expected = "misaligned")]
+fn test_fsw_misaligned_fails_loudly() {
+    let mut mem = SparseMemoryImage::new();
+    write_int_reg_bits(&mut mem, 1, 0x1002);
+    write_fp_reg(&mut mem, 2, 1.0);
+    let state = run_program(vec![fsw(1, 2, 0), terminate()], mem);
+    let _ = state;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Execution-level fuzz: random operands through the VM interpreter, verified
 // against the native semantics helpers from the circuit crate.

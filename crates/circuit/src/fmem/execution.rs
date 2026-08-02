@@ -133,7 +133,11 @@ unsafe fn execute_fmem_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
         // `base + imm`, written to FP register `a` (AS fp_as).
         let base_bytes: [u8; 4] = exec_state.vm_read(1, b);
         let base_addr = u32::from_le_bytes(base_bytes);
-        let mem_addr = base_addr.wrapping_add(imm) & !3;
+        let mem_addr = base_addr.wrapping_add(imm);
+        assert!(
+            mem_addr.is_multiple_of(4),
+            "FLW misaligned address: base 0x{base_addr:x} + imm {imm:#x} = 0x{mem_addr:x}"
+        );
         let data: [u8; 4] = exec_state.vm_read(2, mem_addr);
         exec_state.vm_write(fp_as, a, &data);
     } else {
@@ -141,7 +145,11 @@ unsafe fn execute_fmem_core<F: PrimeField32, CTX: ExecutionCtxTrait>(
         // `b` (AS fp_as), written to AS 2 at `base + imm`.
         let base_bytes: [u8; 4] = exec_state.vm_read(1, a);
         let base_addr = u32::from_le_bytes(base_bytes);
-        let mem_addr = base_addr.wrapping_add(imm) & !3;
+        let mem_addr = base_addr.wrapping_add(imm);
+        assert!(
+            mem_addr.is_multiple_of(4),
+            "FSW misaligned address: base 0x{base_addr:x} + imm {imm:#x} = 0x{mem_addr:x}"
+        );
         let data: [u8; 4] = exec_state.vm_read(fp_as, b);
         exec_state.vm_write(2, mem_addr, &data);
     }

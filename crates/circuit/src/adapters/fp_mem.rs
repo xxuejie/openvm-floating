@@ -290,7 +290,14 @@ where
         record.imm = imm_u16;
         record.imm_sign = imm_u16 & 0x8000 != 0;
         let sign_ext = imm_u16 as i16 as i32 as u32;
-        let mem_ptr = record.base_val.wrapping_add(sign_ext) & !3;
+        let mem_ptr = record.base_val.wrapping_add(sign_ext);
+        assert!(
+            mem_ptr.is_multiple_of(4),
+            "FLW/FSW misaligned address: base 0x{:x} + imm {:#x} = 0x{:x} (not 4-byte aligned)",
+            record.base_val,
+            sign_ext,
+            mem_ptr
+        );
         assert!(
             (mem_ptr as u64) < (1u64 << self.pointer_max_bits),
             "FLW/FSW mem_ptr {mem_ptr:#x} >= 2^{}",
