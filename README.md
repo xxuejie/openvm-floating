@@ -68,7 +68,16 @@ mode.
 `mem_ptr = base + sign_extend(imm)` (2×16-bit carry chain, 4-byte alignment
 enforced), and moves a word between AS 2 at `mem_ptr` and the FP register file.
 Both instructions work in Zfinx and F-extension modes, including negative
-immediate offsets.
+immediate offsets. A misaligned address (not 4-byte aligned) fails loudly at
+execution/preflight with a clear message.
+
+### Gotcha: arena record aliasing
+
+When writing a new chip, note that a core record **aliases the start of the
+trace row's core region** (`get_record_from_slice`). If the record and the
+cols struct overlap, writing cols fields *before* reading every record field
+clobbers the record. Always copy the record fields you need into locals first,
+then write the cols (see `fxfer`/`fmem` fillers for the pattern).
 
 ## Build / test commands
 
@@ -98,5 +107,6 @@ Notes:
 
 ## Soundness audit history
 
-See `AUDIT.md` (parent directory) for the full per-chip audit, the fixed
-findings with commit hashes, and the hardening plan.
+The full per-chip soundness audit (findings + fixes with commit hashes) was
+tracked in `AUDIT.md` in the parent directory during the remediation; it was
+deleted once all findings, hardening items, and exit criteria were completed.
