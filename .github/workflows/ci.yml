@@ -8,37 +8,103 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Some runner images do not ship rustup/cargo by default (and may ship an old
+# apt-managed cargo instead), so every job bootstraps rustup explicitly, puts
+# ~/.cargo/bin ahead of any system cargo, and pins the toolchain from
+# rust-toolchain.toml (1.91.1) rather than relying on a floating `stable`.
 jobs:
   fmt-clippy:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install Rust (rustup + pinned toolchain)
+        run: |
+          set -euxo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustup default 1.91.1
+          rustup component add rustfmt clippy
+          # Prepend so rustup's cargo/rustc shadow any preinstalled system tools.
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          printf '%s\n' "PATH=$HOME/.cargo/bin:$PATH" >> "$GITHUB_ENV"
+      - name: Verify toolchain
+        run: |
+          command -v cargo && command -v rustc
+          rustc --version && cargo --version && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --tests -- -D warnings
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --tests -- -D warnings
 
   test-debug:
     name: unit tests (debug)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (rustup + pinned toolchain)
+        run: |
+          set -euxo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustup default 1.91.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          printf '%s\n' "PATH=$HOME/.cargo/bin:$PATH" >> "$GITHUB_ENV"
+      - name: Verify toolchain
+        run: |
+          command -v cargo && command -v rustc
+          rustc --version && cargo --version && rustup show active-toolchain
+      # Guest programs (crates/example/programs) cross-compile to
+      # riscv32im-risc0-zkvm-elf using a pinned nightly + rust-src via
+      # `-Z build-std` (the target is built-in to rustc; rust-src provides the
+      # stdlib). Install the nightly explicitly (see
+      # https://docs.openvm.dev/book/getting-started/install) so the guest
+      # integration tests in `cargo test --workspace` can build.
+      - name: Install guest toolchain (nightly + rust-src)
+        run: |
+          rustup install nightly-2026-01-18
+          rustup component add rust-src --toolchain nightly-2026-01-18
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - name: Test
+        run: cargo test --workspace
 
   test-proving:
     name: prove + bite tests (release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (rustup + pinned toolchain)
+        run: |
+          set -euxo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustup default 1.91.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          printf '%s\n' "PATH=$HOME/.cargo/bin:$PATH" >> "$GITHUB_ENV"
+      - name: Verify toolchain
+        run: |
+          command -v cargo && command -v rustc
+          rustc --version && cargo --version && rustup show active-toolchain
+      # The proving jobs compile the guest_program_tests module; install the
+      # nightly + rust-src so the guest integration tests can also be run.
+      - name: Install guest toolchain (nightly + rust-src)
+        run: |
+          rustup install nightly-2026-01-18
+          rustup component add rust-src --toolchain nightly-2026-01-18
       - uses: Swatinem/rust-cache@v2
       # Proving in debug is far too slow; run the release gates.
-      - run: cargo test --release -p openvm-rv32f-example --features proving chip_proving_tests
-      - run: cargo test --release -p openvm-rv32f-example --features proving bite_
-      - run: cargo test --release -p openvm-rv32f-example --features proving fuzz_prove
-      - run: cargo test --release -p openvm-rv32f-example --features proving f_extension
+      - name: Prove (chip-level)
+        run: cargo test --release -p openvm-rv32f-example --features proving chip_proving_tests
+      - name: Bite-checks
+        run: cargo test --release -p openvm-rv32f-example --features proving bite_
+      - name: Fuzz prove
+        run: cargo test --release -p openvm-rv32f-example --features proving fuzz_prove
+      - name: F-extension prove
+        run: cargo test --release -p openvm-rv32f-example --features proving f_extension
