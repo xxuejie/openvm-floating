@@ -203,6 +203,8 @@ pub struct FmaCoreCols<T> {
     pub raw_work: [T; 7],
     pub work_cb: [T; 6],
     pub add_overflow: T,
+    /// Inverse of raw_work[6] when nonzero (is-zero pin for add_overflow).
+    pub raw6_inv: T,
     pub work_lo: [T; 7],
     pub cancel_lshift: T,
     pub cancel_shln: ShlnCols<T, 7>,
@@ -1025,13 +1027,17 @@ impl FmaCoreAir {
                     .eval(builder, s.into());
             }
         }
-        // Add overflow: add_overflow = (raw_work[6] > 0). Boolean; cancel must be 0.
+        // Add overflow: add_overflow = s_add AND (raw_work[6] != 0).
+        // One-way "ao=0 ⇒ raw[6]=0" alone is not enough: a prover can set ao=1
+        // with raw[6]=0 (or on deep/cancel where s_add=0) and bump base_exp by
+        // +1, forging overflow→Inf or a wrong subnormal shift. Pin both ways
+        // via an is-zero witness on raw_work[6].
         builder.assert_bool(cols.add_overflow);
-        builder.when(s_cancel).assert_zero(cols.add_overflow);
-        // When add_overflow=0, raw_work[6] must be 0 (no overflow to byte 6).
+        let rw6_z = one.clone() - cols.raw_work[6] * cols.raw6_inv;
+        builder.assert_zero(cols.raw_work[6] * rw6_z.clone());
         builder
-            .when(s_add)
-            .assert_zero(cols.raw_work[6] * (one.clone() - cols.add_overflow));
+            .when(s)
+            .assert_eq(cols.add_overflow, s_add * (one.clone() - rw6_z));
 
         // ── Byte decomposition for add-overflow right-shift ────────────
         for i in 0..7 {
@@ -1832,6 +1838,7 @@ fn zero_finite_columns<F: PrimeField32>(row: &mut FmaCoreCols<F>) {
         row.work_cb[i] = F::ZERO;
     }
     row.add_overflow = F::ZERO;
+    row.raw6_inv = F::ZERO;
     row.cancel_lshift = F::ZERO;
     row.cancel_shln = ShlnCols::<F, 7>::default();
     row.raw_sum = F::ZERO;
@@ -2123,6 +2130,11 @@ fn fill_finite_product<F: PrimeField32>(
         range_checker.add_count(cb, 8);
     }
     row.add_overflow = F::from_u32(add_overflow_val);
+    row.raw6_inv = if raw_bytes[6] == 0 {
+        F::ZERO
+    } else {
+        F::from_u32(raw_bytes[6]).try_inverse().unwrap_or(F::ZERO)
+    };
 
     // Exact-zero cancellation (raw_work all zero).
     let raw_sum: u32 = raw_bytes.iter().sum();
@@ -2842,6 +2854,20 @@ mod product_tests {
         );
         row.is_ovf = F::ONE;
         assert!(!eval_row(&row).ok(), "fraudulent is_ovf accepted");
+
+        // Fraudulent add_overflow=1 with raw_work[6]=0 must fail (would bump
+        // base_exp and can forge Inf / wrong subnormals).
+        let mut row = build_row(
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            1.0f32.to_bits(),
+            FmaddOp::Madd,
+        );
+        assert!(eval_row(&row).ok());
+        assert_eq!(row.add_overflow, F::ZERO, "3*4+1 has no byte-6 overflow");
+        assert_eq!(row.raw_work[6], F::ZERO);
+        row.add_overflow = F::ONE;
+        assert!(!eval_row(&row).ok(), "fraudulent add_overflow accepted");
 
         // Free (r_exp_lo, r_exp_hi) split: bump lo by 2 and drop hi by 1 so the
         // weighted sum is unchanged, then shift result[2]/[3] to match. Without
