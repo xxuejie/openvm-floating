@@ -683,6 +683,11 @@ impl FmulCoreAir {
         builder
             .when(cols.s_normal)
             .assert_eq(cols.result[1], cols.norm_sig[4] + cols.c0 - cols.c1 * f256);
+        // Pin implicit bit in norm_sig[5] (is_high / <<1 already force it;
+        // RC closes the 127+c1 edge the same way as fadd cancel).
+        self.range_bus
+            .range_check(cols.norm_sig[5] - f128, 7)
+            .eval(builder, cols.s_normal.into());
         builder.when(cols.s_normal).assert_eq(
             cols.result[2],
             cols.norm_sig[5] - f128 + cols.c1 + (cols.r_exp_lo - cols.c2) * f128,
@@ -1400,6 +1405,7 @@ fn fill_fmul_witness<F: PrimeField32>(
     }
     if s_normal {
         range_chip.add_count(r_exp >> 1, 7);
+        range_chip.add_count(nb5.wrapping_sub(128), 7);
     }
 
     // The reconstruction is only meaningful for normal results; sanity-check

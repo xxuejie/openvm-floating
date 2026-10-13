@@ -848,6 +848,10 @@ impl FsubCoreAir {
             (cols.norm_sig[3] - f128) + cols.rc1,
             cols.rc2_rem + cols.rc2 * f128,
         );
+        // Pin implicit bit in norm_sig[3] (same under-shift edge as cancel path).
+        self.range_bus
+            .range_check(cols.norm_sig[3] - f128, 7)
+            .eval(builder, s_shallow);
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s_shallow);
@@ -1865,6 +1869,7 @@ fn fill_fsub_witness<F: PrimeField32>(
         F::ZERO
     };
     range_checker.add_count(rc2_rem, 7);
+    range_checker.add_count(((norm >> 24) & 0x7F) as u32, 7);
 
     // ── Result-class routing (base_exp_sh + 256 bias, 9 bits) ──────────
     let base_exp_sh_i = large_exp_eff + carry_out as i32;
