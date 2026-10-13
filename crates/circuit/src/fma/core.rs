@@ -381,6 +381,15 @@ where
                 .range_check(cols.c[i].into(), 8)
                 .eval(builder, cols.is_valid.into());
         }
+        // Result bytes: memory does not byte-check writes. Without RC, a free
+        // r_exp_lo / r_exp_hi split (or free carries on other paths) can trade
+        // ±256 against result limbs while still satisfying the reconstruction
+        // equations — forging a different float in the register file.
+        for i in 0..4 {
+            self.range_bus
+                .range_check(cols.result[i].into(), 8)
+                .eval(builder, cols.is_valid.into());
+        }
 
         // ── Classification (per operand: nan / inf / zero) ───────────────
         let mut classify = |exp_lo: AB::Var,
@@ -1297,6 +1306,15 @@ impl FmaCoreAir {
             .eval(builder, sn.into());
 
         // ── Result exponent (normal path; 255 encodes +-inf) ────────────
+        // Pin the (lo, hi) split: without assert_bool(r_exp_lo) and a 7-bit RC
+        // on r_exp_hi, the prover can flip r_exp_lo by 2 and compensate hi by
+        // -1 (same weighted sum) so result[2] += 256 and result[3] -= 1 while
+        // gates still pass. Result limb RC above also closes this; both are
+        // required for gate-level rejection in NumericBuilder tests.
+        builder.assert_bool(cols.r_exp_lo);
+        self.range_bus
+            .range_check(cols.r_exp_hi.into(), 7)
+            .eval(builder, sn.into());
         builder
             .when(sn)
             .assert_eq(cols.r_exp_lo + cols.r_exp_hi * f2, cols.base_exp + cols.rc2);
@@ -1542,6 +1560,7 @@ fn fill_fma_witness<F: PrimeField32>(
         range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
         range_checker.add_count((b_bits >> (i * 8)) & 0xFF, 8);
         range_checker.add_count((c_bits >> (i * 8)) & 0xFF, 8);
+        range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
     }
 
     let (neg_p, neg_c) = op.negations();
@@ -2305,6 +2324,7 @@ fn fill_finite_product<F: PrimeField32>(
         let res_exp_i = base_exp_i + rc2 as i32;
         row.r_exp_lo = F::from_u32((res_exp_i as u32) & 1);
         row.r_exp_hi = F::from_u32((res_exp_i as u32) >> 1);
+        range_checker.add_count((res_exp_i as u32) >> 1, 7);
         // Sanity against the native result.
         debug_assert_eq!(
             (result >> 23) & 0xFF,
@@ -2817,6 +2837,27 @@ mod product_tests {
         );
         row.is_ovf = F::ONE;
         assert!(!eval_row(&row).ok(), "fraudulent is_ovf accepted");
+
+        // Free (r_exp_lo, r_exp_hi) split: bump lo by 2 and drop hi by 1 so the
+        // weighted sum is unchanged, then shift result[2]/[3] to match. Without
+        // assert_bool(r_exp_lo) + r_exp_hi/result RC this forges a different
+        // float (gates alone used to accept it).
+        let mut row = build_row(
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            1.0f32.to_bits(),
+            FmaddOp::Madd,
+        );
+        assert!(eval_row(&row).ok());
+        assert_eq!(row.r_exp_lo, F::ZERO, "13.0 has even exp field");
+        row.r_exp_lo += F::from_u32(2);
+        row.r_exp_hi -= F::ONE;
+        row.result[2] += F::from_u32(256);
+        row.result[3] -= F::ONE;
+        assert!(
+            !eval_row(&row).ok(),
+            "forged r_exp_lo/r_exp_hi split accepted"
+        );
     }
 }
 
