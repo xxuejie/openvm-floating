@@ -137,17 +137,19 @@ pub struct FmulCoreCols<T> {
     pub r_exp_hi: T, // bits [7:1] of result exponent field
     pub r_exp_hi_zero_inv: T,
     pub r_exp_hi_max_inv: T,
-    pub s_normal: T, // finite inputs AND result exponent field in [1, 254]
+    pub s_normal: T, // finite AND not overflow AND not subnormal (LT-routed)
 
     // Overflow detection (see eval_finite_overflow).
-    pub m3_255_inv: T, // inverse for "norm_sig[3] == 255"
-    pub m4_255_inv: T, // inverse for "norm_sig[4] == 255"
-    pub m5_255_inv: T, // inverse for "norm_sig[5] == 255"
-    pub s_overflow: T, // finite inputs AND product exponent >= 255 (result is +-inf)
+    pub m3_255_inv: T,            // inverse for "norm_sig[3] == 255"
+    pub m4_255_inv: T,            // inverse for "norm_sig[4] == 255"
+    pub m5_255_inv: T,            // inverse for "norm_sig[5] == 255"
+    pub s_overflow: T,            // finite inputs AND exp_normal + c2 >= 255 (result is +-inf)
+    pub route_ovf_decomp: [T; 1], // LT aux for s_overflow
+    pub route_sub_decomp: [T; 1], // LT aux for s_subnormal
 
     // === Subnormal / underflow (see eval_finite_subnormal) ===
-    pub s_subnormal: T, // finite inputs AND result exp field == 0 (subnormal or underflow)
-    pub sub_efz: T,     // (result exp field == 0) indicator, gated on is_valid
+    pub s_subnormal: T, // finite inputs AND exp_normal <= 0 (subnormal or underflow)
+    pub sub_efz: T,     // (result exp field == 0) indicator, gated on is_valid (debug/aux)
     pub sub_capped: T,  // bool: true shift >= 56 (capped to 55 ⇒ deep underflow → 0)
     pub sub_lt_decomp: [T; 1], // lower decomposition for sub_capped = (sum < 97)
     pub sub_shift: T,   // capped shift cshift ∈ [25, 55]
@@ -654,26 +656,14 @@ impl FmulCoreAir {
         // result_exp = r_exp_lo + 2 * r_exp_hi.
         builder.assert_eq(cols.result_exp, cols.r_exp_lo + cols.r_exp_hi * f2);
 
-        // Sound "(r_exp_hi == 0)" and "(r_exp_hi == 127)" indicators via is-zero gadgets.
-        // Gated on is_valid: on padding rows the inverse columns are 0.
-        let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
-        builder
-            .when(cols.is_valid)
-            .assert_zero(cols.r_exp_hi * he0.clone());
-        let delta127 = AB::Expr::from(f127) - cols.r_exp_hi;
-        let he127 = one.clone() - delta127.clone() * cols.r_exp_hi_max_inv;
-        builder
-            .when(cols.is_valid)
-            .assert_zero(delta127 * he127.clone());
+        // Pin r_exp_hi to 7 bits so result[3] = r_exp_hi + sign*128 is a unique
+        // byte decomposition (result limbs are separately range-checked).
+        self.range_bus
+            .range_check(cols.r_exp_hi.into(), 7)
+            .eval(builder, cols.s_normal.into());
 
-        // s_normal = s_finite AND result exp field not in {0, 255}.
-        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
-        let exp_is_zero = (one.clone() - cols.r_exp_lo) * he0;
-        let exp_is_max = cols.r_exp_lo * he127;
-        builder.assert_eq(
-            cols.s_normal,
-            s_finite * (one.clone() - exp_is_zero - exp_is_max),
-        );
+        // s_normal is LT-routed in eval_finite_overflow (from exp_normal + c2),
+        // never from the prover-chosen result exponent field.
 
         // Output reconstruction (gated on s_normal):
         //   result[0] = norm_sig[3]            + round_up - c0*256
@@ -713,6 +703,7 @@ impl FmulCoreAir {
         let f127: AB::F = AB::F::from_u32(127);
         let f255: AB::F = AB::F::from_u32(255);
         let f128: AB::F = AB::F::from_u32(128);
+        let f256: AB::F = AB::F::from_u32(256);
         let one = AB::Expr::ONE;
 
         let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
@@ -746,13 +737,39 @@ impl FmulCoreAir {
             .when(s_finite.clone())
             .assert_eq(cols.c2, cols.c1 * eq5);
 
-        let exp_check = exp_normal + cols.c2;
-
-        // result exp field == 255  <=>  r_exp_lo == 1 and r_exp_hi == 127.
-        let he127 = one.clone() - (AB::Expr::from(f127) - cols.r_exp_hi) * cols.r_exp_hi_max_inv;
-        let exp_is_max = cols.r_exp_lo * he127;
-        builder.assert_eq(cols.s_overflow, s_finite * exp_is_max);
+        // ── Sound result-class routing via exp_normal (never result field) ─
+        // exp_normal in roughly [-250, 380]; exp_b = exp_normal + 256 fits 10 bits.
+        // s_overflow:  exp_normal + c2 >= 255  <=>  510 < exp_b + c2.
+        // s_subnormal: exp_normal <= 0         <=>  exp_b < 257.
+        // Previously s_overflow/s_subnormal were derived from the claimed result
+        // exponent field, so a prover could write a non-Inf encoding whenever
+        // exp_normal+c2 > 255 (or take the subnormal path on a normal product).
+        let exp_b = exp_normal.clone() + AB::Expr::from(f256);
+        self.range_bus
+            .range_check(exp_b.clone(), 10)
+            .eval(builder, s_finite.clone());
+        let lt10 = IsLtSubAir::new(self.range_bus, 10);
+        let ovf_io = IsLessThanIo::new(
+            AB::Expr::from(AB::F::from_u32(510)),
+            exp_b.clone() + cols.c2,
+            cols.s_overflow.into(),
+            s_finite.clone(),
+        );
+        lt10.eval(builder, (ovf_io, &cols.route_ovf_decomp));
+        let sub_io = IsLessThanIo::new(
+            exp_b,
+            AB::Expr::from(AB::F::from_u32(257)),
+            cols.s_subnormal.into(),
+            s_finite.clone(),
+        );
+        lt10.eval(builder, (sub_io, &cols.route_sub_decomp));
         builder.assert_bool(cols.s_overflow);
+        builder.assert_bool(cols.s_subnormal);
+        builder.assert_eq(
+            cols.s_normal,
+            s_finite * (one.clone() - cols.s_overflow) * (one.clone() - cols.s_subnormal),
+        );
+        builder.assert_bool(cols.s_normal);
 
         // Result is +-inf (exponent 255, zero mantissa, sign = a ^ b).
         builder.when(cols.s_overflow).assert_zero(cols.result[0]);
@@ -764,12 +781,7 @@ impl FmulCoreAir {
             cols.result[3],
             AB::Expr::from(f127) + cols.result_sign * f128,
         );
-
-        // Genuine overflow: exp_check >= 255. Range-check (exp_check - 255) to
-        // [0, 256) (a negative value wraps outside the range).
-        self.range_bus
-            .range_check(exp_check - f255, LIMB_BITS)
-            .eval(builder, cols.s_overflow);
+        let _ = f255; // kept for eq_* deltas above
     }
 
     /// Constrain the finite subnormal / underflow result (product exponent ≤ 0).
@@ -795,18 +807,13 @@ impl FmulCoreAir {
         let a_exp = cols.a_exp_lo + cols.a_exp_hi * f2;
         let b_exp = cols.b_exp_lo + cols.b_exp_hi * f2;
 
-        // s_subnormal = s_finite AND result exp field == 0. Split across a column
-        // (sub_efz = exp field == 0) so the is_valid gating stays within degree 4
-        // (s_finite*exp_field_zero is degree 4; gating it directly would be 5).
-        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
+        // s_subnormal is LT-routed in eval_finite_overflow from exp_normal <= 0.
+        // sub_efz still tracks (result exp field == 0) for filler/debug consistency.
         let he0 = one.clone() - cols.r_exp_hi * cols.r_exp_hi_zero_inv;
         let exp_field_zero = (one.clone() - cols.r_exp_lo) * he0;
         builder
             .when(cols.is_valid)
             .assert_eq(cols.sub_efz, exp_field_zero);
-        builder
-            .when(cols.is_valid)
-            .assert_eq(cols.s_subnormal, s_finite.clone() * cols.sub_efz);
         builder.assert_bool(cols.s_subnormal);
         let s = cols.s_subnormal;
 
@@ -1311,8 +1318,7 @@ fn fill_fmul_witness<F: PrimeField32>(
         F::ZERO
     };
     let s_finite = !is_nan_res && !inf_in && !zero_in;
-    let s_normal = s_finite && (1..=254).contains(&r_exp);
-    row.s_normal = F::from_bool(s_normal);
+    // s_normal / s_overflow / s_subnormal assigned below via LT routing.
 
     // Rounding carries. Only meaningful for finite inputs (norm has its implicit
     // bit at 47, so nb5 >= 128); for special/zero inputs they are don't-care
@@ -1358,31 +1364,49 @@ fn fill_fmul_witness<F: PrimeField32>(
     } else {
         F::ZERO
     };
-    let s_overflow = s_finite && r_exp == 255;
+    // Sound result-class routing (matches eval_finite_overflow LT gadgets).
+    let exp_normal_i = a_exp_eff + b_exp_eff - 127 + is_high as i32;
+    let exp_check_i = exp_normal_i + c2 as i32;
+    let s_overflow = s_finite && exp_check_i >= 255;
+    let s_subnormal = s_finite && exp_normal_i <= 0;
+    let s_normal = s_finite && !s_overflow && !s_subnormal;
     row.s_overflow = F::from_bool(s_overflow);
-    // Register the overflow exponent-check key on the tuple range bus so the
-    // corresponding lookup in eval_finite_overflow balances.
-    if s_overflow {
-        let exp_check = (a_exp_eff + b_exp_eff - 127 + is_high as i32 + c2 as i32) as u32;
-        range_chip.add_count(exp_check - 255, LIMB_BITS);
+    row.s_subnormal = F::from_bool(s_subnormal);
+    row.s_normal = F::from_bool(s_normal);
+    row.sub_efz = F::from_bool(r_exp == 0);
+    let exp_b = (exp_normal_i + 256) as u32;
+    debug_assert!(exp_b < 1024, "fmul exp_b out of 10-bit range: {exp_b}");
+    if s_finite {
+        range_chip.add_count(exp_b, 10);
+        let lt10 = IsLtSubAir::new(range_chip.bus(), 10);
+        lt10.generate_subrow(
+            (range_chip.as_ref(), 510u32, exp_b + c2),
+            (&mut row.route_ovf_decomp, &mut row.s_overflow),
+        );
+        lt10.generate_subrow(
+            (range_chip.as_ref(), exp_b, 257u32),
+            (&mut row.route_sub_decomp, &mut row.s_subnormal),
+        );
+        debug_assert_eq!(row.s_overflow, F::from_bool(s_overflow));
+        debug_assert_eq!(row.s_subnormal, F::from_bool(s_subnormal));
+    } else {
+        row.route_ovf_decomp = [F::ZERO];
+        row.route_sub_decomp = [F::ZERO];
+    }
+    if s_normal {
+        range_chip.add_count(r_exp >> 1, 7);
     }
 
     // The reconstruction is only meaningful for normal results; sanity-check
     // the exponent carry there so any witness drift surfaces immediately.
     debug_assert!(
-        !s_normal || r_exp as i32 == a_exp_eff + b_exp_eff - 127 + is_high as i32 + c2 as i32,
+        !s_normal || r_exp as i32 == exp_check_i,
         "fmul normal-result exponent reconstruction mismatch"
     );
-    // Overflow exponent sanity check.
     debug_assert!(
-        !s_overflow || a_exp_eff + b_exp_eff - 127 + is_high as i32 + c2 as i32 >= 255,
+        !s_overflow || exp_check_i >= 255,
         "fmul overflow exponent mismatch"
     );
-
-    // ── Subnormal / underflow witness ──────────────────────────────────
-    let s_subnormal = s_finite && r_exp == 0;
-    row.s_subnormal = F::from_bool(s_subnormal);
-    row.sub_efz = F::from_bool(r_exp == 0);
     if s_subnormal {
         let exp_normal = a_exp_eff + b_exp_eff - 127 + is_high as i32;
         let sum_b = (a_exp_eff + b_exp_eff + is_high as i32 + 64) as u32;
@@ -1800,106 +1824,43 @@ mod finite_tests {
 mod overflow_tests {
     use super::*;
     use crate::test_utils::NumericBuilder;
+    use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
     use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
 
     type F = BabyBear;
 
-    /// Build a row for an overflow case (finite inputs whose product is +-inf).
-    fn make_overflow_cols(a: u32, b: u32) -> FmulCoreCols<F> {
-        let a_exp = (a >> 23) & 0xFF;
-        let b_exp = (b >> 23) & 0xFF;
-        let a_sig = (a & 0x7FFFFF) | 0x800000;
-        let b_sig = (b & 0x7FFFFF) | 0x800000;
-        let prod = (a_sig as u64) * (b_sig as u64);
-        let is_high = (prod >> 47) & 1 == 1;
-        let norm = if is_high { prod } else { prod << 1 };
-        let guard_bit = ((norm >> 23) & 1) as u32;
-        let slack = norm & 0xFFFFFF;
-        let sticky = (slack & 0x7FFFFF) != 0;
-        let mant_lsb = (norm >> 24) & 1;
-        let round_up = guard_bit == 1 && (sticky || mant_lsb == 1);
-
-        let nb3 = ((norm >> 24) & 0xFF) as u32;
-        let nb4 = ((norm >> 32) & 0xFF) as u32;
-        let nb5 = ((norm >> 40) & 0xFF) as u32;
-        let s0 = nb3 + round_up as u32;
-        let c0 = s0 >> 8;
-        let s1 = nb4 + c0;
-        let c1 = s1 >> 8;
-        let c2 = (nb5.wrapping_sub(128)).wrapping_add(c1) >> 7;
-
-        let result = fmul_s(a, b); // inf
-        let r_sign = ((a >> 31) & 1) ^ ((b >> 31) & 1);
-
-        FmulCoreCols {
-            is_high: F::from_bool(is_high),
-            round_up: F::from_bool(round_up),
-            a_exp_lo: F::from_u32(a_exp & 1),
-            a_exp_hi: F::from_u32(a_exp >> 1),
-            b_exp_lo: F::from_u32(b_exp & 1),
-            b_exp_hi: F::from_u32(b_exp >> 1),
-            result_sign: F::from_u32(r_sign),
-            result_exp: F::from_u32(255),
-            norm_sig: core::array::from_fn(|i| F::from_u32((norm >> (i * 8)) as u32 & 0xFF)),
-            result: core::array::from_fn(|i| F::from_u32((result >> (i * 8)) & 0xFF)),
-            c0: F::from_u32(c0),
-            c1: F::from_u32(c1),
-            c2: F::from_u32(c2),
-            r_exp_lo: F::ONE, // 255 = 1 + 2*127
-            r_exp_hi: F::from_u32(127),
-            r_exp_hi_zero_inv: F::ZERO,
-            r_exp_hi_max_inv: F::ZERO, // r_exp_hi == 127
-            m3_255_inv: if nb3 != 255 {
-                (F::from_u32(255) - F::from_u32(nb3))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO)
-            } else {
-                F::ZERO
-            },
-            m4_255_inv: if nb4 != 255 {
-                (F::from_u32(255) - F::from_u32(nb4))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO)
-            } else {
-                F::ZERO
-            },
-            m5_255_inv: if nb5 != 255 {
-                (F::from_u32(255) - F::from_u32(nb5))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO)
-            } else {
-                F::ZERO
-            },
-            s_overflow: F::ONE,
-            ..Default::default()
-        }
+    fn filler_cols(a: u32, b: u32) -> FmulCoreCols<F> {
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let lt = IsLtSubAir::new(chip.bus(), 8);
+        let mut cols = FmulCoreCols::<F>::default();
+        fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip, &lt);
+        cols
     }
 
     fn run(c: &FmulCoreCols<F>) -> NumericBuilder<F> {
         let mut b = NumericBuilder::new(vec![]);
-        FmulCoreAir::new(
-            openvm_circuit_primitives::var_range::VariableRangeCheckerBus::new(0, 16),
-            0,
-        )
-        .eval_finite_overflow(&mut b, c);
+        FmulCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0).eval_finite_overflow(&mut b, c);
         b
     }
 
     #[test]
     fn overflow_honest_passes() {
-        // Products that overflow to +-inf.
         let cases: &[(u32, u32)] = &[
             (f32::MAX.to_bits(), f32::MAX.to_bits()),
             (f32::MAX.to_bits(), 2.0f32.to_bits()),
-            (f32::MIN.to_bits(), f32::MAX.to_bits()), // -inf
+            (f32::MIN.to_bits(), f32::MAX.to_bits()),
             (1e30f32.to_bits(), 1e30f32.to_bits()),
         ];
         for &(a, bb) in cases {
-            let c = make_overflow_cols(a, bb);
+            let c = filler_cols(a, bb);
             assert_eq!(
                 fmul_s(a, bb) & 0x7FFF_FFFF,
                 f32::INFINITY.to_bits() & 0x7FFF_FFFF
             );
+            assert_eq!(c.s_overflow, F::ONE, "expected overflow row");
             let bld = run(&c);
             assert!(
                 bld.ok(),
@@ -1913,9 +1874,70 @@ mod overflow_tests {
 
     #[test]
     fn overflow_corrupt_result_rejected() {
-        let mut c = make_overflow_cols(f32::MAX.to_bits(), f32::MAX.to_bits());
-        c.result[0] = F::ONE; // inf has zero mantissa
+        let mut c = filler_cols(f32::MAX.to_bits(), f32::MAX.to_bits());
+        c.result[0] = F::ONE;
         assert!(!run(&c).ok(), "non-inf overflow result must be rejected");
+    }
+
+    /// Prover sets a non-255 result exp encoding equal to exp_check (>255).
+    /// Before LT routing this satisfied gates with a finite garbage write.
+    #[test]
+    fn overflow_cannot_forge_finite_via_large_result_exp() {
+        use openvm_circuit::arch::BasicAdapterInterface;
+        use openvm_circuit::arch::MinimalInstruction;
+        use openvm_stark_backend::p3_field::PrimeField32;
+        type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let lt = IsLtSubAir::new(chip.bus(), 8);
+        let a = f32::MAX.to_bits();
+        let b = f32::MAX.to_bits();
+        let mut cols = FmulCoreCols::<F>::default();
+        fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip, &lt);
+        assert_eq!(cols.s_overflow, F::ONE);
+        // Forge: claim exp_check as a "normal" result exponent (>255).
+        let exp_check = cols.result_exp; // may be 255 on Inf row; use a_exp path
+                                         // Derive exp_check from inputs: max*max has large product exp.
+        let a_exp = ((a >> 23) & 0xFF) as i32;
+        let b_exp = ((b >> 23) & 0xFF) as i32;
+        let is_high = cols.is_high.as_canonical_u32();
+        let c2 = cols.c2.as_canonical_u32();
+        let exp_check_i = a_exp + b_exp - 127 + is_high as i32 + c2 as i32;
+        assert!(
+            exp_check_i >= 255,
+            "need overflow exp_check, got {exp_check_i}"
+        );
+        if exp_check_i == 255 {
+            // Exact-255 overflow cannot use the >255 forge; still ensure Inf is forced.
+            return;
+        }
+        let forged_exp = exp_check_i as u32;
+        cols.s_overflow = F::ZERO;
+        cols.s_subnormal = F::ZERO;
+        cols.s_normal = F::ONE;
+        cols.result_exp = F::from_u32(forged_exp);
+        cols.r_exp_lo = F::from_u32(forged_exp & 1);
+        cols.r_exp_hi = F::from_u32(forged_exp >> 1);
+        cols.result[0] = F::from_u32(0x12);
+        cols.result[1] = F::from_u32(0x34);
+        cols.result[2] = F::from_u32((forged_exp & 1) * 128);
+        cols.result[3] = F::from_u32(forged_exp >> 1); // result_sign=0
+        let mut buf = vec![F::ZERO; FmulCoreCols::<F>::width()];
+        *buf.as_mut_slice().borrow_mut() = cols;
+        let mut bld = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+            &FmulCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0),
+            &mut bld,
+            &buf,
+            F::ZERO,
+        );
+        assert!(
+            !bld.ok(),
+            "forged finite encoding for overflow must be rejected: {:?}",
+            bld.failures
+        );
+        let _ = exp_check;
     }
 }
 
