@@ -468,10 +468,9 @@ where
                 .when(not(cols.is_high))
                 .assert_eq(cols.norm_sig[i], shifted - new_carry.clone() * f256);
             // The per-limb carry must be a bit, or the chain is tautological.
-            self.range_bus.range_check(new_carry.clone(), 1).eval(
-                builder,
-                cols.is_valid.into() * s_finite * not(cols.is_high),
-            );
+            self.range_bus
+                .range_check(new_carry.clone(), 1)
+                .eval(builder, cols.is_valid.into() * s_finite * not(cols.is_high));
             shift_carry = new_carry;
         }
         // Only enforce shift carry == 0 when !is_high (skipped for is_high rows)
@@ -739,12 +738,8 @@ impl FmulCoreAir {
         builder
             .when(s_finite)
             .assert_eq(cols.c0, cols.round_up * eq3);
-        builder
-            .when(s_finite)
-            .assert_eq(cols.c1, cols.c0 * eq4);
-        builder
-            .when(s_finite)
-            .assert_eq(cols.c2, cols.c1 * eq5);
+        builder.when(s_finite).assert_eq(cols.c1, cols.c0 * eq4);
+        builder.when(s_finite).assert_eq(cols.c2, cols.c1 * eq5);
 
         // ── Sound result-class routing via exp_normal (never result field) ─
         // exp_normal in roughly [-250, 380]; exp_b = exp_normal + 256 fits 10 bits.
