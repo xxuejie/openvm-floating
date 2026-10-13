@@ -8,11 +8,16 @@ The 13 chips cover: `fadd`, `fsub`, `fmul`, `fdiv`, `fsqrt`, `fma`, `fsgnj`,
 `fminmax`, `fcmp`, `fclass`, `fxfer` (`fmv.x.s`/`fmv.s.x`), `fcvt_f2i`
 (`fcvt.w.s`/`fcvt.wu.s`), and `fcvt_i2f` (`fcvt.s.w`/`fcvt.s.wu`).
 
-## Full soundness
+## Soundness
 
 Every arithmetic chip **cryptographically enforces** that its output equals the
-true IEEE-754 result of the operation on its inputs. A malicious prover cannot
-pick an unconstrained witness column or input class to forge a result.
+IEEE-754 result under a fixed config subset. A malicious prover cannot pick an
+unconstrained witness column or input class to forge a result within that
+subset.
+
+**Scope.** Arith / FMA / `fsqrt` / `fcvt.s.w[u]` use RNE (`DYN` as RNE; no FCSR).
+`fcvt.w[u].s` is RTZ-only. No accrued exception flags. Zfinx (AS1) or
+F-extension (AS5). The transpiler rejects other rounding modes.
 
 ### Architecture
 
@@ -47,7 +52,8 @@ pick an unconstrained witness column or input class to forge a result.
   `test_utils.rs`) — perturb every witness column of an honest row by +1 and
   re-eval; every accepted perturbation is triaged and whitelisted with a written
   justification. Live for the small chips (fcmp, fminmax, fclass, fsgnj, fxfer,
-  fmem), plus focused result-byte + selector pinning sweeps for fadd/fsub/fmul.
+  fmem), plus focused result-byte + selector / critical-aux pinning sweeps for
+  fadd/fsub/fmul/fdiv/fsqrt and fcvt.
 - **STARK-level bite-checks** (`crates/example/src/lib.rs`, `bite_checks` module)
   — run a program through the full VM, verify the honest trace with
   `debug_proving_ctx` (constraints + LogUp bus balance), corrupt one witness
