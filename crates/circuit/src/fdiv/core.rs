@@ -226,13 +226,19 @@ where
                 .eval(builder, cols.is_valid.into());
         }
 
-        // Range check input bytes (bounds exponent/mantissa sums).
+        // Range check input bytes (bounds exponent/mantissa sums) and the
+        // result bytes (the memory side does not byte-check written data).
+        // Without result RC, free bool carries (rc0/rc1/sub_rc*) can trade
+        // ±256 against result limbs and still satisfy the carry equations.
         for i in 0..4 {
             self.range_bus
                 .range_check(cols.a[i].into(), 8)
                 .eval(builder, cols.is_valid.into());
             self.range_bus
                 .range_check(cols.b[i].into(), 8)
+                .eval(builder, cols.is_valid.into());
+            self.range_bus
+                .range_check(cols.result[i].into(), 8)
                 .eval(builder, cols.is_valid.into());
         }
 
@@ -1034,6 +1040,7 @@ fn fill_fdiv_witness<F: PrimeField32>(
         core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
         range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
         range_checker.add_count((b_bits >> (i * 8)) & 0xFF, 8);
+        range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
     }
 
     let (a_sign, a_exp, a_mant) = decompose(a_bits);
@@ -1872,5 +1879,44 @@ mod corruption_sweep_tests {
                 &format!("fdiv a={a:08x} b={b:08x}"),
             );
         }
+    }
+
+    /// Joint forge: flip rc0 and compensate result[0] by −256.
+    /// Before result limb RC this passed AIR; it must be rejected now.
+    #[test]
+    fn joint_rc0_result0_compensation_rejected() {
+        use openvm_stark_backend::p3_field::PrimeField32;
+        let a = 3.0f32.to_bits();
+        let b = 2.0f32.to_bits();
+        let mut cols = filler_cols(a, b);
+        assert_eq!(
+            cols.s_normal,
+            F::ONE,
+            "need a normal-result row for rc0 forge"
+        );
+        assert_eq!(
+            cols.rc0,
+            F::ZERO,
+            "need rc0=0 so the +1/−256 trade is available"
+        );
+        let honest0 = cols.result[0];
+        cols.rc0 = F::ONE;
+        cols.result[0] = honest0 - F::from_u32(256);
+        let bad = cols.result[0].as_canonical_u32();
+        assert!(bad > 255, "expected non-byte canonical limb, got {bad}");
+        let mut buf = vec![F::ZERO; FdivCoreCols::<F>::width()];
+        *buf.as_mut_slice().borrow_mut() = cols;
+        let mut bld = crate::test_utils::NumericBuilder::new(vec![]);
+        VmCoreAir::<crate::test_utils::NumericBuilder<F>, TestI>::eval(
+            &air(),
+            &mut bld,
+            &buf,
+            F::ZERO,
+        );
+        assert!(
+            !bld.ok(),
+            "rc0=1 with result[0]-=256 must be rejected (got ok; failures={:?})",
+            bld.failures
+        );
     }
 }
