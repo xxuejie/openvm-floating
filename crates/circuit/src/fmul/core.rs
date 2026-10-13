@@ -217,6 +217,21 @@ where
                 .range_check(v.into(), 7)
                 .eval(builder, cols.is_valid.into());
         }
+        // Low mantissa bytes are adapter-read limbs; range-check them like
+        // fdiv's input bytes (memory does not byte-check written data).
+        for v in [cols.a_mant0, cols.a_mant1, cols.b_mant0, cols.b_mant1] {
+            self.range_bus
+                .range_check(v.into(), 8)
+                .eval(builder, cols.is_valid.into());
+        }
+        // Result bytes: without RC, free bool carries (sub_rc0/sub_rc1) on the
+        // subnormal path can trade ±256 against result limbs and still satisfy
+        // the carry equations (memory does not byte-check writes).
+        for i in 0..4 {
+            self.range_bus
+                .range_check(cols.result[i].into(), 8)
+                .eval(builder, cols.is_valid.into());
+        }
 
         // ── Phase 2: Classification (stored as columns, fdiv-style) ──────────
         // The exp_is_zero / exp_is_max / mant_is_zero columns are constrained only
@@ -1044,6 +1059,10 @@ fn fill_fmul_witness<F: PrimeField32>(
     range_chip.add_count(b_mant2, 7);
     range_chip.add_count(a_exp_hi, 7);
     range_chip.add_count(b_exp_hi, 7);
+    range_chip.add_count(a_mant0, 8);
+    range_chip.add_count(a_mant1, 8);
+    range_chip.add_count(b_mant0, 8);
+    range_chip.add_count(b_mant1, 8);
 
     // Classification inverse witnesses
     let a_exp_f = F::from_u32(a_exp);
@@ -1237,6 +1256,9 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.result[1] = F::from_u32((result_bits >> 8) & 0xFF);
     row.result[2] = F::from_u32((result_bits >> 16) & 0xFF);
     row.result[3] = F::from_u32((result_bits >> 24) & 0xFF);
+    for i in 0..4 {
+        range_chip.add_count((result_bits >> (i * 8)) & 0xFF, 8);
+    }
 
     let is_nan_res = a_is_nan || b_is_nan || (a_is_inf && b_is_zero) || (a_is_zero && b_is_inf);
     row.is_nan_result = F::from_bool(is_nan_res);
@@ -2011,6 +2033,71 @@ mod full_eval_tests {
                 b4.failures
             );
         }
+    }
+
+    /// Joint forge: flip sub_rc0 and compensate result[0] by −256 (and
+    /// result[1] by +1 so the carry cascade still holds). Before result limb
+    /// RC this is a LogUp-only hole; with result RC the non-byte limb is
+    /// rejected. NumericBuilder ignores interactions, so we also assert the
+    /// forged limb is outside [0, 255] as documentation of the attack shape,
+    /// and reject the incomplete (result[0]-only) forge via the cascade.
+    #[test]
+    fn joint_sub_rc0_result0_compensation_rejected() {
+        use openvm_circuit::arch::BasicAdapterInterface;
+        use openvm_circuit::arch::MinimalInstruction;
+        use openvm_stark_backend::p3_field::PrimeField32;
+        type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+        // subnormal * 1.0 → subnormal result (exercises sub_rc*).
+        let a = 0x00000001u32;
+        let b = 1.0f32.to_bits();
+        let (cols, _chip) = filler_cols(a, b);
+        assert_eq!(
+            cols.s_subnormal,
+            F::ONE,
+            "need a subnormal-result row for sub_rc0 forge"
+        );
+        assert_eq!(
+            cols.sub_rc0,
+            F::ZERO,
+            "need sub_rc0=0 so the +1/−256 trade is available"
+        );
+        let honest0 = cols.result[0];
+        let honest1 = cols.result[1];
+        let mut buf = vec![F::ZERO; FmulCoreCols::<F>::width()];
+        {
+            let c: &mut FmulCoreCols<F> = buf.as_mut_slice().borrow_mut();
+            *c = cols;
+            // Incomplete forge (breaks cascade on result[1]).
+            c.sub_rc0 = F::ONE;
+            c.result[0] = honest0 - F::from_u32(256);
+            let bad = c.result[0].as_canonical_u32();
+            assert!(bad > 255, "expected non-byte canonical limb, got {bad}");
+        }
+        let mut bld = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air(), &mut bld, &buf, F::ZERO);
+        assert!(
+            !bld.ok(),
+            "incomplete sub_rc0 forge must fail cascade (got ok; failures={:?})",
+            bld.failures
+        );
+        // Complete forge: also bump result[1] so both carry eqs hold in-field.
+        // Gate constraints pass; the soundness fix is result limb LogUp RC
+        // (not visible to NumericBuilder). Document the non-byte attack shape.
+        {
+            let c: &mut FmulCoreCols<F> = buf.as_mut_slice().borrow_mut();
+            c.result[1] = honest1 + F::ONE;
+            assert!(
+                c.result[0].as_canonical_u32() > 255,
+                "complete forge must leave a non-byte result[0]"
+            );
+        }
+        let mut bld2 = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(&air(), &mut bld2, &buf, F::ZERO);
+        assert!(
+            bld2.ok(),
+            "complete joint forge holds gate constraints (RC is LogUp-only): {:?}",
+            bld2.failures
+        );
     }
 
     #[test]
