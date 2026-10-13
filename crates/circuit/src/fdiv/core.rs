@@ -1008,163 +1008,176 @@ where
         self.adapter.fill_trace_row(mem_helper, adapter_row);
         let record: &FdivCoreRecord = unsafe { get_record_from_slice(&mut core_row, ()) };
         let core_row: &mut FdivCoreCols<F> = core_row.borrow_mut();
-
         let a_bits = u32::from_le_bytes(record.a);
         let b_bits = u32::from_le_bytes(record.b);
-        let result = fdiv_s(a_bits, b_bits);
+        fill_fdiv_witness(
+            core_row,
+            a_bits,
+            b_bits,
+            fdiv_s(a_bits, b_bits),
+            &self.range_checker,
+        );
+    }
+}
 
-        for i in 0..4 {
-            core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
-            core_row.b[i] = F::from_u32((b_bits >> (i * 8)) & 0xFF);
-            core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
-            self.range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
-            self.range_checker.add_count((b_bits >> (i * 8)) & 0xFF, 8);
-        }
+/// Fill a complete FDIV.S core witness row (production filler + corruption tests).
+fn fill_fdiv_witness<F: PrimeField32>(
+    core_row: &mut FdivCoreCols<F>,
+    a_bits: u32,
+    b_bits: u32,
+    result: u32,
+    range_checker: &SharedVariableRangeCheckerChip,
+) {
+    for i in 0..4 {
+        core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
+        core_row.b[i] = F::from_u32((b_bits >> (i * 8)) & 0xFF);
+        core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
+        range_checker.add_count((b_bits >> (i * 8)) & 0xFF, 8);
+    }
 
-        let (a_sign, a_exp, a_mant) = decompose(a_bits);
-        let (b_sign, b_exp, b_mant) = decompose(b_bits);
+    let (a_sign, a_exp, a_mant) = decompose(a_bits);
+    let (b_sign, b_exp, b_mant) = decompose(b_bits);
 
-        let classify = |exp: u32,
-                        mant: u32,
-                        exp_zero_inv: &mut F,
-                        exp_max_inv: &mut F,
-                        mant_sum_inv: &mut F,
-                        exp_is_zero: &mut F,
-                        exp_is_max: &mut F,
-                        mant_is_zero: &mut F| {
-            let exp_f = F::from_u32(exp);
-            *exp_is_zero = F::from_bool(exp == 0);
-            *exp_is_max = F::from_bool(exp == 255);
-            *exp_zero_inv = if exp != 0 {
-                exp_f.try_inverse().unwrap_or(F::ZERO)
-            } else {
-                F::ZERO
-            };
-            *exp_max_inv = if exp != 255 {
-                (F::from_u32(255) - exp_f).try_inverse().unwrap_or(F::ZERO)
-            } else {
-                F::ZERO
-            };
-            let mant_sum = (mant & 0xFF) + ((mant >> 8) & 0xFF) + ((mant >> 16) & 0x7F);
-            *mant_is_zero = F::from_bool(mant == 0);
-            *mant_sum_inv = if mant != 0 {
-                F::from_u32(mant_sum).try_inverse().unwrap_or(F::ZERO)
-            } else {
-                F::ZERO
-            };
+    let classify = |exp: u32,
+                    mant: u32,
+                    exp_zero_inv: &mut F,
+                    exp_max_inv: &mut F,
+                    mant_sum_inv: &mut F,
+                    exp_is_zero: &mut F,
+                    exp_is_max: &mut F,
+                    mant_is_zero: &mut F| {
+        let exp_f = F::from_u32(exp);
+        *exp_is_zero = F::from_bool(exp == 0);
+        *exp_is_max = F::from_bool(exp == 255);
+        *exp_zero_inv = if exp != 0 {
+            exp_f.try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
         };
+        *exp_max_inv = if exp != 255 {
+            (F::from_u32(255) - exp_f).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+        let mant_sum = (mant & 0xFF) + ((mant >> 8) & 0xFF) + ((mant >> 16) & 0x7F);
+        *mant_is_zero = F::from_bool(mant == 0);
+        *mant_sum_inv = if mant != 0 {
+            F::from_u32(mant_sum).try_inverse().unwrap_or(F::ZERO)
+        } else {
+            F::ZERO
+        };
+    };
 
-        core_row.a_sign = F::from_u32(a_sign);
-        core_row.b_sign = F::from_u32(b_sign);
-        core_row.a_exp_lo = F::from_u32(a_exp & 1);
-        core_row.b_exp_lo = F::from_u32(b_exp & 1);
-        core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
-        core_row.b_mant2 = F::from_u32((b_mant >> 16) & 0x7F);
-        core_row.a_hi = F::from_u32(a_exp >> 1);
-        core_row.b_hi = F::from_u32(b_exp >> 1);
-        self.range_checker.add_count((a_mant >> 16) & 0x7F, 7);
-        self.range_checker.add_count((b_mant >> 16) & 0x7F, 7);
-        self.range_checker.add_count(a_exp >> 1, 7);
-        self.range_checker.add_count(b_exp >> 1, 7);
+    core_row.a_sign = F::from_u32(a_sign);
+    core_row.b_sign = F::from_u32(b_sign);
+    core_row.a_exp_lo = F::from_u32(a_exp & 1);
+    core_row.b_exp_lo = F::from_u32(b_exp & 1);
+    core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+    core_row.b_mant2 = F::from_u32((b_mant >> 16) & 0x7F);
+    core_row.a_hi = F::from_u32(a_exp >> 1);
+    core_row.b_hi = F::from_u32(b_exp >> 1);
+    range_checker.add_count((a_mant >> 16) & 0x7F, 7);
+    range_checker.add_count((b_mant >> 16) & 0x7F, 7);
+    range_checker.add_count(a_exp >> 1, 7);
+    range_checker.add_count(b_exp >> 1, 7);
 
-        classify(
+    classify(
+        a_exp,
+        a_mant,
+        &mut core_row.a_exp_zero_inv,
+        &mut core_row.a_exp_max_inv,
+        &mut core_row.a_mant_sum_inv,
+        &mut core_row.a_exp_is_zero,
+        &mut core_row.a_exp_is_max,
+        &mut core_row.a_mant_is_zero,
+    );
+    classify(
+        b_exp,
+        b_mant,
+        &mut core_row.b_exp_zero_inv,
+        &mut core_row.b_exp_max_inv,
+        &mut core_row.b_mant_sum_inv,
+        &mut core_row.b_exp_is_zero,
+        &mut core_row.b_exp_is_max,
+        &mut core_row.b_mant_is_zero,
+    );
+
+    let a_nan = a_exp == 255 && a_mant != 0;
+    let b_nan = b_exp == 255 && b_mant != 0;
+    let a_inf = a_exp == 255 && a_mant == 0;
+    let b_inf = b_exp == 255 && b_mant == 0;
+    let a_zero = a_exp == 0 && a_mant == 0;
+    let b_zero = b_exp == 0 && b_mant == 0;
+    let any_nan = a_nan || b_nan;
+    let canon_sel = any_nan || (a_inf && b_inf) || (a_zero && b_zero);
+    let inf_res = !any_nan && ((a_inf && !b_inf) || (b_zero && !a_inf && !a_zero));
+    let zero_res = !any_nan && ((b_inf && !a_inf) || (a_zero && !b_zero && !b_inf));
+
+    core_row.a_nan = F::from_bool(a_nan);
+    core_row.b_nan = F::from_bool(b_nan);
+    core_row.a_inf = F::from_bool(a_inf);
+    core_row.b_inf = F::from_bool(b_inf);
+    core_row.a_zero = F::from_bool(a_zero);
+    core_row.b_zero = F::from_bool(b_zero);
+    core_row.any_nan = F::from_bool(any_nan);
+    core_row.canon_sel = F::from_bool(canon_sel);
+    core_row.inf_res = F::from_bool(inf_res);
+    core_row.zero_res = F::from_bool(zero_res);
+    core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
+    core_row.r_sign = F::from_bool(a_sign != b_sign);
+
+    let a_normal = (1..=254).contains(&a_exp);
+    let b_normal = (1..=254).contains(&b_exp);
+    let a_sub = a_exp == 0 && a_mant != 0;
+    let b_sub = b_exp == 0 && b_mant != 0;
+    let s_finite =
+        !canon_sel && !inf_res && !zero_res && (a_normal || a_sub) && (b_normal || b_sub);
+    core_row.s_finite = F::from_bool(s_finite);
+    core_row.a_normal = F::from_bool(a_normal);
+    core_row.b_normal = F::from_bool(b_normal);
+    core_row.a_sub = F::from_bool(a_sub);
+    core_row.b_sub = F::from_bool(b_sub);
+
+    // Set r_exp_lo/r_exp_hi from the result for ALL rows (fill_finite_div
+    // will override with identical values for finite rows).
+    let r_exp_field = (result >> 23) & 0xFF;
+    core_row.r_exp_lo = F::from_u32(r_exp_field & 1);
+    core_row.r_exp_hi = F::from_u32(r_exp_field >> 1);
+
+    if s_finite {
+        fill_finite_div(
+            core_row,
+            a_exp,
+            b_exp,
+            a_mant,
+            b_mant,
+            result,
+            range_checker,
+        );
+    } else {
+        zero_finite_columns(core_row);
+        // Operand normalization gadgets stay enabled on subnormal inputs
+        // regardless of the path — always fill them.
+        fill_op_norm(
             a_exp,
             a_mant,
-            &mut core_row.a_exp_zero_inv,
-            &mut core_row.a_exp_max_inv,
-            &mut core_row.a_mant_sum_inv,
-            &mut core_row.a_exp_is_zero,
-            &mut core_row.a_exp_is_max,
-            &mut core_row.a_mant_is_zero,
+            &mut core_row.a_lshift,
+            &mut core_row.a_shln,
+            &mut core_row.a_y2_lo7,
+            range_checker,
         );
-        classify(
+        fill_op_norm(
             b_exp,
             b_mant,
-            &mut core_row.b_exp_zero_inv,
-            &mut core_row.b_exp_max_inv,
-            &mut core_row.b_mant_sum_inv,
-            &mut core_row.b_exp_is_zero,
-            &mut core_row.b_exp_is_max,
-            &mut core_row.b_mant_is_zero,
+            &mut core_row.b_lshift,
+            &mut core_row.b_shln,
+            &mut core_row.b_y2_lo7,
+            range_checker,
         );
-
-        let a_nan = a_exp == 255 && a_mant != 0;
-        let b_nan = b_exp == 255 && b_mant != 0;
-        let a_inf = a_exp == 255 && a_mant == 0;
-        let b_inf = b_exp == 255 && b_mant == 0;
-        let a_zero = a_exp == 0 && a_mant == 0;
-        let b_zero = b_exp == 0 && b_mant == 0;
-        let any_nan = a_nan || b_nan;
-        let canon_sel = any_nan || (a_inf && b_inf) || (a_zero && b_zero);
-        let inf_res = !any_nan && ((a_inf && !b_inf) || (b_zero && !a_inf && !a_zero));
-        let zero_res = !any_nan && ((b_inf && !a_inf) || (a_zero && !b_zero && !b_inf));
-
-        core_row.a_nan = F::from_bool(a_nan);
-        core_row.b_nan = F::from_bool(b_nan);
-        core_row.a_inf = F::from_bool(a_inf);
-        core_row.b_inf = F::from_bool(b_inf);
-        core_row.a_zero = F::from_bool(a_zero);
-        core_row.b_zero = F::from_bool(b_zero);
-        core_row.any_nan = F::from_bool(any_nan);
-        core_row.canon_sel = F::from_bool(canon_sel);
-        core_row.inf_res = F::from_bool(inf_res);
-        core_row.zero_res = F::from_bool(zero_res);
-        core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
-        core_row.r_sign = F::from_bool(a_sign != b_sign);
-
-        // ── Finite division witness ──────────────────────────────────────
-        let a_normal = (1..=254).contains(&a_exp);
-        let b_normal = (1..=254).contains(&b_exp);
-        let a_sub = a_exp == 0 && a_mant != 0;
-        let b_sub = b_exp == 0 && b_mant != 0;
-        let s_finite =
-            !canon_sel && !inf_res && !zero_res && (a_normal || a_sub) && (b_normal || b_sub);
-        core_row.s_finite = F::from_bool(s_finite);
-        core_row.a_normal = F::from_bool(a_normal);
-        core_row.b_normal = F::from_bool(b_normal);
-        core_row.a_sub = F::from_bool(a_sub);
-        core_row.b_sub = F::from_bool(b_sub);
-
-        // Set r_exp_lo/r_exp_hi from the result for ALL rows (fill_finite_div
-        // will override with identical values for finite rows).
-        let r_exp_field = (result >> 23) & 0xFF;
-        core_row.r_exp_lo = F::from_u32(r_exp_field & 1);
-        core_row.r_exp_hi = F::from_u32(r_exp_field >> 1);
-
-        if s_finite {
-            fill_finite_div(
-                core_row,
-                a_exp,
-                b_exp,
-                a_mant,
-                b_mant,
-                result,
-                &self.range_checker,
-            );
-        } else {
-            zero_finite_columns(core_row);
-            // Operand normalization gadgets stay enabled on subnormal inputs
-            // regardless of the path — always fill them.
-            fill_op_norm(
-                a_exp,
-                a_mant,
-                &mut core_row.a_lshift,
-                &mut core_row.a_shln,
-                &mut core_row.a_y2_lo7,
-                &self.range_checker,
-            );
-            fill_op_norm(
-                b_exp,
-                b_mant,
-                &mut core_row.b_lshift,
-                &mut core_row.b_shln,
-                &mut core_row.b_y2_lo7,
-                &self.range_checker,
-            );
-        }
-
-        core_row.is_valid = F::ONE;
     }
+
+    core_row.is_valid = F::ONE;
 }
 
 // === Witness computation helpers ===
@@ -1760,6 +1773,103 @@ mod finite_numeric_tests {
                 builder.failures,
                 a,
                 b
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod corruption_sweep_tests {
+    use super::*;
+    use crate::test_utils::assert_columns_constrained;
+    use openvm_circuit::arch::BasicAdapterInterface;
+    use openvm_circuit::arch::MinimalInstruction;
+    use openvm_circuit_primitives::var_range::{
+        SharedVariableRangeCheckerChip, VariableRangeCheckerBus, VariableRangeCheckerChip,
+    };
+    use openvm_circuit_primitives::StructReflectionHelper;
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+    type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+
+    fn rc() -> SharedVariableRangeCheckerChip {
+        Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )))
+    }
+
+    fn air() -> FdivCoreAir {
+        FdivCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0)
+    }
+
+    fn filler_cols(a: u32, b: u32) -> FdivCoreCols<F> {
+        let chip = rc();
+        let mut cols = FdivCoreCols::<F>::default();
+        fill_fdiv_witness(&mut cols, a, b, fdiv_s(a, b), &chip);
+        cols
+    }
+
+    /// Result bytes, routing selectors, and newly pinned a_sig_hi must reject +1.
+    #[test]
+    fn corruption_sweep_pins_result_and_selectors() {
+        let names = FdivCoreCols::<F>::struct_reflection().unwrap_or_default();
+        let eval_full = |b: &mut crate::test_utils::NumericBuilder<F>, cols: &[F]| {
+            VmCoreAir::<crate::test_utils::NumericBuilder<F>, TestI>::eval(
+                &air(),
+                b,
+                cols,
+                F::ZERO,
+            );
+        };
+        let classes: &[(u32, u32, &[&str])] = &[
+            (
+                3.0f32.to_bits(),
+                2.0f32.to_bits(),
+                &[
+                    "is_high",
+                    "round_up",
+                    "a_sig_hi__0",
+                    "a_sig_hi__1",
+                    "a_sig_hi__2",
+                ][..],
+            ),
+            (
+                1.0f32.to_bits(),
+                3.0f32.to_bits(),
+                &["a_sig_hi__0", "a_sig_hi__1", "a_sig_hi__2"][..],
+            ),
+            (0x7F7FFFFF, 0x3F000000, &[]), // MAX / 0.5 -> inf (overflow)
+            (0x7F800000, 0x3F800000, &[]), // inf / 1
+            (0x7FC00000, 0x3F800000, &[]), // NaN / 1
+            (0x00000001, 0x3F800000, &[]), // min subnormal / 1
+            (0x3F800000, 0x00000001, &[]), // 1 / min subnormal -> inf
+        ];
+        for &(a, b, selectors) in classes {
+            let cols = filler_cols(a, b);
+            let mut buf = vec![F::ZERO; FdivCoreCols::<F>::width()];
+            *buf.as_mut_slice().borrow_mut() = cols;
+            let mut bld = crate::test_utils::NumericBuilder::new(vec![]);
+            VmCoreAir::<crate::test_utils::NumericBuilder<F>, TestI>::eval(
+                &air(),
+                &mut bld,
+                &buf,
+                F::ZERO,
+            );
+            assert!(
+                bld.ok(),
+                "honest fdiv a={a:08x} b={b:08x}: {:?}",
+                bld.failures
+            );
+            let mut pinned = vec!["result__0", "result__1", "result__2", "result__3"];
+            pinned.extend_from_slice(selectors);
+            assert_columns_constrained(
+                &buf,
+                eval_full,
+                &names,
+                &pinned,
+                &format!("fdiv a={a:08x} b={b:08x}"),
             );
         }
     }

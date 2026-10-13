@@ -677,78 +677,85 @@ where
         self.adapter.fill_trace_row(mem_helper, adapter_row);
         let record: &FsqrtCoreRecord = unsafe { get_record_from_slice(&mut core_row, ()) };
         let core_row: &mut FsqrtCoreCols<F> = core_row.borrow_mut();
-
         let a_bits = u32::from_le_bytes(record.a);
-        let result = fsqrt_s(a_bits);
-
-        for i in 0..4 {
-            core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
-            core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
-            self.range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
-            self.range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
-        }
-
-        let (a_sign, a_exp, a_mant) = decompose(a_bits);
-        core_row.a_sign = F::from_u32(a_sign);
-        core_row.a_exp_lo = F::from_u32(a_exp & 1);
-        core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
-        core_row.a_hi = F::from_u32(a_exp >> 1);
-        self.range_checker.add_count((a_mant >> 16) & 0x7F, 7);
-        self.range_checker.add_count(a_exp >> 1, 7);
-
-        let a_exp_f = F::from_u32(a_exp);
-        core_row.a_exp_is_zero = F::from_bool(a_exp == 0);
-        core_row.a_exp_is_max = F::from_bool(a_exp == 255);
-        core_row.a_exp_zero_inv = if a_exp != 0 {
-            a_exp_f.try_inverse().unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        core_row.a_exp_max_inv = if a_exp != 255 {
-            (F::from_u32(255) - a_exp_f)
-                .try_inverse()
-                .unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-        let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
-        core_row.a_mant_is_zero = F::from_bool(a_mant == 0);
-        core_row.a_mant_sum_inv = if a_mant != 0 {
-            F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
-        } else {
-            F::ZERO
-        };
-
-        let a_nan = a_exp == 255 && a_mant != 0;
-        let a_inf = a_exp == 255 && a_mant == 0;
-        let a_zero = a_exp == 0 && a_mant == 0;
-        let canon_sel = a_nan || (a_sign == 1 && !a_zero);
-        let inf_res = a_inf && a_sign == 0;
-        let zero_res = a_zero;
-
-        core_row.a_nan = F::from_bool(a_nan);
-        core_row.a_inf = F::from_bool(a_inf);
-        core_row.a_zero = F::from_bool(a_zero);
-        core_row.canon_sel = F::from_bool(canon_sel);
-        core_row.inf_res = F::from_bool(inf_res);
-        core_row.zero_res = F::from_bool(zero_res);
-        core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
-
-        let a_normal = (1..=254).contains(&a_exp);
-        let a_subnormal = a_exp == 0 && a_mant != 0 && a_sign == 0;
-        let s_finite = !canon_sel && !inf_res && !zero_res && (a_normal || a_subnormal);
-        core_row.s_finite = F::from_bool(s_finite);
-        core_row.a_normal = F::from_bool(a_normal);
-        core_row.a_subnormal = F::from_bool(a_subnormal);
-
-        if s_finite {
-            fill_finite_sqrt(core_row, a_exp, a_mant, result, &self.range_checker);
-        } else {
-            zero_finite_columns(core_row);
-        }
-
-        core_row.is_valid = F::ONE;
+        fill_fsqrt_witness(core_row, a_bits, fsqrt_s(a_bits), &self.range_checker);
     }
+}
+
+/// Fill a complete FSQRT.S core witness row (production filler + corruption tests).
+fn fill_fsqrt_witness<F: PrimeField32>(
+    core_row: &mut FsqrtCoreCols<F>,
+    a_bits: u32,
+    result: u32,
+    range_checker: &SharedVariableRangeCheckerChip,
+) {
+    for i in 0..4 {
+        core_row.a[i] = F::from_u32((a_bits >> (i * 8)) & 0xFF);
+        core_row.result[i] = F::from_u32((result >> (i * 8)) & 0xFF);
+        range_checker.add_count((a_bits >> (i * 8)) & 0xFF, 8);
+        range_checker.add_count((result >> (i * 8)) & 0xFF, 8);
+    }
+
+    let (a_sign, a_exp, a_mant) = decompose(a_bits);
+    core_row.a_sign = F::from_u32(a_sign);
+    core_row.a_exp_lo = F::from_u32(a_exp & 1);
+    core_row.a_mant2 = F::from_u32((a_mant >> 16) & 0x7F);
+    core_row.a_hi = F::from_u32(a_exp >> 1);
+    range_checker.add_count((a_mant >> 16) & 0x7F, 7);
+    range_checker.add_count(a_exp >> 1, 7);
+
+    let a_exp_f = F::from_u32(a_exp);
+    core_row.a_exp_is_zero = F::from_bool(a_exp == 0);
+    core_row.a_exp_is_max = F::from_bool(a_exp == 255);
+    core_row.a_exp_zero_inv = if a_exp != 0 {
+        a_exp_f.try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    core_row.a_exp_max_inv = if a_exp != 255 {
+        (F::from_u32(255) - a_exp_f)
+            .try_inverse()
+            .unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let a_mant_sum = (a_mant & 0xFF) + ((a_mant >> 8) & 0xFF) + ((a_mant >> 16) & 0x7F);
+    core_row.a_mant_is_zero = F::from_bool(a_mant == 0);
+    core_row.a_mant_sum_inv = if a_mant != 0 {
+        F::from_u32(a_mant_sum).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+
+    let a_nan = a_exp == 255 && a_mant != 0;
+    let a_inf = a_exp == 255 && a_mant == 0;
+    let a_zero = a_exp == 0 && a_mant == 0;
+    let canon_sel = a_nan || (a_sign == 1 && !a_zero);
+    let inf_res = a_inf && a_sign == 0;
+    let zero_res = a_zero;
+
+    core_row.a_nan = F::from_bool(a_nan);
+    core_row.a_inf = F::from_bool(a_inf);
+    core_row.a_zero = F::from_bool(a_zero);
+    core_row.canon_sel = F::from_bool(canon_sel);
+    core_row.inf_res = F::from_bool(inf_res);
+    core_row.zero_res = F::from_bool(zero_res);
+    core_row.is_special = F::from_bool(canon_sel || inf_res || zero_res);
+
+    let a_normal = (1..=254).contains(&a_exp);
+    let a_subnormal = a_exp == 0 && a_mant != 0 && a_sign == 0;
+    let s_finite = !canon_sel && !inf_res && !zero_res && (a_normal || a_subnormal);
+    core_row.s_finite = F::from_bool(s_finite);
+    core_row.a_normal = F::from_bool(a_normal);
+    core_row.a_subnormal = F::from_bool(a_subnormal);
+
+    if s_finite {
+        fill_finite_sqrt(core_row, a_exp, a_mant, result, range_checker);
+    } else {
+        zero_finite_columns(core_row);
+    }
+
+    core_row.is_valid = F::ONE;
 }
 
 // === Witness computation helpers ===
@@ -1282,6 +1289,106 @@ mod finite_numeric_tests {
                     fsqrt_s(a)
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod corruption_sweep_tests {
+    use super::*;
+    use crate::test_utils::assert_columns_constrained;
+    use openvm_circuit::arch::BasicAdapterInterface;
+    use openvm_circuit::arch::MinimalInstruction;
+    use openvm_circuit_primitives::var_range::{
+        SharedVariableRangeCheckerChip, VariableRangeCheckerBus, VariableRangeCheckerChip,
+    };
+    use openvm_circuit_primitives::StructReflectionHelper;
+    use openvm_stark_sdk::p3_baby_bear::BabyBear;
+    use std::sync::Arc;
+
+    type F = BabyBear;
+    type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 1, 1, 4, 4>;
+
+    fn rc() -> SharedVariableRangeCheckerChip {
+        Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )))
+    }
+
+    fn air() -> FsqrtCoreAir {
+        FsqrtCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0)
+    }
+
+    fn filler_cols(a: u32) -> FsqrtCoreCols<F> {
+        let chip = rc();
+        let mut cols = FsqrtCoreCols::<F>::default();
+        fill_fsqrt_witness(&mut cols, a, fsqrt_s(a), &chip);
+        cols
+    }
+
+    /// Result bytes, routing selectors, and newly pinned a_sig_hi/q_hi must reject +1.
+    #[test]
+    fn corruption_sweep_pins_result_and_selectors() {
+        let names = FsqrtCoreCols::<F>::struct_reflection().unwrap_or_default();
+        let eval_full = |b: &mut crate::test_utils::NumericBuilder<F>, cols: &[F]| {
+            VmCoreAir::<crate::test_utils::NumericBuilder<F>, TestI>::eval(
+                &air(),
+                b,
+                cols,
+                F::ZERO,
+            );
+        };
+        // a_sig_hi only enters the radicand algebraically when eff_exp_odd=1;
+        // NumericBuilder ignores the range-bus half of the half-decomp, so pin
+        // a_sig_hi on an odd-exp input. q_hi always feeds twoq, so pin on both.
+        let classes: &[(u32, &[&str])] = &[
+            (
+                4.0f32.to_bits(), // exp 129 odd → a_sig_hi live
+                &[
+                    "is_hi",
+                    "round_up",
+                    "a_sig_hi__0",
+                    "a_sig_hi__1",
+                    "a_sig_hi__2",
+                    "q_hi__0",
+                    "q_hi__1",
+                    "q_hi__2",
+                    "q_hi__3",
+                    "q_hi__4",
+                ][..],
+            ),
+            (
+                2.0f32.to_bits(), // exp 128 even → a_sig_hi not algebraically live
+                &["q_hi__0", "q_hi__1", "q_hi__2", "q_hi__3", "q_hi__4"][..],
+            ),
+            (0x7F800000, &[]), // +inf
+            (0x7FC00000, &[]), // NaN
+            (0x00000000, &[]), // +0
+            (0x80000000, &[]), // -0
+            (0xBF800000, &[]), // -1 -> canon NaN
+            (0x00400000, &[]), // positive subnormal
+        ];
+        for &(a, selectors) in classes {
+            let cols = filler_cols(a);
+            let mut buf = vec![F::ZERO; FsqrtCoreCols::<F>::width()];
+            *buf.as_mut_slice().borrow_mut() = cols;
+            let mut bld = crate::test_utils::NumericBuilder::new(vec![]);
+            VmCoreAir::<crate::test_utils::NumericBuilder<F>, TestI>::eval(
+                &air(),
+                &mut bld,
+                &buf,
+                F::ZERO,
+            );
+            assert!(bld.ok(), "honest fsqrt a={a:08x}: {:?}", bld.failures);
+            let mut pinned = vec!["result__0", "result__1", "result__2", "result__3"];
+            pinned.extend_from_slice(selectors);
+            assert_columns_constrained(
+                &buf,
+                eval_full,
+                &names,
+                &pinned,
+                &format!("fsqrt a={a:08x}"),
+            );
         }
     }
 }
