@@ -32,14 +32,15 @@ macro_rules! fclass {
     }};
 }
 
-/// fcvt: funct3 = rm (RNE), rs2 = x0 for W / x1 for WU.
+/// fcvt: funct3 = rm matching the circuit (RTZ for float→int, RNE for int→float).
+/// rs2 = x0 for W / x1 for WU.
 macro_rules! fcvt {
-    ($funct7:expr, $rs2:tt, $a:expr, $slot:expr) => {{
+    ($funct7:expr, $rm:expr, $rs2:tt, $a:expr, $slot:expr) => {{
         let result: u32;
         unsafe {
             core::arch::asm!(
                 concat!(".insn r 0x53, {f3}, {f7}, {rd}, {rs1}, ", $rs2),
-                f3 = const openvm_rv32f_guest::RM_RNE,
+                f3 = const $rm,
                 f7 = const $funct7,
                 rd = out(reg) result,
                 rs1 = in(reg) $a,
@@ -61,9 +62,41 @@ pub fn main() {
     fclass!(pos1_5, 0);
     fclass!(neg_inf, 1);
     fclass!(qnan, 2);
-    fcvt!(openvm_rv32f_guest::FCVT_W_S_FUNCT7, "x0", pos3_7, 3);
-    fcvt!(openvm_rv32f_guest::FCVT_W_S_FUNCT7, "x0", neg3_7, 4);
-    fcvt!(openvm_rv32f_guest::FCVT_W_S_FUNCT7, "x1", qnan, 5);
-    fcvt!(openvm_rv32f_guest::FCVT_S_W_FUNCT7, "x0", neg42, 6);
-    fcvt!(openvm_rv32f_guest::FCVT_S_W_FUNCT7, "x1", pos42, 7);
+    // float → int: circuit is RTZ-only
+    fcvt!(
+        openvm_rv32f_guest::FCVT_W_S_FUNCT7,
+        openvm_rv32f_guest::RM_RTZ,
+        "x0",
+        pos3_7,
+        3
+    );
+    fcvt!(
+        openvm_rv32f_guest::FCVT_W_S_FUNCT7,
+        openvm_rv32f_guest::RM_RTZ,
+        "x0",
+        neg3_7,
+        4
+    );
+    fcvt!(
+        openvm_rv32f_guest::FCVT_W_S_FUNCT7,
+        openvm_rv32f_guest::RM_RTZ,
+        "x1",
+        qnan,
+        5
+    );
+    // int → float: circuit is RNE
+    fcvt!(
+        openvm_rv32f_guest::FCVT_S_W_FUNCT7,
+        openvm_rv32f_guest::RM_RNE,
+        "x0",
+        neg42,
+        6
+    );
+    fcvt!(
+        openvm_rv32f_guest::FCVT_S_W_FUNCT7,
+        openvm_rv32f_guest::RM_RNE,
+        "x1",
+        pos42,
+        7
+    );
 }

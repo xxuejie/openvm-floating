@@ -28,8 +28,10 @@ mod tests;
 /// - AS 1 (integer registers) for Zfinx mode — default
 /// - AS 5 (FP registers) for F extension mode
 ///
-/// Only RNE (rm=0) and DYN (rm=7, treated as RNE) rounding modes are accepted.
-/// All other rounding modes are transpiled to UNIMP.
+/// Rounding-mode policy (must match what the AIR implements; others → UNIMP):
+/// - Arithmetic / FMA / fsqrt / fcvt.s.w[u]: RNE or DYN (DYN treated as RNE; no FCSR).
+/// - fcvt.w[u].s: RTZ only (circuit always truncates; DYN/RNE rejected for honesty).
+/// - Sign-inject / minmax / compare / fclass / fmv / flw / fsw: no rm field (funct3 is op).
 pub struct Rv32FTranspilerExtension {
     /// Address space for FP register operands.
     /// 1 = Zfinx (integer registers), 5 = F extension (FP registers).
@@ -280,19 +282,20 @@ impl<F: PrimeField32> TranspilerExtension<F> for Rv32FTranspilerExtension {
         // Conversion family: fcvt.w.s / fcvt.wu.s (float -> int) and
         // fcvt.s.w / fcvt.s.wu (int -> float). The rs2 field selects
         // the integer type.
-        // - fcvt.w.s/fcvt.wu.s: C mandates truncation (RTZ), but also accept RNE/DYN for
-        //   completeness. The executor always truncates.
-        // - fcvt.s.w/fcvt.s.wu: conversion is always exact, any rm is fine.
+        // RM policy matches the AIR (reject anything the circuit does not implement):
+        // - fcvt.w[u].s: RTZ only (AIR always truncates; no FCSR so DYN is rejected)
+        // - fcvt.s.w[u]: RNE or DYN-as-RNE (AIR implements RNE; large ints are inexact)
         if funct7 == FCVT_W_S_FUNCT7 || funct7 == FCVT_S_W_FUNCT7 {
             if funct7 == FCVT_W_S_FUNCT7 {
-                // float -> int: accept RTZ (C standard), RNE, and DYN
-                if rm != RM_RNE && rm != RM_DYN && rm != RM_RTZ {
+                if rm != RM_RTZ {
                     return Some(TranspilerOutput::one_to_one(
                         openvm_transpiler::util::unimp(),
                     ));
                 }
-            } else {
-                // int -> float: always exact, accept any rm
+            } else if rm != RM_RNE && rm != RM_DYN {
+                return Some(TranspilerOutput::one_to_one(
+                    openvm_transpiler::util::unimp(),
+                ));
             }
             let is_wu = match dec_insn.rs2 as u8 {
                 FCVT_RS2_W => false,

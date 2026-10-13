@@ -6,8 +6,10 @@
 //! fmv.s.x, flw, fsw, fclass, fcvt) encode their read/write address spaces in
 //! the `d`/`e`/`f` fields, which the circuit chips rely on.
 
+use openvm_rv32f_guest::{RM_RDN, RM_RMM, RM_RUP};
 use openvm_stark_backend::p3_field::PrimeField32;
 use openvm_stark_sdk::p3_baby_bear::BabyBear;
+use openvm_transpiler::TranspilerOutput;
 
 use super::*;
 
@@ -115,8 +117,23 @@ fn fclass_fields() {
 /// fcvt.w.s: read fp, write int; fcvt.s.w: read int, write fp.
 #[test]
 fn fcvt_fields() {
-    let fcvt_w = enc(RV32_FP_OPCODE, 9, 0, 3, FCVT_RS2_W as u32, FCVT_W_S_FUNCT7);
-    let fcvt_s = enc(RV32_FP_OPCODE, 9, 0, 3, FCVT_RS2_W as u32, FCVT_S_W_FUNCT7);
+    // fcvt.w.s requires RTZ; fcvt.s.w requires RNE (or DYN).
+    let fcvt_w = enc(
+        RV32_FP_OPCODE,
+        9,
+        RM_RTZ,
+        3,
+        FCVT_RS2_W as u32,
+        FCVT_W_S_FUNCT7,
+    );
+    let fcvt_s = enc(
+        RV32_FP_OPCODE,
+        9,
+        RM_RNE,
+        3,
+        FCVT_RS2_W as u32,
+        FCVT_S_W_FUNCT7,
+    );
     let fw = fields(&trans(&Rv32FTranspilerExtension::new_f(), fcvt_w));
     let fs = fields(&trans(&Rv32FTranspilerExtension::new_f(), fcvt_s));
     assert_eq!(fw, (4 * 9, 4 * 3, 0, 1, 5, 0, 0)); // fp -> int
@@ -172,7 +189,7 @@ fn fminmax_fields() {
     );
 }
 
-/// Non-F instructions and unsupported rounding modes fall through.
+/// Non-F instructions fall through; unsupported RMs become UNIMP.
 #[test]
 fn falls_through() {
     // A plain integer RISC-V instruction (addi).
@@ -180,6 +197,158 @@ fn falls_through() {
     let ext: &dyn TranspilerExtension<F> = &Rv32FTranspilerExtension::new_f();
     assert!(ext.process_custom(&[addi]).is_none());
     // fadd.s with a non-RNE rounding mode -> UNIMP.
-    let fadd_rm = enc(RV32_FP_OPCODE, 2, 3, 3, 4, FADD_S_FUNCT7);
-    assert!(ext.process_custom(&[fadd_rm]).is_some());
+    let fadd_rm = enc(RV32_FP_OPCODE, 2, RM_RUP, 3, 4, FADD_S_FUNCT7);
+    let out = ext.process_custom(&[fadd_rm]).expect("hit");
+    let inst = out.instructions[0].as_ref().expect("insn");
+    assert_eq!(inst.opcode, openvm_transpiler::util::unimp::<F>().opcode);
+}
+
+fn is_unimp(insn: u32) -> bool {
+    let ext = Rv32FTranspilerExtension::new_f();
+    let out: TranspilerOutput<F> = ext
+        .process_custom(&[insn])
+        .expect("expected a transpile hit");
+    let inst = out.instructions[0].as_ref().expect("insn");
+    inst.opcode == openvm_transpiler::util::unimp::<F>().opcode
+}
+
+fn is_opcode(insn: u32, op: FpOpcode) -> bool {
+    let out = trans(&Rv32FTranspilerExtension::new_f(), insn);
+    out.opcode == op.global_opcode()
+}
+
+/// Arithmetic / FMA / fsqrt: RNE and DYN accepted; other RMs → UNIMP.
+#[test]
+fn rm_policy_rne_ops() {
+    // fadd.s
+    assert!(is_opcode(
+        enc(RV32_FP_OPCODE, 2, RM_RNE, 3, 4, FADD_S_FUNCT7),
+        FpOpcode::FADD_S
+    ));
+    assert!(is_opcode(
+        enc(RV32_FP_OPCODE, 2, RM_DYN, 3, 4, FADD_S_FUNCT7),
+        FpOpcode::FADD_S
+    ));
+    for bad in [RM_RTZ, RM_RDN, RM_RUP, RM_RMM] {
+        assert!(
+            is_unimp(enc(RV32_FP_OPCODE, 2, bad, 3, 4, FADD_S_FUNCT7)),
+            "fadd rm={bad} should UNIMP"
+        );
+    }
+
+    // fsqrt.s
+    assert!(is_opcode(
+        enc(RV32_FP_OPCODE, 2, RM_RNE, 3, 0, FSQRT_S_FUNCT7),
+        FpOpcode::FSQRT_S
+    ));
+    assert!(is_opcode(
+        enc(RV32_FP_OPCODE, 2, RM_DYN, 3, 0, FSQRT_S_FUNCT7),
+        FpOpcode::FSQRT_S
+    ));
+    assert!(is_unimp(enc(
+        RV32_FP_OPCODE,
+        2,
+        RM_RTZ,
+        3,
+        0,
+        FSQRT_S_FUNCT7
+    )));
+
+    // fmadd.s (R4): rs3=0, fmt=single, rs2=4, rs1=3, rd=2
+    let fmadd = |rm: u8| {
+        (4u32 << 20) | (3u32 << 15) | ((rm as u32) << 12) | (2u32 << 7) | (FMADD_S_OPCODE as u32)
+    };
+    assert!(is_opcode(fmadd(RM_RNE), FpOpcode::FMADD_S));
+    assert!(is_unimp(fmadd(RM_RTZ)));
+}
+
+/// fcvt.w[u].s: RTZ only (AIR truncates). RNE/DYN/other → UNIMP.
+#[test]
+fn rm_policy_fcvt_f2i() {
+    assert!(is_opcode(
+        enc(
+            RV32_FP_OPCODE,
+            9,
+            RM_RTZ,
+            3,
+            FCVT_RS2_W as u32,
+            FCVT_W_S_FUNCT7
+        ),
+        FpOpcode::FCVT_W_S
+    ));
+    assert!(is_opcode(
+        enc(
+            RV32_FP_OPCODE,
+            9,
+            RM_RTZ,
+            3,
+            FCVT_RS2_WU as u32,
+            FCVT_W_S_FUNCT7
+        ),
+        FpOpcode::FCVT_WU_S
+    ));
+    for bad in [RM_RNE, RM_DYN, RM_RDN, RM_RUP, RM_RMM] {
+        assert!(
+            is_unimp(enc(
+                RV32_FP_OPCODE,
+                9,
+                bad,
+                3,
+                FCVT_RS2_W as u32,
+                FCVT_W_S_FUNCT7
+            )),
+            "fcvt.w.s rm={bad} should UNIMP"
+        );
+        assert!(
+            is_unimp(enc(
+                RV32_FP_OPCODE,
+                9,
+                bad,
+                3,
+                FCVT_RS2_WU as u32,
+                FCVT_W_S_FUNCT7
+            )),
+            "fcvt.wu.s rm={bad} should UNIMP"
+        );
+    }
+}
+
+/// fcvt.s.w[u]: RNE or DYN only (AIR is RNE). Other RMs → UNIMP.
+#[test]
+fn rm_policy_fcvt_i2f() {
+    assert!(is_opcode(
+        enc(
+            RV32_FP_OPCODE,
+            9,
+            RM_RNE,
+            3,
+            FCVT_RS2_W as u32,
+            FCVT_S_W_FUNCT7
+        ),
+        FpOpcode::FCVT_S_W
+    ));
+    assert!(is_opcode(
+        enc(
+            RV32_FP_OPCODE,
+            9,
+            RM_DYN,
+            3,
+            FCVT_RS2_WU as u32,
+            FCVT_S_W_FUNCT7
+        ),
+        FpOpcode::FCVT_S_WU
+    ));
+    for bad in [RM_RTZ, RM_RDN, RM_RUP, RM_RMM] {
+        assert!(
+            is_unimp(enc(
+                RV32_FP_OPCODE,
+                9,
+                bad,
+                3,
+                FCVT_RS2_W as u32,
+                FCVT_S_W_FUNCT7
+            )),
+            "fcvt.s.w rm={bad} should UNIMP"
+        );
+    }
 }

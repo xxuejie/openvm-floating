@@ -88,16 +88,23 @@ fn expected_decode(insn: u32) -> Option<Option<FpOpcode>> {
                 None
             }
         }
-        FCVT_W_S_FUNCT7 => match rs2 {
-            FCVT_RS2_W => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_W_S) } else { None }),
-            FCVT_RS2_WU => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_WU_S) } else { None }),
-            _ => None,
-        },
-        FCVT_S_W_FUNCT7 => match rs2 {
-            FCVT_RS2_W => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_S_W) } else { None }),
-            FCVT_RS2_WU => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_S_WU) } else { None }),
-            _ => None,
-        },
+        FCVT_W_S_FUNCT7 => {
+            // AIR always truncates: RTZ only (DYN/RNE rejected).
+            let ok = rm == RM_RTZ;
+            match rs2 {
+                FCVT_RS2_W => Some(if ok { Some(FpOpcode::FCVT_W_S) } else { None }),
+                FCVT_RS2_WU => Some(if ok { Some(FpOpcode::FCVT_WU_S) } else { None }),
+                _ => None,
+            }
+        }
+        FCVT_S_W_FUNCT7 => {
+            // AIR implements RNE; DYN treated as RNE.
+            match rs2 {
+                FCVT_RS2_W => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_S_W) } else { None }),
+                FCVT_RS2_WU => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_S_WU) } else { None }),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
