@@ -123,11 +123,12 @@ pub struct FmulCoreCols<T> {
     pub is_nan_result: T,
 
     // Special-case selectors (input-derived; see eval_special_cases).
-    pub inf_in: T,  // a_is_inf | b_is_inf
-    pub zero_in: T, // a_is_zero | b_is_zero
-    pub s_nan: T,   // result is canonical NaN (NaN input or 0*inf)
-    pub s_inf: T,   // result is +-inf due to an infinite input
-    pub s_zero: T,  // result is +-0 due to a zero input
+    pub inf_in: T,   // a_is_inf | b_is_inf
+    pub zero_in: T,  // a_is_zero | b_is_zero
+    pub s_nan: T,    // result is canonical NaN (NaN input or 0*inf)
+    pub s_inf: T,    // result is +-inf due to an infinite input
+    pub s_zero: T,   // result is +-0 due to a zero input
+    pub s_finite: T, // is_valid AND not (s_nan|s_inf|s_zero); 0 on padding
 
     // Finite normal-result output reconstruction (see eval_finite_output).
     pub c0: T,       // carry out of mantissa byte 0 when adding round_up
@@ -416,11 +417,16 @@ where
             .when(cols.is_valid)
             .assert_zero(carry[PRODUCT_NUM_LIMBS - 1].clone());
 
-        // Sound finite-input selector: normalization / output reconstruction are
-        // only meaningful when both inputs are finite and nonzero. (Selectors are
-        // constrained by eval_special_cases below; constraint order is irrelevant
-        // since they must all hold simultaneously.)
-        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
+        // Sound finite-input selector (column): normalization / output
+        // reconstruction are only meaningful when both inputs are finite and
+        // nonzero. Stored as a column so it is 0 on padding (the expression
+        // 1-s_nan-s_inf-s_zero alone is 1 on all-zero padding rows).
+        builder.when(cols.is_valid).assert_eq(
+            cols.s_finite,
+            one.clone() - cols.s_nan - cols.s_inf - cols.s_zero,
+        );
+        builder.assert_bool(cols.s_finite);
+        let s_finite = cols.s_finite;
 
         // ── Phase 5: Normalization ───────────────────────────────────────
         builder.assert_bool(cols.is_high);
@@ -431,12 +437,12 @@ where
         // leading bit, so these constraints must not fire for them.
         builder
             .when(cols.is_valid)
-            .when(s_finite.clone())
+            .when(s_finite)
             .when(cols.is_high)
             .assert_eq(cols.product[5], cols.p5_lo + f128);
         builder
             .when(cols.is_valid)
-            .when(s_finite.clone())
+            .when(s_finite)
             .when(not(cols.is_high))
             .assert_eq(cols.product[5], cols.p5_lo + f64);
         // p5_lo must be range-checked, or is_high is a free choice.
@@ -450,7 +456,7 @@ where
         for i in 0..PRODUCT_NUM_LIMBS {
             // is_high case: norm_sig[i] == product[i]
             builder
-                .when(s_finite.clone())
+                .when(s_finite)
                 .when(cols.is_high)
                 .assert_eq(cols.norm_sig[i], cols.product[i]);
 
@@ -458,13 +464,13 @@ where
             let shifted = cols.product[i] * f2 + shift_carry.clone();
             let new_carry = (shifted.clone() - cols.norm_sig[i]) * carry_divide;
             builder
-                .when(s_finite.clone())
+                .when(s_finite)
                 .when(not(cols.is_high))
                 .assert_eq(cols.norm_sig[i], shifted - new_carry.clone() * f256);
             // The per-limb carry must be a bit, or the chain is tautological.
             self.range_bus.range_check(new_carry.clone(), 1).eval(
                 builder,
-                cols.is_valid.into() * s_finite.clone() * not(cols.is_high),
+                cols.is_valid.into() * s_finite * not(cols.is_high),
             );
             shift_carry = new_carry;
         }
@@ -711,7 +717,7 @@ impl FmulCoreAir {
         let a_exp_eff = a_exp.clone() + cols.a_sub * (one.clone() - cols.a_lshift - a_exp);
         let b_exp_eff = b_exp.clone() + cols.b_sub * (one.clone() - cols.b_lshift - b_exp);
         let exp_normal = a_exp_eff + b_exp_eff - f127 + cols.is_high;
-        let s_finite = one.clone() - cols.s_nan - cols.s_inf - cols.s_zero;
+        let s_finite = cols.s_finite;
 
         // eq_i = (norm_sig[i] == 255) via is-zero on (255 - norm_sig[i]).
         // Gated on is_valid: on padding rows the inverse columns are 0.
@@ -731,13 +737,13 @@ impl FmulCoreAir {
 
         // Cascade carry chain (gated on s_finite): c0 = round_up & eq3, etc.
         builder
-            .when(s_finite.clone())
+            .when(s_finite)
             .assert_eq(cols.c0, cols.round_up * eq3);
         builder
-            .when(s_finite.clone())
+            .when(s_finite)
             .assert_eq(cols.c1, cols.c0 * eq4);
         builder
-            .when(s_finite.clone())
+            .when(s_finite)
             .assert_eq(cols.c2, cols.c1 * eq5);
 
         // ── Sound result-class routing via exp_normal (never result field) ─
@@ -750,20 +756,20 @@ impl FmulCoreAir {
         let exp_b = exp_normal.clone() + AB::Expr::from(f256);
         self.range_bus
             .range_check(exp_b.clone(), 10)
-            .eval(builder, s_finite.clone());
+            .eval(builder, s_finite);
         let lt10 = IsLtSubAir::new(self.range_bus, 10);
         let ovf_io = IsLessThanIo::new(
             AB::Expr::from(AB::F::from_u32(510)),
             exp_b.clone() + cols.c2,
             cols.s_overflow.into(),
-            s_finite.clone(),
+            s_finite,
         );
         lt10.eval(builder, (ovf_io, &cols.route_ovf_decomp));
         let sub_io = IsLessThanIo::new(
             exp_b,
             AB::Expr::from(AB::F::from_u32(257)),
             cols.s_subnormal.into(),
-            s_finite.clone(),
+            s_finite,
         );
         lt10.eval(builder, (sub_io, &cols.route_sub_decomp));
         builder.assert_bool(cols.s_overflow);
@@ -1283,6 +1289,7 @@ fn fill_fmul_witness<F: PrimeField32>(
     row.s_nan = F::from_bool(is_nan_res);
     row.s_inf = F::from_bool(s_inf);
     row.s_zero = F::from_bool(s_zero);
+    row.s_finite = F::from_bool(!is_nan_res && !s_inf && !s_zero);
 
     // 1-bit shift carries for the <<1 normalization (finite, !is_high only).
     let s_finite = !is_nan_res && !s_inf && !s_zero;
@@ -1734,6 +1741,7 @@ mod finite_tests {
                 F::ZERO
             },
             s_normal: F::ONE,
+            s_finite: F::ONE,
             ..Default::default()
         }
     }
