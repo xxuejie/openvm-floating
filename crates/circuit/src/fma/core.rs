@@ -1251,10 +1251,12 @@ impl FmaCoreAir {
 
         // Alignment loss indicator (shared by all rounding paths). The lost
         // fraction is align.guard*0.5 + align.sticky*(<0.5) working units.
-        // On add/deep paths the lost bits add to the magnitude (a tie with
-        // any loss rounds up); on the cancel path they are *subtracted*
-        // (true value strictly less than raw << lshift, always by less than
-        // half a ULP), so a tie rounds down instead of to-even.
+        // Same-sign (add) paths: lost bits add to the magnitude (a tie with
+        // any loss rounds up). Opposite-sign (cancel) paths — including deep
+        // cancel, where s_cancel=0 because is_deep — subtract the loss, so a
+        // float midpoint rounds down instead of to-even / up. Polarity must
+        // key off sign_diff, not s_cancel; using s_cancel forged round-up on
+        // deep-cancel midpoints (ediff>=56, guard=1, below=0, lsb=0).
         builder.when(s).assert_eq(
             cols.align_loss,
             cols.align.guard + cols.align.sticky - cols.align.guard * cols.align.sticky,
@@ -1262,11 +1264,11 @@ impl FmaCoreAir {
         builder.assert_bool(cols.align_loss);
         builder.when(s).assert_eq(
             cols.aloss_nc,
-            cols.align_loss * (one.clone() - cols.s_cancel),
+            cols.align_loss * (one.clone() - cols.sign_diff),
         );
         builder.assert_bool(cols.aloss_nc);
 
-        // Effective sticky (normal path): below OR align_loss-when-not-cancel.
+        // Effective sticky (normal path): below OR align_loss-when-same-sign.
         let sticky_expr = cols.below_guard_nz + cols.aloss_nc - cols.below_guard_nz * cols.aloss_nc;
         builder.when(sn).assert_eq(cols.eff_sticky, sticky_expr);
         builder.assert_bool(cols.eff_sticky);
@@ -1275,7 +1277,7 @@ impl FmaCoreAir {
         // with subtractive loss (then a tie rounds down).
         builder.when(sn).assert_eq(
             cols.nw_lsb_ok,
-            cols.nw_lsb * (one.clone() - cols.s_cancel * cols.align_loss),
+            cols.nw_lsb * (one.clone() - cols.sign_diff * cols.align_loss),
         );
         builder.assert_bool(cols.nw_lsb_ok);
 
@@ -1400,7 +1402,7 @@ impl FmaCoreAir {
         builder.assert_bool(cols.sub_eff_sticky);
         builder.when(ss).assert_eq(
             cols.sub_lsb_ok,
-            cols.sub_lsb * (one.clone() - cols.s_cancel * cols.align_loss),
+            cols.sub_lsb * (one.clone() - cols.sign_diff * cols.align_loss),
         );
         builder.assert_bool(cols.sub_lsb_ok);
         let sub_sor = cols.sub_eff_sticky + cols.sub_lsb_ok - cols.sub_eff_sticky * cols.sub_lsb_ok;
@@ -2237,7 +2239,9 @@ fn fill_finite_product<F: PrimeField32>(
     let align_sticky = row.align.sticky.as_canonical_u32() != 0;
     let align_loss = align_guard || align_sticky;
     row.align_loss = F::from_bool(align_loss);
-    row.aloss_nc = F::from_bool(align_loss && !s_cancel);
+    // Additive sticky only when same sign; deep cancel has s_cancel=0 but
+    // still subtracts the tiny addend (see AIR comment on aloss_nc).
+    row.aloss_nc = F::from_bool(align_loss && !sign_diff);
 
     // Result class: base_exp is the exponent before the rounding carry.
     let larger_exp_i = if c_is_larger { c_exp_eff_i } else { prod_exp_i };
@@ -2302,11 +2306,11 @@ fn fill_finite_product<F: PrimeField32>(
         F::ZERO
     };
 
-    // Effective sticky: on add/deep paths the alignment-lost bits count as
-    // sticky; on the cancel path they are subtractive.
-    let eff_sticky = bg_nz || (align_loss && !s_cancel);
+    // Effective sticky: same-sign paths count alignment loss as sticky;
+    // opposite-sign (incl. deep cancel) treat it as subtractive.
+    let eff_sticky = bg_nz || (align_loss && !sign_diff);
     row.eff_sticky = F::from_bool(eff_sticky);
-    let lsb_ok = lsb == 1 && !(s_cancel && align_loss);
+    let lsb_ok = lsb == 1 && !(sign_diff && align_loss);
     row.nw_lsb_ok = F::from_bool(lsb_ok);
 
     // round_up = guard AND (eff_sticky OR lsb_ok).
@@ -2390,9 +2394,9 @@ fn fill_finite_product<F: PrimeField32>(
         row.sub_lsb = F::from_u32(sub_lsb);
         row.sub_hi7 = F::from_u32(y[0] >> 1);
         range_checker.add_count(y[0] >> 1, 7);
-        let sub_eff = row.sub_shrn.sticky.as_canonical_u32() != 0 || (align_loss && !s_cancel);
+        let sub_eff = row.sub_shrn.sticky.as_canonical_u32() != 0 || (align_loss && !sign_diff);
         row.sub_eff_sticky = F::from_bool(sub_eff);
-        let sub_lsb_ok = sub_lsb == 1 && !(s_cancel && align_loss);
+        let sub_lsb_ok = sub_lsb == 1 && !(sign_diff && align_loss);
         row.sub_lsb_ok = F::from_bool(sub_lsb_ok);
         let sub_round_up = row.sub_shrn.guard.as_canonical_u32() == 1 && (sub_eff || sub_lsb_ok);
         row.sub_round_up = F::from_bool(sub_round_up);
@@ -2804,6 +2808,46 @@ mod product_tests {
             }
         }
         assert!(found >= 3, "failed to construct tie cases");
+    }
+
+    /// Deep cancel (ediff >= 56) at an exact float midpoint with mantissa LSB
+    /// clear: the tiny opposite-sign addend pulls the exact value *below* the
+    /// midpoint, so RNE must round down. Using `s_cancel` (0 on deep rows) for
+    /// sticky polarity previously treated the loss as additive and rounded up.
+    #[test]
+    fn deep_cancel_midpoint_rounds_down() {
+        // Product significands: 0x808000 * 0xff0100 = 2^47 + 2^23 (is_high),
+        // so float guard=1, below=0, mantissa LSB=0 → exact midpoint.
+        let a = 0x4600_8000u32; // exp 140, sig 0x808000
+        let b = 0x467f_0100u32; // exp 140, sig 0xff0100
+        let c = 0xb100_0000u32; // -2^(98-127), ediff = 154-98 = 56
+        let r = fmadd_result(a, b, c, FmaddOp::Madd);
+        assert_eq!(r, 0x4d00_0000, "native RNE must tie-down / below-midpoint");
+        // Next float would be the forged round-up the old polarity allowed.
+        assert_ne!(r, 0x4d00_0001);
+        assert_ok(a, b, c, FmaddOp::Madd);
+
+        // Forcing additive sticky / round-up on this deep-cancel row must fail.
+        let mut row = build_row(a, b, c, FmaddOp::Madd);
+        assert!(eval_row(&row).ok());
+        assert_eq!(row.is_deep, F::ONE);
+        assert_eq!(row.sign_diff, F::ONE);
+        assert_eq!(row.s_cancel, F::ZERO);
+        assert_eq!(row.nw_guard, F::ONE);
+        assert_eq!(row.nw_lsb, F::ZERO);
+        assert_eq!(row.align_loss, F::ONE);
+        assert_eq!(row.aloss_nc, F::ZERO);
+        assert_eq!(row.round_up, F::ZERO);
+        row.aloss_nc = F::ONE;
+        row.eff_sticky = F::ONE;
+        row.round_up = F::ONE;
+        // Keep result/m0 consistent with a forged round-up so only polarity fails.
+        row.m0 = F::ONE;
+        row.result[0] = F::ONE;
+        assert!(
+            !eval_row(&row).ok(),
+            "deep-cancel midpoint forged round-up accepted"
+        );
     }
 
     #[test]
