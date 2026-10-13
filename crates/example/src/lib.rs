@@ -2039,7 +2039,7 @@ mod fuzz_tests {
         }
         // Heavy cancellation (close magnitudes, large left shift).
         cases.push((0x3f800000, 0xbf800001)); // 1.0 + (-(1.0+tiny))
-                                              // Deep opposite-sign (ediff >= 25): result is the larger operand.
+                                              // Deep opposite-sign (ediff >= 25): result is the larger operand (except pow2 binade boundary).
         cases.push((0x74800000, 0x84800000)); // 2^100 + (-2^-5ish... tiny)
         cases.push((0x3F800000, 0x80800000)); // 1.0 + (-min_normal)
         cases.push((0x00800000, 0xBF800000)); // min_normal + (-1.0)
@@ -2092,7 +2092,7 @@ mod fuzz_tests {
         }
         // Heavy cancellation (close magnitudes).
         cases.push((0x3f800000, 0x3f800001)); // 1.0 - (1.0+tiny)
-                                              // Deep same-sign (ediff >= 25): result is the larger operand.
+                                              // Deep same-sign (ediff >= 25): result is the larger operand (except pow2 binade boundary for fsub).
         cases.push((0x74800000, 0x04800000)); // 2^100 - tiny
         cases.push((0x04800000, 0x74800000)); // tiny - 2^100 (negative result)
         cases.push((0x3F800000, 0x00800000)); // 1.0 - min_normal

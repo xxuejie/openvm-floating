@@ -32,8 +32,13 @@ pub const EXT_SIG_LIMBS: usize = 4; // extended significand: 3 mantissa bytes + 
 pub const LIMB_BITS: usize = 8;
 /// Working significand width in bytes: 3 significand bytes + 1 guard/sticky byte.
 pub const WORK_LIMBS: usize = 4;
-/// ediff >= 25 ⇒ the smaller operand is strictly below 0.5 ULP of the larger, so the
-/// result equals the larger operand (no rounding). Below this, align exactly.
+/// ediff >= 25 ⇒ normally the smaller is at most 0.5 ULP of the larger's binade.
+/// Cancel's align field is `small_sig<<24`, so ediff>=25 cannot go through cancel
+/// without dropping significand bits; those rows take the deep path instead.
+///
+/// Exception (see `s_deep_boundary`): opposite signs, ediff == 25, larger exact
+/// power of two, smaller mantissa nonzero → result binade ULP halves and the
+/// honest RNE result is `larger - 1` lower-binade ULP, not the larger itself.
 pub const DEEP_EDIFF: u32 = 25;
 
 /// IEEE 754 / RISC-V FADD.S: correctly-rounded (RNE) addition.
@@ -122,10 +127,18 @@ pub struct FaddCoreCols<T> {
     // Variable right-shift gadget for alignment of the smaller significand. Its `x`
     // input is `small_sig << 8` (4 bytes), `shift` = ediff, `y` = aligned significand.
     pub align: ShrnCols<T, WORK_LIMBS>,
-    pub is_deep: T, // bool: ediff >= 25 (smaller operand < 0.5 ULP ⇒ result = larger)
+    pub is_deep: T,    // bool: ediff >= 25 (deep path; see s_deep_boundary exception)
     pub deep_delta: T, // byte witness used to soundly derive is_deep
+    pub deep_delta_inv: T, // inverse for deep_delta==0 (ediff == DEEP_EDIFF)
     pub lost_sticky: T, // OR of align.guard / align.sticky (bits lost during alignment)
     pub align_enable: T, // bool: s_add AND !is_deep (gates the ShrnGadget)
+    // Deep-path binade-boundary exception (effective subtraction only).
+    pub large_pow2_inv: T, // inv of large_sig[0]+large_sig[1]+(large_sig[2]-128)
+    pub small_ext_inv: T,  // inv of the same sum over small_sig (nonzero ⇒ sticky mant)
+    pub s_deep_cancel: T,  // s_bn AND !is_add AND is_deep
+    pub s_deep_ediff25: T, // s_deep_cancel AND deep_delta==0 (ediff == 25)
+    pub s_deep_boundary: T, // s_deep_ediff25 AND large pow2 AND small ext
+    pub s_deep_exact: T,   // s_bn AND is_deep AND !s_deep_boundary (result = larger)
 
     // === Sum / difference ===
     pub is_add: T,                // bool: same sign → add, different sign → subtract
@@ -616,6 +629,7 @@ impl FaddCoreAir {
         let f25: AB::F = AB::F::from_u32(DEEP_EDIFF);
         let f127: AB::F = AB::F::from_u32(127);
         let f128: AB::F = AB::F::from_u32(128);
+        let f255: AB::F = AB::F::from_u32(255);
         let f256: AB::F = AB::F::from_u32(1 << LIMB_BITS);
         let one = AB::Expr::ONE;
 
@@ -686,11 +700,11 @@ impl FaddCoreAir {
         );
         builder.assert_bool(cols.s_add);
 
-        // ── Deep clamp: is_deep = (ediff >= 25) ─────────────────────────
-        //   !is_deep: ediff + deep_delta == 24   (deep_delta = 24 - ediff ∈ [0, 24])
-        //   is_deep:  ediff - deep_delta == 25   (deep_delta = ediff - 25 ∈ [0, 230])
+        // ── Deep clamp: is_deep = (ediff >= DEEP_EDIFF) ─────────────────
+        //   !is_deep: ediff + deep_delta == DEEP_EDIFF-1
+        //   is_deep:  ediff - deep_delta == DEEP_EDIFF
         // Both branches range-check deep_delta to a byte, which forces is_deep to
-        // correctly indicate ediff >= 25.
+        // correctly indicate ediff >= DEEP_EDIFF.
         self.range_bus
             .range_check(cols.deep_delta.into(), LIMB_BITS)
             .eval(builder, cols.is_valid.into());
@@ -708,10 +722,49 @@ impl FaddCoreAir {
         builder.assert_eq(cols.align_enable, cols.s_add * (one.clone() - cols.is_deep));
         builder.assert_bool(cols.align_enable);
         let s_shallow = cols.align_enable;
-        // Deep path (ediff >= 25): result = larger operand for any effective
-        // operation — the smaller operand is strictly below half a ULP, so
-        // both addition and cancellation round to the larger operand exactly.
+        // Deep path (ediff >= DEEP_EDIFF). Default: result = larger. Exception:
+        // s_deep_boundary (cancel, ediff==25, larger power-of-two, small mant≠0)
+        // → larger − 1 lower-binade ULP (IEEE RNE past-midpoint after binade drop).
         let s_deep = cols.s_bn * cols.is_deep;
+
+        // deep_delta == 0 ⇔ ediff == DEEP_EDIFF on deep rows.
+        let dd_zero = one.clone() - cols.deep_delta * cols.deep_delta_inv;
+        builder.assert_zero(cols.deep_delta * dd_zero.clone());
+
+        // large_pow2 ⇔ large_sig == 0x800000; small_ext ⇔ small_sig != 0x800000.
+        let f128e: AB::Expr = AB::Expr::from(f128);
+        let large_pow2_sum =
+            cols.large_sig[0] + cols.large_sig[1] + cols.large_sig[2] - f128e.clone();
+        let large_pow2 = one.clone() - large_pow2_sum.clone() * cols.large_pow2_inv;
+        // Only meaningful when significands carry an implicit bit (s_bn).
+        builder
+            .when(cols.s_bn)
+            .assert_zero(large_pow2_sum * large_pow2.clone());
+        let small_ext_sum = cols.small_sig[0] + cols.small_sig[1] + cols.small_sig[2] - f128e;
+        let small_ext_zero = one.clone() - small_ext_sum.clone() * cols.small_ext_inv;
+        builder
+            .when(cols.s_bn)
+            .assert_zero(small_ext_sum.clone() * small_ext_zero.clone());
+        let small_ext = one.clone() - small_ext_zero;
+
+        builder.assert_eq(
+            cols.s_deep_cancel,
+            cols.s_bn * (one.clone() - cols.is_add) * cols.is_deep,
+        );
+        builder.assert_bool(cols.s_deep_cancel);
+        // Factored so every assert_eq RHS stays degree ≤ 3.
+        builder.assert_eq(cols.s_deep_ediff25, cols.s_deep_cancel * dd_zero);
+        builder.assert_bool(cols.s_deep_ediff25);
+        builder.assert_eq(
+            cols.s_deep_boundary,
+            cols.s_deep_ediff25 * large_pow2 * small_ext,
+        );
+        builder.assert_bool(cols.s_deep_boundary);
+        builder.assert_eq(
+            cols.s_deep_exact,
+            s_deep.clone() * (one.clone() - cols.s_deep_boundary),
+        );
+        builder.assert_bool(cols.s_deep_exact);
 
         // ── Alignment via ShrnGadget (shallow path) ─────────────────────
         // x = small_sig << 8 = [0, small_sig[0], small_sig[1], small_sig[2]].
@@ -739,7 +792,7 @@ impl FaddCoreAir {
         );
         builder.assert_bool(cols.lost_sticky);
 
-        // ── Deep path: result = larger operand (no rounding) ────────────
+        // ── Deep path: result = larger, unless binade-boundary exception ─
         let large_b0 = sel.clone() * cols.a_mant0 + notsel.clone() * cols.b_mant0;
         let large_b1 = sel.clone() * cols.a_mant1 + notsel.clone() * cols.b_mant1;
         let large_b2 = sel.clone() * (cols.a_mant2 + cols.a_exp_lo * f128)
@@ -747,24 +800,50 @@ impl FaddCoreAir {
         let large_b3 = sel.clone() * (cols.a_exp_hi + cols.a_sign * f128)
             + notsel.clone() * (cols.b_exp_hi + cols.b_sign * f128);
         let large_sign = sel.clone() * cols.a_sign + notsel.clone() * cols.b_sign;
+        let s_de = cols.s_deep_exact;
         builder
-            .when(s_deep.clone())
+            .when(s_de)
             .assert_eq(cols.result[0], large_b0.clone());
         builder
-            .when(s_deep.clone())
+            .when(s_de)
             .assert_eq(cols.result[1], large_b1.clone());
         builder
-            .when(s_deep.clone())
+            .when(s_de)
             .assert_eq(cols.result[2], large_b2.clone());
         builder
-            .when(s_deep.clone())
+            .when(s_de)
             .assert_eq(cols.result[3], large_b3.clone());
         builder
-            .when(s_deep.clone())
-            .assert_eq(cols.result_sign, large_sign);
+            .when(s_de)
+            .assert_eq(cols.result_sign, large_sign.clone());
         builder
-            .when(s_deep.clone())
+            .when(s_de)
             .assert_eq(cols.result_exp, large_exp.clone());
+        // Boundary: result = pack(large_sign, large_exp - 1, mant=0x7FFFFF).
+        let s_db = cols.s_deep_boundary;
+        builder.when(s_db).assert_eq(cols.result_sign, large_sign);
+        builder
+            .when(s_db)
+            .assert_eq(cols.result_exp, large_exp.clone() - AB::Expr::ONE);
+        builder
+            .when(s_db)
+            .assert_eq(cols.result[0], AB::Expr::from(f255));
+        builder
+            .when(s_db)
+            .assert_eq(cols.result[1], AB::Expr::from(f255));
+        // result_exp = r_exp_lo + 2*r_exp_hi, bytes 2/3 pack mant-all-ones.
+        builder.when(s_db).assert_eq(
+            cols.result_exp,
+            cols.r_exp_lo + cols.r_exp_hi * AB::Expr::from(f2),
+        );
+        builder.when(s_db).assert_eq(
+            cols.result[2],
+            AB::Expr::from(f127) + cols.r_exp_lo * AB::Expr::from(f128),
+        );
+        builder.when(s_db).assert_eq(
+            cols.result[3],
+            cols.r_exp_hi + cols.result_sign * AB::Expr::from(f128),
+        );
 
         // ── Sum (shallow): raw_sum = (large_sig << 8) + aligned ─────────
         // large_working = [0, large_sig[0], large_sig[1], large_sig[2]].
@@ -1748,12 +1827,18 @@ fn fill_fadd_witness<F: PrimeField32>(
 
     let is_deep = ediff >= DEEP_EDIFF;
     row.is_deep = F::from_bool(is_deep);
-    row.deep_delta = F::from_u32(if is_deep {
+    let deep_delta = if is_deep {
         ediff - DEEP_EDIFF
     } else {
         DEEP_EDIFF - 1 - ediff
-    });
-    range_checker.add_count(row.deep_delta.as_canonical_u32(), LIMB_BITS);
+    };
+    row.deep_delta = F::from_u32(deep_delta);
+    row.deep_delta_inv = if deep_delta != 0 {
+        F::from_u32(deep_delta).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    range_checker.add_count(deep_delta, LIMB_BITS);
 
     let s_shallow = s_add && !is_deep;
     row.align_enable = F::from_bool(s_shallow);
@@ -1767,11 +1852,40 @@ fn fill_fadd_witness<F: PrimeField32>(
         F::ZERO
     };
     let s_cancel = s_finite_bool && !same_sign && a_ok && b_ok && !is_deep;
-    row.s_bn = F::from_bool(s_finite_bool && a_ok && b_ok);
+    let s_bn_bool = s_finite_bool && a_ok && b_ok;
+    row.s_bn = F::from_bool(s_bn_bool);
     row.s_fb = F::from_bool(s_finite_bool && !a_is_zero && !b_is_zero);
     row.s_one_zero = F::from_bool(s_finite_bool && (a_is_zero != b_is_zero));
     row.s_cancel = F::from_bool(s_cancel);
     row.s_cancel_normal = F::ZERO;
+
+    // Deep binade-boundary selectors (effective subtraction only).
+    let large_pow2_sum = (large_sig & 0xFF)
+        + ((large_sig >> 8) & 0xFF)
+        + ((large_sig >> 16) & 0xFF).wrapping_sub(0x80);
+    let large_pow2 = large_pow2_sum == 0;
+    row.large_pow2_inv = if large_pow2_sum != 0 {
+        F::from_u32(large_pow2_sum).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let small_ext_sum = (small_sig & 0xFF)
+        + ((small_sig >> 8) & 0xFF)
+        + ((small_sig >> 16) & 0xFF).wrapping_sub(0x80);
+    let small_ext = small_ext_sum != 0;
+    row.small_ext_inv = if small_ext_sum != 0 {
+        F::from_u32(small_ext_sum).try_inverse().unwrap_or(F::ZERO)
+    } else {
+        F::ZERO
+    };
+    let s_deep_cancel = s_bn_bool && !same_sign && is_deep;
+    let s_deep_ediff25 = s_deep_cancel && deep_delta == 0;
+    let s_deep_boundary = s_deep_ediff25 && large_pow2 && small_ext;
+    let s_deep_exact = s_bn_bool && is_deep && !s_deep_boundary;
+    row.s_deep_cancel = F::from_bool(s_deep_cancel);
+    row.s_deep_ediff25 = F::from_bool(s_deep_ediff25);
+    row.s_deep_boundary = F::from_bool(s_deep_boundary);
+    row.s_deep_exact = F::from_bool(s_deep_exact);
 
     // ── Alignment via ShrnGadget (shallow), else disabled ───────────────
     let x: [u32; WORK_LIMBS] = [
@@ -1834,6 +1948,23 @@ fn fill_fadd_witness<F: PrimeField32>(
         row.cancel_shln = ShlnCols::<F, 6>::default();
         row.cancel_lshift = F::ZERO;
         row.result_exp = F::from_u32(r_exp);
+        // Boundary deep path reads r_exp_lo/hi to pack mant-all-ones result bytes.
+        if s_deep_boundary {
+            row.r_exp_lo = F::from_u32(r_exp & 1);
+            row.r_exp_hi = F::from_u32(r_exp >> 1);
+            row.r_exp_hi_zero_inv = if r_exp >> 1 != 0 {
+                F::from_u32(r_exp >> 1).try_inverse().unwrap_or(F::ZERO)
+            } else {
+                F::ZERO
+            };
+            row.r_exp_hi_max_inv = if r_exp >> 1 != 127 {
+                (F::from_u32(127) - F::from_u32(r_exp >> 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            } else {
+                F::ZERO
+            };
+        }
         row.is_valid = F::ONE;
         return;
     }
@@ -2834,7 +2965,10 @@ mod finite_add_tests {
         let _ = trials;
         assert!(carry_seen, "never exercised a carry-out normalization");
         assert!(round_up_seen, "never exercised a round_up=1 case");
-        assert!(deep_seen, "never exercised the deep (ediff>=25) path");
+        assert!(
+            deep_seen,
+            "never exercised the deep (ediff>=DEEP_EDIFF) path"
+        );
         assert!(overflow_seen, "never exercised an overflow->inf result");
     }
 
@@ -2906,14 +3040,14 @@ mod finite_add_tests {
         // 1.0 + 2.0 = 3.0 (no carry)
         let (b, _) = run(1.0f32.to_bits(), 2.0f32.to_bits());
         assert!(b.ok(), "{:?}", b.failures);
-        // 1.0 + (tiny, ediff=25) = 1.0 (deep path)
-        let tiny = f32::from_bits(1 << 0); // smallest subnormal is not normal; use exp=102
+        // 1.0 + (tiny, ediff=25) = 1.0 (deep same-sign)
         let large = 1.0f32;
-        // build a normal small operand 25 exp below 1.0 (exp 127): exp 102
+        // normal small operand 25 exp below 1.0 (exp 127): exp 102
         let small = f32::from_bits((102u32 << 23) | 1).to_bits();
-        let _ = tiny;
-        let (b, _) = run(large.to_bits(), small);
+        let (b, row) = run(large.to_bits(), small);
         assert!(b.ok(), "deep path: {:?}", b.failures);
+        assert_eq!(row.is_deep, F::ONE);
+        assert_eq!(row.s_deep_boundary, F::ZERO);
         // MAX + MAX = +inf (overflow)
         let (b, _) = run(f32::MAX.to_bits(), f32::MAX.to_bits());
         assert!(b.ok(), "overflow: {:?}", b.failures);
@@ -2983,6 +3117,49 @@ mod finite_add_tests {
         // (s_add = 0), so the constraints must not fire / fail.
         let (builder, _) = run(5.0f32.to_bits(), (-3.0f32).to_bits());
         assert!(builder.ok(), "subtraction must not be constrained here");
+    }
+
+    /// Binade-boundary completeness: opposite signs, larger = exact power of two,
+    /// ediff == 25, smaller mantissa != 0 ⇒ result = larger − 1 lower-binade ULP.
+    /// The old DEEP_EDIFF=25 deep path asserted result == larger and rejected the
+    /// honest IEEE witness (prove failure). Tie (mant=0) and non-boundary stay OK.
+    #[test]
+    fn finite_add_binade_boundary_ediff25() {
+        let chip = rc();
+        // (a, b, expected, expect_boundary)
+        let cases: &[(u32, u32, u32, bool)] = &[
+            (0x3F000000, 0xB2800001, 0x3EFFFFFF, true), // past midpoint → larger−1ulp
+            (0x3F800000, 0xB3000001, 0x3F7FFFFF, true),
+            (0x3F000000, 0xB2800000, 0x3F000000, false), // exact tie → round-even = larger
+            (0x3F000001, 0xB2800001, 0x3F000001, false), // not power-of-two larger
+            (0xB2800001, 0x3F000000, 0x3EFFFFFF, true),  // operand swap
+            (0xB3000001, 0x3F800000, 0x3F7FFFFF, true),
+            (0x3F000000, 0xB2000001, 0x3F000000, false), // ediff=26 deep exact
+        ];
+        for &(a, b, exp, expect_boundary) in cases {
+            assert_eq!(fadd_s(a, b), exp, "ieee a={a:08x} b={b:08x}");
+            let (builder, row) = run_with(a, b, &chip);
+            assert!(
+                builder.ok(),
+                "binade ediff case a={a:08x} b={b:08x}: {:?}",
+                builder.failures
+            );
+            let got = row.result[0].as_canonical_u32()
+                | (row.result[1].as_canonical_u32() << 8)
+                | (row.result[2].as_canonical_u32() << 16)
+                | (row.result[3].as_canonical_u32() << 24);
+            assert_eq!(got, exp, "result bits a={a:08x} b={b:08x}");
+            assert_eq!(
+                row.s_deep_boundary,
+                F::from_bool(expect_boundary),
+                "boundary flag a={a:08x} b={b:08x}"
+            );
+            if expect_boundary {
+                assert_eq!(row.is_deep, F::ONE);
+                assert_eq!(row.s_deep_exact, F::ZERO);
+                assert_eq!(row.s_cancel, F::ZERO);
+            }
+        }
     }
 
     #[test]
