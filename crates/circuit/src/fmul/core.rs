@@ -722,7 +722,10 @@ impl FmulCoreAir {
         let eq4 = one.clone() - d4.clone() * cols.m4_255_inv;
         builder.when(cols.is_valid).assert_zero(d4 * eq4.clone());
         let d5 = AB::Expr::from(f255) - cols.norm_sig[5];
-        let eq5 = one.clone() - d5 * cols.m5_255_inv;
+        let eq5 = one.clone() - d5.clone() * cols.m5_255_inv;
+        // Without d5*eq5=0, inv=0 forges eq5=1 whenever norm_sig[5]!=255,
+        // which lets c2 spuriously bump the exponent (observable wrong result).
+        builder.when(cols.is_valid).assert_zero(d5 * eq5.clone());
         // (norm_sig[5] == 255 iff its low 7 mantissa bits are all ones, since bit
         // 47 is the implicit 1.)
 
@@ -1877,6 +1880,54 @@ mod overflow_tests {
         let mut c = filler_cols(f32::MAX.to_bits(), f32::MAX.to_bits());
         c.result[0] = F::ONE;
         assert!(!run(&c).ok(), "non-inf overflow result must be rejected");
+    }
+
+    /// Forging eq5=1 with m5_255_inv=0 while norm_sig[5]!=255 must not bump c2.
+    #[test]
+    fn eq5_inv_zero_forge_rejected() {
+        use openvm_circuit::arch::BasicAdapterInterface;
+        use openvm_circuit::arch::MinimalInstruction;
+        use openvm_stark_backend::p3_field::PrimeField32;
+        type TestI = BasicAdapterInterface<F, MinimalInstruction<F>, 2, 1, 4, 4>;
+        let chip = Arc::new(VariableRangeCheckerChip::new(VariableRangeCheckerBus::new(
+            0, 16,
+        )));
+        let lt = IsLtSubAir::new(chip.bus(), 8);
+        // 1.5 * 1.5 = 2.25 — normal, norm_sig[5] is not 255, c1 may be 0.
+        // Use a case where c1=1 so forged eq5 would change c2.
+        let a = 0x7f7ffffe_u32; // near MAX so rounding cascade can carry
+        let b = 0x3fc00000_u32; // 1.5
+        let mut cols = FmulCoreCols::<F>::default();
+        fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip, &lt);
+        let ns5 = cols.norm_sig[5].as_canonical_u32();
+        if ns5 == 255 || cols.c1 == F::ZERO {
+            // Fall back to any finite normal row and force the forge shape.
+            let a = 3.0f32.to_bits();
+            let b = 4.0f32.to_bits();
+            fill_fmul_witness(&mut cols, a, b, fmul_s(a, b), &chip, &lt);
+        }
+        let ns5 = cols.norm_sig[5].as_canonical_u32();
+        assert_ne!(ns5, 255, "need norm_sig[5]!=255 for inv=0 forge");
+        let honest_c2 = cols.c2;
+        cols.m5_255_inv = F::ZERO;
+        cols.c2 = cols.c1; // forged: c2 = c1 * eq5 with eq5=1
+        if cols.c2 == honest_c2 {
+            // c1 was 0 so c2 unchanged; still the is-zero gate must fail.
+        }
+        let mut buf = vec![F::ZERO; FmulCoreCols::<F>::width()];
+        *buf.as_mut_slice().borrow_mut() = cols;
+        let mut bld = NumericBuilder::new(vec![]);
+        VmCoreAir::<NumericBuilder<F>, TestI>::eval(
+            &FmulCoreAir::new(VariableRangeCheckerBus::new(0, 16), 0),
+            &mut bld,
+            &buf,
+            F::ZERO,
+        );
+        assert!(
+            !bld.ok(),
+            "eq5 forge with m5_255_inv=0 must be rejected: {:?}",
+            bld.failures
+        );
     }
 
     /// Prover sets a non-255 result exp encoding equal to exp_check (>255).
