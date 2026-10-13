@@ -566,9 +566,12 @@ impl FsqrtCoreAir {
             cols.sqrt_shrn.y[1] + cols.rc0,
         );
         let top7 = cols.sqrt_shrn.y[2] - f128;
+        // Pin implicit bit in y[2]: RC top7 to 7 bits (same class as fadd/fma
+        // cancel normalize — y[2]=127 with rc1=1 would otherwise satisfy top7c).
         builder
             .when(s)
-            .assert_eq(top7 + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+            .assert_eq(top7.clone() + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus.range_check(top7, 7).eval(builder, s.into());
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s.into());
@@ -1052,6 +1055,7 @@ fn fill_finite_sqrt<F: PrimeField32>(
     row.rc2 = F::from_u32(rc2);
     row.rc2_rem = F::from_u32(rc2_rem);
     range_checker.add_count(rc2_rem, 7);
+    range_checker.add_count(top7, 7);
 
     let res_exp = (res_exp_base + is_hi_val as i32 + rc2 as i32) as u32;
     row.r_exp_lo = F::from_u32(res_exp & 1);

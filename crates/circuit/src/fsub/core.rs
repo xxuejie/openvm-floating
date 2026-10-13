@@ -1249,9 +1249,15 @@ impl FsubCoreAir {
         builder.when(scn).assert_eq(cols.result[0], cols.c_m0);
         builder.when(scn).assert_eq(cols.result[1], cols.c_m1);
         // top7c = (norm[5] - 128) + rc1 = rc2_rem + rc2*128.
+        // Pin implicit bit at bit 47: RC (norm[5]-128) to 7 bits. Without this,
+        // under-shifting by 1 with norm[5]=127 and rc1=1 satisfies top7c with
+        // rem=rc2=0 (LHS=0), forging result_exp+1 while gates still pass.
         builder
             .when(s * (one.clone() - ez))
             .assert_eq((norm[5] - f128) + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus
+            .range_check(norm[5] - f128, 7)
+            .eval(builder, s * (one.clone() - ez));
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, s * (one.clone() - ez));
@@ -2396,6 +2402,7 @@ fn fill_cancel_fsub<F: PrimeField32>(
     row.result_sign = F::from_u32(cancel_r_sign);
     if !is_exact_zero {
         range_checker.add_count(rc2_rem, 7);
+        range_checker.add_count(nb5.saturating_sub(128), 7);
     }
     row.s_cancel_normal = F::from_bool(!is_sub && !is_ovf && !is_exact_zero);
 

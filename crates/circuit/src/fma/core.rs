@@ -1297,10 +1297,14 @@ impl FmaCoreAir {
             .range_check(cols.m1.into(), 8)
             .eval(builder, sn.into());
         // top7 = norm_work[5] - 128 (remove implicit bit).
+        // Pin implicit bit at bit 47: RC top7 to 7 bits. Without this, a cancel
+        // under-shift with norm_work[5]=127 and rc1=1 satisfies top7c with
+        // rem=rc2=0, forging result_exp+1 (norm_work[6]=0 only blocks over-shift).
         let top7 = cols.norm_work[5] - f128;
         builder
             .when(sn)
-            .assert_eq(top7 + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+            .assert_eq(top7.clone() + cols.rc1, cols.rc2_rem + cols.rc2 * f128);
+        self.range_bus.range_check(top7, 7).eval(builder, sn.into());
         self.range_bus
             .range_check(cols.rc2_rem.into(), 7)
             .eval(builder, sn.into());
@@ -2318,6 +2322,7 @@ fn fill_finite_product<F: PrimeField32>(
         range_checker.add_count(m0, 8);
         range_checker.add_count(m1, 8);
         range_checker.add_count(rc2_rem, 7);
+        range_checker.add_count(top7, 7);
     }
 
     if s_norm {
