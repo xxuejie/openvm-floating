@@ -10,9 +10,7 @@ use libfuzzer_sys::fuzz_target;
 use openvm_instructions::LocalOpcode;
 use openvm_rv32f_guest::*;
 use openvm_rv32f_transpiler::{FpOpcode, Rv32FTranspilerExtension};
-use openvm_stark_sdk::{
-    openvm_stark_backend::p3_field::PrimeField32, p3_baby_bear::BabyBear,
-};
+use openvm_stark_sdk::{openvm_stark_backend::p3_field::PrimeField32, p3_baby_bear::BabyBear};
 use openvm_transpiler::TranspilerExtension;
 
 type F = BabyBear;
@@ -53,10 +51,26 @@ fn expected_decode(insn: u32) -> Option<Option<FpOpcode>> {
     let funct7 = ((insn >> 25) & 0x7f) as u8;
     let rs2 = ((insn >> 20) & 0b11111) as u8;
     match funct7 {
-        FADD_S_FUNCT7 => Some(if rm_ok(rm) { Some(FpOpcode::FADD_S) } else { None }),
-        FSUB_S_FUNCT7 => Some(if rm_ok(rm) { Some(FpOpcode::FSUB_S) } else { None }),
-        FMUL_S_FUNCT7 => Some(if rm_ok(rm) { Some(FpOpcode::FMUL_S) } else { None }),
-        FDIV_S_FUNCT7 => Some(if rm_ok(rm) { Some(FpOpcode::FDIV_S) } else { None }),
+        FADD_S_FUNCT7 => Some(if rm_ok(rm) {
+            Some(FpOpcode::FADD_S)
+        } else {
+            None
+        }),
+        FSUB_S_FUNCT7 => Some(if rm_ok(rm) {
+            Some(FpOpcode::FSUB_S)
+        } else {
+            None
+        }),
+        FMUL_S_FUNCT7 => Some(if rm_ok(rm) {
+            Some(FpOpcode::FMUL_S)
+        } else {
+            None
+        }),
+        FDIV_S_FUNCT7 => Some(if rm_ok(rm) {
+            Some(FpOpcode::FDIV_S)
+        } else {
+            None
+        }),
         FSGNJ_S_FUNCT7 => match rm {
             FSGNJ_FUNCT3 => Some(Some(FpOpcode::FSGNJ_S)),
             FSGNJN_FUNCT3 => Some(Some(FpOpcode::FSGNJN_S)),
@@ -78,7 +92,11 @@ fn expected_decode(insn: u32) -> Option<Option<FpOpcode>> {
             if rs2 != 0 {
                 None
             } else {
-                Some(if rm_ok(rm) { Some(FpOpcode::FSQRT_S) } else { None })
+                Some(if rm_ok(rm) {
+                    Some(FpOpcode::FSQRT_S)
+                } else {
+                    None
+                })
             }
         }
         FCLASS_S_FUNCT7 => {
@@ -100,8 +118,16 @@ fn expected_decode(insn: u32) -> Option<Option<FpOpcode>> {
         FCVT_S_W_FUNCT7 => {
             // AIR implements RNE; DYN treated as RNE.
             match rs2 {
-                FCVT_RS2_W => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_S_W) } else { None }),
-                FCVT_RS2_WU => Some(if rm_ok(rm) { Some(FpOpcode::FCVT_S_WU) } else { None }),
+                FCVT_RS2_W => Some(if rm_ok(rm) {
+                    Some(FpOpcode::FCVT_S_W)
+                } else {
+                    None
+                }),
+                FCVT_RS2_WU => Some(if rm_ok(rm) {
+                    Some(FpOpcode::FCVT_S_WU)
+                } else {
+                    None
+                }),
                 _ => None,
             }
         }
@@ -117,7 +143,8 @@ fuzz_target!(|data: &[u8]| {
         }
         let insn = u32::from_le_bytes(word.try_into().unwrap());
         let expected = expected_decode(insn);
-        let out: Option<openvm_transpiler::TranspilerOutput<F>> = transpiler.process_custom(&[insn]);
+        let out: Option<openvm_transpiler::TranspilerOutput<F>> =
+            transpiler.process_custom(&[insn]);
         match (expected, out) {
             (Some(Some(op)), Some(output)) => {
                 assert_eq!(output.instructions.len(), 1, "insn {insn:#010x}");
@@ -128,8 +155,8 @@ fuzz_target!(|data: &[u8]| {
                     "insn {insn:#010x}: opcode mismatch (expected {op:?})"
                 );
                 // rd / rs1 pointers
-                let rd = ((insn >> 7) & 0b11111) as u32;
-                let rs1 = ((insn >> 15) & 0b11111) as u32;
+                let rd = (insn >> 7) & 0b11111;
+                let rs1 = (insn >> 15) & 0b11111;
                 assert_eq!(inst.a.as_canonical_u32(), 4 * rd, "insn {insn:#010x}: rd");
                 assert_eq!(inst.b.as_canonical_u32(), 4 * rs1, "insn {insn:#010x}: rs1");
             }

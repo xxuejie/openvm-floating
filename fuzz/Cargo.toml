@@ -14,9 +14,12 @@ libfuzzer-sys = "0.4"
 openvm-rv32f-circuit = { path = "../crates/circuit" }
 openvm-rv32f-transpiler = { path = "../crates/transpiler" }
 openvm-rv32f-guest = { path = "../crates/guest" }
-openvm-circuit = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1", features = ["test-utils"] }
-openvm-instructions = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
-openvm-transpiler = { git = "https://github.com/openvm-org/openvm", tag = "v2.0.1" }
+# Must match the main workspace OpenVM pin (xxuejie fork). Pinning
+# openvm-org/openvm@v2.0.1 alongside path crates that pull the fork
+# causes a `links = "circuit-primitives-cuda"` resolver conflict.
+openvm-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", features = ["test-utils"] }
+openvm-instructions = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
+openvm-transpiler = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
 openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", features = ["cpu-backend"] }
 
 [[bin]]
