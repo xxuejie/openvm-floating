@@ -363,10 +363,14 @@ impl FsqrtCoreAir {
         self.range_bus
             .range_check(cols.a_sig2_lo7.into(), 7)
             .eval(builder, s * is_sub);
+        // Pin a_sig_hi as bit 7: a_sig = lo7 + hi*128 with lo7 ∈ [0, 127].
         for i in 0..3 {
             builder.assert_bool(cols.a_sig_hi[i]);
             self.range_bus
                 .range_check(cols.a_sig[i].into(), 8)
+                .eval(builder, s.into());
+            self.range_bus
+                .range_check(cols.a_sig[i] - cols.a_sig_hi[i] * f128, 7)
                 .eval(builder, s.into());
         }
 
@@ -399,13 +403,13 @@ impl FsqrtCoreAir {
             .range_check(cols.q4_lo4.into(), 4)
             .eval(builder, s.into());
 
-        // q_hi: bit 7 of each q byte. q_hi[4] must be 0 (q[4] < 32).
+        // Pin q_hi as bit 7 of each q byte: q = lo7 + hi*128 with lo7 ∈ [0, 127].
+        // q_hi[4] must be 0 (q[4] < 32 from the q4_lo4 / is_hi split above).
         for i in 0..5 {
             builder.assert_bool(cols.q_hi[i]);
-            builder.when(s).assert_eq(
-                cols.q[i],
-                cols.q[i] - cols.q_hi[i] * f128 + cols.q_hi[i] * f128,
-            );
+            self.range_bus
+                .range_check(cols.q[i] - cols.q_hi[i] * f128, 7)
+                .eval(builder, s.into());
         }
         builder.when(s).assert_zero(cols.q_hi[4]);
 
@@ -880,6 +884,7 @@ fn fill_finite_sqrt<F: PrimeField32>(
         row.a_sig[i] = F::from_u32(sb);
         row.a_sig_hi[i] = F::from_u32(sb >> 7);
         range_checker.add_count(sb, 8);
+        range_checker.add_count(sb & 0x7F, 7);
     }
     if is_sub {
         row.a_sig2_lo7 = F::from_u32(asig_bytes[2] - 128);
@@ -902,6 +907,7 @@ fn fill_finite_sqrt<F: PrimeField32>(
         row.q[i] = F::from_u32(qb);
         row.q_hi[i] = F::from_u32(qb >> 7);
         range_checker.add_count(qb, 8);
+        range_checker.add_count(qb & 0x7F, 7);
     }
 
     // q[4] < 32 (q < 2^37). Decompose: q[4] = q4_lo4 + is_hi * 16.

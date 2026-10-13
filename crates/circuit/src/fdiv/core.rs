@@ -511,15 +511,15 @@ impl FdivCoreAir {
             b_ns * (cols.b_mant2 + f128) + cols.b_sub * cols.b_shln.y[2],
         );
 
-        // a_sig bit-7 decomposition (for a_sig << 25 target).
+        // Pin a_sig_hi as bit 7 (for a_sig << 25 target): a_sig = lo7 + hi*128
+        // with lo7 ∈ [0, 127]. Without the 7-bit check, hi is a free bool.
         for i in 0..3 {
             builder.assert_bool(cols.a_sig_hi[i]);
-            let lo7 = cols.a_sig[i] - cols.a_sig_hi[i] * f128;
-            builder
-                .when(s)
-                .assert_eq(cols.a_sig[i], lo7 + cols.a_sig_hi[i] * f128);
             self.range_bus
                 .range_check(cols.a_sig[i].into(), 8)
+                .eval(builder, s.into());
+            self.range_bus
+                .range_check(cols.a_sig[i] - cols.a_sig_hi[i] * f128, 7)
                 .eval(builder, s.into());
         }
         for i in 0..3 {
@@ -1269,6 +1269,7 @@ fn fill_finite_div<F: PrimeField32>(
         row.b_sig[i] = F::from_u32(bsig_bytes[i]);
         row.a_sig_hi[i] = F::from_u32(asig_bytes[i] >> 7);
         range_checker.add_count(asig_bytes[i], 8);
+        range_checker.add_count(asig_bytes[i] & 0x7F, 7);
         range_checker.add_count(bsig_bytes[i], 8);
     }
 
