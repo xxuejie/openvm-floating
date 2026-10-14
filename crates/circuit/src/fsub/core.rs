@@ -134,6 +134,9 @@ pub struct FsubCoreCols<T> {
     pub align_enable: T, // bool: s_sub AND !is_deep (gates the ShrnGadget)
     pub large_pow2_inv: T,
     pub small_ext_inv: T,
+    // Degree-1 bools (exprs are deg-2; product with s_deep_ediff25 must stay ≤4).
+    pub large_pow2: T,
+    pub small_ext: T,
     pub s_deep_cancel: T, // s_bn AND is_add AND is_deep (same-sign ⇒ effective sub)
     pub s_deep_ediff25: T,
     pub s_deep_boundary: T,
@@ -693,25 +696,34 @@ impl FsubCoreAir {
         let f128e: AB::Expr = AB::Expr::from(f128);
         let large_pow2_sum =
             cols.large_sig[0] + cols.large_sig[1] + cols.large_sig[2] - f128e.clone();
-        let large_pow2 = one.clone() - large_pow2_sum.clone() * cols.large_pow2_inv;
-        // Only meaningful when significands carry an implicit bit (s_bn).
+        let large_pow2_expr = one.clone() - large_pow2_sum.clone() * cols.large_pow2_inv;
+        // Pin only on s_bn rows (specials leave sig unused; inv may be 0 → expr=1).
         builder
             .when(cols.s_bn)
-            .assert_zero(large_pow2_sum * large_pow2.clone());
+            .assert_eq(cols.large_pow2, large_pow2_expr.clone());
+        builder.when(not(cols.s_bn)).assert_zero(cols.large_pow2);
+        builder.assert_bool(cols.large_pow2);
+        builder
+            .when(cols.s_bn)
+            .assert_zero(large_pow2_sum * cols.large_pow2);
         let small_ext_sum = cols.small_sig[0] + cols.small_sig[1] + cols.small_sig[2] - f128e;
         let small_ext_zero = one.clone() - small_ext_sum.clone() * cols.small_ext_inv;
+        let small_ext_expr = one.clone() - small_ext_zero.clone();
         builder
             .when(cols.s_bn)
-            .assert_zero(small_ext_sum.clone() * small_ext_zero.clone());
-        let small_ext = one.clone() - small_ext_zero;
-        // fsub: same-sign (is_add) ⇒ effective subtraction.
+            .assert_eq(cols.small_ext, small_ext_expr);
+        builder.when(not(cols.s_bn)).assert_zero(cols.small_ext);
+        builder.assert_bool(cols.small_ext);
+        builder
+            .when(cols.s_bn)
+            .assert_zero(small_ext_sum.clone() * small_ext_zero);
         builder.assert_eq(cols.s_deep_cancel, cols.s_bn * cols.is_add * cols.is_deep);
         builder.assert_bool(cols.s_deep_cancel);
         builder.assert_eq(cols.s_deep_ediff25, cols.s_deep_cancel * dd_zero);
         builder.assert_bool(cols.s_deep_ediff25);
         builder.assert_eq(
             cols.s_deep_boundary,
-            cols.s_deep_ediff25 * large_pow2 * small_ext,
+            cols.s_deep_ediff25 * cols.large_pow2 * cols.small_ext,
         );
         builder.assert_bool(cols.s_deep_boundary);
         builder.assert_eq(
@@ -1780,22 +1792,26 @@ fn fill_fsub_witness<F: PrimeField32>(
     let large_pow2_sum = (large_sig & 0xFF)
         + ((large_sig >> 8) & 0xFF)
         + ((large_sig >> 16) & 0xFF).wrapping_sub(0x80);
+    let large_pow2 = large_pow2_sum == 0;
     row.large_pow2_inv = if large_pow2_sum != 0 {
         F::from_u32(large_pow2_sum).try_inverse().unwrap_or(F::ZERO)
     } else {
         F::ZERO
     };
+    row.large_pow2 = F::from_bool(s_bn_bool && large_pow2);
     let small_ext_sum = (small_sig & 0xFF)
         + ((small_sig >> 8) & 0xFF)
         + ((small_sig >> 16) & 0xFF).wrapping_sub(0x80);
+    let small_ext = small_ext_sum != 0;
     row.small_ext_inv = if small_ext_sum != 0 {
         F::from_u32(small_ext_sum).try_inverse().unwrap_or(F::ZERO)
     } else {
         F::ZERO
     };
+    row.small_ext = F::from_bool(s_bn_bool && small_ext);
     let s_deep_cancel = s_bn_bool && same_sign && is_deep;
     let s_deep_ediff25 = s_deep_cancel && deep_delta == 0;
-    let s_deep_boundary = s_deep_ediff25 && large_pow2_sum == 0 && small_ext_sum != 0;
+    let s_deep_boundary = s_deep_ediff25 && large_pow2 && small_ext;
     let s_deep_exact = s_bn_bool && is_deep && !s_deep_boundary;
     row.s_deep_cancel = F::from_bool(s_deep_cancel);
     row.s_deep_ediff25 = F::from_bool(s_deep_ediff25);

@@ -135,10 +135,13 @@ pub struct FaddCoreCols<T> {
     // Deep-path binade-boundary exception (effective subtraction only).
     pub large_pow2_inv: T, // inv of large_sig[0]+large_sig[1]+(large_sig[2]-128)
     pub small_ext_inv: T,  // inv of the same sum over small_sig (nonzero ⇒ sticky mant)
-    pub s_deep_cancel: T,  // s_bn AND !is_add AND is_deep
-    pub s_deep_ediff25: T, // s_deep_cancel AND deep_delta==0 (ediff == 25)
-    pub s_deep_boundary: T, // s_deep_ediff25 AND large pow2 AND small ext
-    pub s_deep_exact: T,   // s_bn AND is_deep AND !s_deep_boundary (result = larger)
+    // Degree-1 bools for pow2/ext (exprs are deg-2; product with s_deep_ediff25 must stay ≤4).
+    pub large_pow2: T,      // bool: large_sig == 0x800000
+    pub small_ext: T,       // bool: small_sig != 0x800000 (mantissa bits beyond implicit)
+    pub s_deep_cancel: T,   // s_bn AND !is_add AND is_deep
+    pub s_deep_ediff25: T,  // s_deep_cancel AND deep_delta==0 (ediff == 25)
+    pub s_deep_boundary: T, // s_deep_ediff25 AND large_pow2 AND small_ext
+    pub s_deep_exact: T,    // s_bn AND is_deep AND !s_deep_boundary (result = larger)
 
     // === Sum / difference ===
     pub is_add: T,                // bool: same sign → add, different sign → subtract
@@ -732,32 +735,43 @@ impl FaddCoreAir {
         builder.assert_zero(cols.deep_delta * dd_zero.clone());
 
         // large_pow2 ⇔ large_sig == 0x800000; small_ext ⇔ small_sig != 0x800000.
+        // Pin as columns: expression forms are deg-2; s_deep_ediff25 * expr * expr was deg 5.
         let f128e: AB::Expr = AB::Expr::from(f128);
         let large_pow2_sum =
             cols.large_sig[0] + cols.large_sig[1] + cols.large_sig[2] - f128e.clone();
-        let large_pow2 = one.clone() - large_pow2_sum.clone() * cols.large_pow2_inv;
-        // Only meaningful when significands carry an implicit bit (s_bn).
+        let large_pow2_expr = one.clone() - large_pow2_sum.clone() * cols.large_pow2_inv;
+        // Pin only on s_bn rows (specials leave sig unused; inv may be 0 → expr=1).
         builder
             .when(cols.s_bn)
-            .assert_zero(large_pow2_sum * large_pow2.clone());
+            .assert_eq(cols.large_pow2, large_pow2_expr.clone());
+        builder.when(not(cols.s_bn)).assert_zero(cols.large_pow2);
+        builder.assert_bool(cols.large_pow2);
+        builder
+            .when(cols.s_bn)
+            .assert_zero(large_pow2_sum * cols.large_pow2);
         let small_ext_sum = cols.small_sig[0] + cols.small_sig[1] + cols.small_sig[2] - f128e;
         let small_ext_zero = one.clone() - small_ext_sum.clone() * cols.small_ext_inv;
+        let small_ext_expr = one.clone() - small_ext_zero.clone();
         builder
             .when(cols.s_bn)
-            .assert_zero(small_ext_sum.clone() * small_ext_zero.clone());
-        let small_ext = one.clone() - small_ext_zero;
+            .assert_eq(cols.small_ext, small_ext_expr);
+        builder.when(not(cols.s_bn)).assert_zero(cols.small_ext);
+        builder.assert_bool(cols.small_ext);
+        builder
+            .when(cols.s_bn)
+            .assert_zero(small_ext_sum.clone() * small_ext_zero);
 
         builder.assert_eq(
             cols.s_deep_cancel,
             cols.s_bn * (one.clone() - cols.is_add) * cols.is_deep,
         );
         builder.assert_bool(cols.s_deep_cancel);
-        // Factored so every assert_eq RHS stays degree ≤ 3.
+        // Factored so every assert_eq RHS stays degree ≤ 3 (all factors columns / deg≤2).
         builder.assert_eq(cols.s_deep_ediff25, cols.s_deep_cancel * dd_zero);
         builder.assert_bool(cols.s_deep_ediff25);
         builder.assert_eq(
             cols.s_deep_boundary,
-            cols.s_deep_ediff25 * large_pow2 * small_ext,
+            cols.s_deep_ediff25 * cols.large_pow2 * cols.small_ext,
         );
         builder.assert_bool(cols.s_deep_boundary);
         builder.assert_eq(
@@ -1869,6 +1883,8 @@ fn fill_fadd_witness<F: PrimeField32>(
     } else {
         F::ZERO
     };
+    // AIR zeros these when !s_bn; keep witness consistent (zeros/specials ≠ 0x800000).
+    row.large_pow2 = F::from_bool(s_bn_bool && large_pow2);
     let small_ext_sum = (small_sig & 0xFF)
         + ((small_sig >> 8) & 0xFF)
         + ((small_sig >> 16) & 0xFF).wrapping_sub(0x80);
@@ -1878,6 +1894,7 @@ fn fill_fadd_witness<F: PrimeField32>(
     } else {
         F::ZERO
     };
+    row.small_ext = F::from_bool(s_bn_bool && small_ext);
     let s_deep_cancel = s_bn_bool && !same_sign && is_deep;
     let s_deep_ediff25 = s_deep_cancel && deep_delta == 0;
     let s_deep_boundary = s_deep_ediff25 && large_pow2 && small_ext;
